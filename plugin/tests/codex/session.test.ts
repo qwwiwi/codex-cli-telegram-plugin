@@ -208,9 +208,11 @@ test('reuses one YAML decision for the same Codex command and asks again for a d
     expect((await session.run('approval:policy')).text).toBe('accept')
     expect(seen).toHaveLength(1)
     expect(seen[0]?.reason).toContain('вне песочницы')
+    expect((await session.run('approval:policy-production-shell')).text).toBe('accept')
+    expect(seen).toHaveLength(2)
     expect((await session.run('approval:policy-mismatch')).text).toBe('accept')
     expect(seen.map(request => request.target)).toEqual([
-      'printf test', 'printf test', "/usr/bin/bash -lc 'printf other'",
+      'printf test', 'printf test', 'printf test', "/usr/bin/bash -lc 'printf other'",
     ])
   } finally { server.close() }
 })

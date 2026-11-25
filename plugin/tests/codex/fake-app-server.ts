@@ -133,6 +133,7 @@ for await (const line of createInterface({ input: process.stdin })) {
           turnId: scenario === 'approval:child' ? childTurn : activeTurn,
           itemId: 'item',
           command: scenario === 'approval:policy' ? "/usr/bin/bash -lc 'printf test'"
+            : scenario === 'approval:policy-production-shell' ? "/bin/bash -c 'printf test'"
             : scenario === 'approval:policy-mismatch' ? "/usr/bin/bash -lc 'printf other'" : 'printf test',
           cwd: '/workspace',
           ...(scenario === 'approval:incomplete' ? { command: undefined } : {}),

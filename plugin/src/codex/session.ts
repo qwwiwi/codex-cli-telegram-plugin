@@ -64,7 +64,8 @@ function recordFileChange(execution: Execution, item: Record<string, unknown>): 
 function sameShellCommand(native: string, hook: string): boolean {
   // Match Codex's observed Bash argv presentation without evaluating shell syntax.
   const quoted = "'" + hook.replaceAll("'", "'\\''") + "'"
-  return native === hook || native === '/usr/bin/bash -lc ' + quoted || native === '/bin/bash -lc ' + quoted
+  const shellPrefix = /^(?:\/usr)?\/bin\/bash -(?:l)?c /u.exec(native)?.[0]
+  return native === hook || (shellPrefix !== undefined && native.slice(shellPrefix.length) === quoted)
 }
 
 export class CodexSession {
