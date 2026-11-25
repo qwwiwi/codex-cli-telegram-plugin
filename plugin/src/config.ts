@@ -289,7 +289,7 @@ export const AppConfigSchema = z.object({
   // The watcher NEVER replaces the channel notification — it auto-replies
   // AND lets the original message flow to Claude through the normal path.
   watcher: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     debounce_ms: z.number().int().nonnegative().default(10_000),
     busy_threshold_ms: z.number().int().positive().default(30_000),
     // Mid-turn ack text (Level 1, 2026-06-04). When set, the auto-reply uses

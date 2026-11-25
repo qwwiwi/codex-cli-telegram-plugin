@@ -67,6 +67,38 @@ test('relays a scoped MCP approval through the existing one-time callback', asyn
   }])
 })
 
+test('requires a current-turn approval for a hosted GitHub write', async () => {
+  const requests: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async request => {
+    requests.push(request)
+    return 'decline'
+  }).create()
+  await session.initialize()
+  expect(JSON.parse((await session.run('mcp-approval:github')).text)).toEqual({ action: 'decline' })
+  expect(JSON.parse((await session.run('mcp-approval:github-stale')).text)).toEqual({ action: 'cancel' })
+  expect(requests.map(request => request.target)).toEqual(['GitHub / create_tree\nРепозиторий: example/private'])
+})
+
+test('does not open a worker MCP card resolved during the scope lookup', async () => {
+  const requests: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async request => {
+    requests.push(request)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  expect(JSON.parse((await session.run('mcp-approval:github-resolved')).text)).toEqual({ action: 'cancel' })
+  expect(requests).toEqual([])
+})
+
+test('checks whether the requested worker thread is idle or unloaded', async () => {
+  const session = fixture().create()
+  await session.initialize()
+  expect(await session.threadIsIdle('idle-child')).toBe(true)
+  expect(await session.threadIsIdle('unloaded-child')).toBe(true)
+  expect(await session.threadIsIdle('active-child')).toBe(false)
+  expect(await session.threadIsIdle('wrong-thread')).toBe(false)
+})
+
 test('interrupts a running turn and can run a new turn afterward', async () => {
   const session = fixture().create()
   await session.initialize()
@@ -196,6 +228,20 @@ test('relays one active command approval and rejects mismatched or incomplete re
   expect(seen[0]).toMatchObject({ kind: 'command', target: 'printf test', cwd: '/workspace' })
 })
 
+test('suppresses pending and denied duplicates within a turn and asks again in the next turn', async () => {
+  let shown = 0
+  const session = fixture('chatgpt', async () => {
+    const decision = shown++ === 0 ? 'decline' : 'accept'
+    await Bun.sleep(30)
+    return decision
+  }).create()
+  await session.initialize()
+  expect((await session.run('approval:repeated')).text).toBe('decline,decline,decline')
+  expect(shown).toBe(1)
+  expect((await session.run('approval:repeated')).text).toBe('accept,decline,accept')
+  expect(shown).toBe(3)
+})
+
 test('relays a verified subagent approval and rejects a different child turn', async () => {
   const seen: ApprovalRequest[] = []
   const session = fixture('chatgpt', async approval => {
@@ -243,7 +289,8 @@ test('reuses one YAML decision for the same Codex command and asks again for a d
     await session.initialize()
     expect((await session.run('approval:policy')).text).toBe('accept')
     expect(seen).toHaveLength(1)
-    expect(seen[0]?.reason).toContain('вне песочницы')
+    expect(seen[0]?.reason).toBeUndefined()
+    expect(seen[0]?.notice).toContain('вне песочницы')
     expect((await session.run('approval:policy-production-shell')).text).toBe('accept')
     expect(seen).toHaveLength(2)
     expect((await session.run('approval:policy-mismatch')).text).toBe('accept')

@@ -71,7 +71,10 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   (`status.interval_ms`), and cleanup (`status.delete_on_complete`).
   `status.chat_action.enabled` controls the native typing indicator.
   `status.thoughts.enabled` lets the bubble show brief, public progress
-  commentary from Codex. Tool arguments are summarized and secrets are masked.
+  commentary from Codex. The activity block summarizes up to three recent
+  tool calls separately. The bridge moves the bubble below newly delivered
+  cards and messages while work continues, keeping the original elapsed time.
+  Set `watcher.enabled` to `true` if you want the separate busy reminder.
   The bubble and typing indicator stay active while Codex reports a running
   turn or a managed background job or subagent. Detached processes without
   Codex lifecycle events are outside the activity feed.
@@ -127,7 +130,7 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 - `/cc cost` shows account usage as percentage of the limits reported by
   Codex. The managed ChatGPT account may not report a cost per conversation.
 - `/goal <outcome and completion criteria>` starts a native Codex Goal.
-  Codex can continue it across turns with a 60,000-token budget for the goal.
+  Codex can continue it across turns. The bridge sends no fixed token budget for the goal.
   `/goal status`, `/goal pause`, `/goal resume`, and `/goal cancel`
   inspect or control it. `/stop` pauses an active goal. Completed plan
   steps appear as Telegram milestones and the current plan in the status pin.

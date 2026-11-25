@@ -4,15 +4,17 @@ import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rp
 import { sameFilePatch, type NativeFileChange } from './file-approval.js'
 import { agentChatTool, type AgentChatActions } from './chat-actions.js'
 import { isRoutineServerCommand } from './server-approval-policy.js'
+import { parseMcpApproval } from './mcp-approval.js'
 
 export type ApprovalDecision = 'accept' | 'decline' | 'cancel'
-import { parseMcpApproval } from './mcp-approval.js'
 
 export type ApprovalRequest = {
   kind: 'command' | 'file' | 'network' | 'stdin' | 'mcp'
   target: string
   cwd?: string
   reason?: string
+  notice?: string
+  dedupeKey?: string
 }
 export type PolicyApprovalRequest = ApprovalRequest & {
   kind: 'command' | 'file'
@@ -84,7 +86,12 @@ function networkDestination(context: unknown): string | undefined {
 }
 
 export class CodexSession {
-  private readonly pendingServerRequests = new Map<number | string, { threadId: string; abort: AbortController }>()
+  private readonly pendingServerRequests = new Map<number | string, {
+    threadId: string
+    turnId: string | undefined
+    abort: AbortController
+  }>()
+  private readonly turnApprovals = new WeakMap<Execution, { pending: Set<string>; declined: Set<string> }>()
   private readonly rpc: CodexRpc
   private threadId: string | null = null
   private needsResume = false
@@ -138,9 +145,13 @@ export class CodexSession {
     const id = this.threadId
     if (!id) return true
     if (this.needsResume) await this.resume(id)
-    const result = await this.rpc.request('thread/read', { threadId: id, includeTurns: false })
+    return this.threadIsIdle(id)
+  }
+
+  async threadIsIdle(threadId: string): Promise<boolean> {
+    const result = await this.rpc.request('thread/read', { threadId, includeTurns: false }, 5000)
     const thread = object(result.thread)
-    if (thread.id !== id) return false
+    if (thread.id !== threadId) return false
     const status = object(thread.status).type
     return status === 'idle' || status === 'notLoaded'
   }
@@ -400,10 +411,13 @@ export class CodexSession {
 
   private receive(event: CodexEvent): void {
     if (event.method === 'serverRequest/resolved') {
-      const { requestId, threadId } = event.params
+      const { requestId, threadId, turnId } = event.params
       if (typeof requestId === 'number' || typeof requestId === 'string') {
         const request = this.pendingServerRequests.get(requestId)
-        if (request && request.threadId === threadId) request.abort.abort()
+        if (request && (request.turnId === undefined ? request.threadId === threadId :
+          (threadId == null || request.threadId === threadId) && (turnId == null || request.turnId === turnId))) {
+          request.abort.abort()
+        }
       }
     }
     this.settings.onActivity?.(event, this.threadId)
@@ -485,6 +499,32 @@ export class CodexSession {
     return [this.active, this.goalTurn].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
   }
 
+  private async approveInTurn(
+    execution: Execution, request: ApprovalRequest, approve: NonNullable<Settings['approve']>, signal?: AbortSignal,
+  ): Promise<ApprovalDecision> {
+    if (signal?.aborted) return 'cancel'
+    if (request.target.length > 3000) return approve(request, signal)
+    let state = this.turnApprovals.get(execution)
+    if (!state) {
+      state = { pending: new Set(), declined: new Set() }
+      this.turnApprovals.set(execution, state)
+    }
+
+    const key = JSON.stringify([request.kind, request.cwd, request.dedupeKey ?? request.target])
+    if (state.pending.has(key) || state.declined.has(key)) return 'decline'
+    state.pending.add(key)
+    try {
+      const decision = await approve(request, signal)
+      if (decision === 'decline' && !signal?.aborted) {
+        if (state.declined.size >= 128) state.declined.delete(state.declined.values().next().value!)
+        state.declined.add(key)
+      }
+      return decision
+    } finally {
+      state.pending.delete(key)
+    }
+  }
+
   async requestPolicyApproval({ operation, ...request }: PolicyApprovalRequest): Promise<ApprovalDecision> {
     const approve = this.settings.approve
     if (!approve) return 'decline'
@@ -492,19 +532,19 @@ export class CodexSession {
     const matches = this.runningTurns().filter(turn => turn.threadId === operation.threadId)
       .flatMap(owner => [owner, ...owner.children.values()].filter(execution => execution.id === operation.turnId)
         .map(execution => ({ owner, execution })))
-    if (matches.length !== 1) return approve(request)
-    const { owner, execution } = matches[0]!
-    const decision = await approve({
+    const scope = matches.length === 1 ? matches[0] : await this.approvalExecution(operation.threadId, operation.turnId)
+    if (!scope) return approve(request)
+    const { owner, execution } = scope
+    const canRecordReceipt = owner.threadId === operation.threadId
+    const decision = await this.approveInTurn(execution, canRecordReceipt ? {
       ...request,
-      reason: [request.kind === 'command'
+      notice: request.kind === 'command'
         ? 'Если эта же команда потребует нативное разрешение, её можно один раз выполнить вне песочницы.'
         : 'Если этот же набор изменений потребует нативное разрешение, его можно один раз применить вне песочницы.',
-      request.reason]
-        .filter(Boolean).join('\n\n'),
-    })
+    } : request, approve)
     if (!this.runningTurns().includes(owner) ||
         (owner !== execution && owner.children.get(execution.threadId) !== execution)) return 'cancel'
-    if (decision === 'accept' && owner.approvedPolicy.size < 128) {
+    if (decision === 'accept' && canRecordReceipt && owner.approvedPolicy.size < 128) {
       owner.approvedPolicy.set(JSON.stringify([execution.threadId, operation.turnId, operation.itemId]), {
         kind: request.kind, target: request.target, cwd: request.cwd, until: Date.now() + 30_000,
       })
@@ -553,13 +593,15 @@ export class CodexSession {
       const request = parseMcpApproval(params)
       const approve = this.settings.approve
       if (!request || !approve) return { action: 'cancel' }
-      const scope = await this.approvalExecution(request.threadId, request.turnId)
-      if (!scope) return { action: 'cancel' }
-      const { owner, execution } = scope
-      const decision = await this.withServerRequest(id, execution.threadId,
-        signal => approve(request.operation, signal)).catch(() => 'cancel')
-      if (!this.runningTurns().includes(owner) ||
-          (owner !== execution && owner.children.get(execution.threadId) !== execution)) return { action: 'cancel' }
+      const decision = await this.withServerRequest(id, request.threadId, async signal => {
+        const scope = await this.approvalExecution(request.threadId, request.turnId)
+        if (signal.aborted || !scope) return 'cancel'
+        const { owner, execution } = scope
+        const decision = await this.approveInTurn(execution, request.operation, approve, signal)
+        if (signal.aborted || !this.runningTurns().includes(owner) ||
+            (owner !== execution && owner.children.get(execution.threadId) !== execution)) return 'cancel'
+        return decision
+      }, request.turnId).catch(() => 'cancel')
       return decision === 'accept' ? { action: 'accept', content: {} } : { action: decision }
     }
     const commandRequest = method === 'item/commandExecution/requestApproval'
@@ -615,20 +657,25 @@ export class CodexSession {
         isRoutineServerCommand(target, params.cwd)) {
       return { decision: 'accept' }
     }
-    const decision = await this.withServerRequest(id, execution.threadId, signal => approve({
+    const decision = await this.withServerRequest(id, execution.threadId, signal => this.approveInTurn(execution, {
       kind: network ? 'network' : stdin ? 'stdin' : commandRequest ? 'command' : 'file',
       target,
       ...(typeof params.cwd === 'string' ? { cwd: params.cwd } : {}),
       ...(typeof params.reason === 'string' ? { reason: params.reason } : {}),
-    }, signal)).catch(() => 'decline' as const)
+    }, approve, signal)).catch(() => 'decline' as const)
     return { decision: this.runningTurns().includes(owner) &&
       (owner === execution || owner.children.get(execution.threadId) === execution)
       ? stdin && decision === 'decline' ? 'cancel' : decision : 'cancel' }
   }
 
-  private async withServerRequest<T>(id: number | string, threadId: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private async withServerRequest<T>(
+    id: number | string, threadId: string, run: (signal: AbortSignal) => Promise<T>, turnId?: string,
+  ): Promise<T> {
     const abort = new AbortController()
-    this.pendingServerRequests.set(id, { threadId, abort })
-    try { return await run(abort.signal) } finally { this.pendingServerRequests.delete(id) }
+    const request = { threadId, turnId, abort }
+    this.pendingServerRequests.set(id, request)
+    try { return await run(abort.signal) } finally {
+      if (this.pendingServerRequests.get(id) === request) this.pendingServerRequests.delete(id)
+    }
   }
 }

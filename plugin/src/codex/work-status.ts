@@ -5,6 +5,7 @@ import type { StatusHandle, StatusManager, StatusState } from '../status/status-
 import { object, type CodexEvent } from './rpc.js'
 
 type Settings = AppConfig['status']
+const REPOST_DELAY_MS = 120
 
 function activityCall(item: ReturnType<typeof object>, clean: (text: string) => string): ActivityCall | undefined {
   const tool = typeof item.tool === 'string' ? clean(item.tool) : ''
@@ -40,10 +41,14 @@ function activityCall(item: ReturnType<typeof object>, clean: (text: string) => 
 }
 
 export class CodexWorkStatus {
+  private latestChatMessage = 0
+  private repostTimer: ReturnType<typeof setTimeout> | undefined
   private foreground = false
   private closed = false
   private native = new Set<string>()
-  private children = new Set<string>()
+  private children = new Map<string, number>()
+  private childRevision = 0
+  private checkingChildren = false
   private commands = new Map<string, string>()
   private backgroundCommands = new Set<string>()
   private calls = new Map<string, ActivityCall>()
@@ -58,7 +63,7 @@ export class CodexWorkStatus {
   private pending: Promise<void> | undefined
 
   constructor(
-    private manager: Pick<StatusManager, 'start' | 'update' | 'complete' | 'isActive'>,
+    private manager: Pick<StatusManager, 'start' | 'update' | 'complete' | 'isActive' | 'activeMessageId'>,
     private chatId: string,
     private config: Settings,
     private secrets: readonly string[],
@@ -95,20 +100,50 @@ export class CodexWorkStatus {
 
   async close(): Promise<void> {
     this.closed = true
+    clearTimeout(this.repostTimer)
     this.render()
     await this.pending
   }
 
-  repost(): void {
-    if (!this.busy || this.closed) return
-    this.generation++
-    this.render()
+  repost(messageId: number): void {
+    if (!this.busy || !Number.isSafeInteger(messageId) ||
+        messageId <= Math.max(this.latestChatMessage, this.manager.activeMessageId(this.chatId))) return
+    this.latestChatMessage = messageId
+    if (this.repostTimer !== undefined) return
+    this.repostTimer = setTimeout(() => {
+      this.repostTimer = undefined
+      if (this.busy) this.render()
+    }, REPOST_DELAY_MS)
+    this.repostTimer.unref()
+  }
+
+  async reconcileChildren(isIdle: (threadId: string) => Promise<boolean>): Promise<void> {
+    if (this.closed || this.foreground || this.checkingChildren || !this.children.size) return
+    this.checkingChildren = true
+    try {
+      await Promise.all([...this.children].map(async ([id, revision]) => {
+        let idle: boolean
+        try {
+          idle = await isIdle(id)
+        } catch {
+          return
+        }
+        // A child can start new work while its thread/read is in flight.
+        if (idle && !this.closed && !this.foreground && this.children.get(id) === revision) {
+          this.children.delete(id)
+          this.native.delete(id)
+          this.render()
+        }
+      }))
+    } finally {
+      this.checkingChildren = false
+    }
   }
 
   receive({ method, params }: CodexEvent, currentThread: string | null): void {
     if (this.closed || typeof params.threadId !== 'string') return
-    if (!['turn/started', 'turn/completed', 'thread/status/changed', 'thread/closed',
-      'item/started', 'item/completed'].includes(method)) return
+    // Aggregate thread status may arrive after the turn that produced it.
+    if (!['turn/started', 'turn/completed', 'thread/closed', 'item/started', 'item/completed'].includes(method)) return
     const thread = params.threadId
     if (thread !== currentThread && !this.children.has(thread) && !this.native.has(thread) &&
         ![...this.commands.values()].includes(thread)) return
@@ -116,10 +151,9 @@ export class CodexWorkStatus {
     if (wasBusy) this.lastActivityAt = this.now()
     let update = false
     const item = object(params.item)
-    if (method === 'turn/started' || method === 'thread/status/changed') {
-      const active = method === 'turn/started' || object(params.status).type === 'active'
-      if (active) this.native.add(thread)
-      else this.native.delete(thread)
+    if (method === 'turn/started') {
+      this.native.add(thread)
+      if (this.children.has(thread)) this.children.set(thread, ++this.childRevision)
       update = wasBusy !== this.busy
     } else if (method === 'turn/completed' || method === 'thread/closed') {
       this.native.delete(thread)
@@ -135,7 +169,9 @@ export class CodexWorkStatus {
       update = wasBusy !== this.busy
     } else if (method === 'item/started' || method === 'item/completed') {
       if (item.type === 'subAgentActivity' && typeof item.agentThreadId === 'string') {
-        if (item.kind === 'started' || item.kind === 'interacted') this.children.add(item.agentThreadId)
+        if (item.kind === 'started' || item.kind === 'interacted') {
+          this.children.set(item.agentThreadId, ++this.childRevision)
+        }
         if (item.kind === 'completed' || item.kind === 'interrupted') {
           this.children.delete(item.agentThreadId)
           this.native.delete(item.agentThreadId)
@@ -145,7 +181,7 @@ export class CodexWorkStatus {
       if (item.type === 'collabAgentToolCall') {
         for (const [id, raw] of Object.entries(object(item.agentsStates))) {
           const status = object(raw).status
-          if (status === 'running' || status === 'pendingInit') this.children.add(id)
+          if (status === 'running' || status === 'pendingInit') this.children.set(id, ++this.childRevision)
           else if (typeof status === 'string') {
             this.children.delete(id)
             this.native.delete(id)
@@ -212,9 +248,11 @@ export class CodexWorkStatus {
     while (this.dirty) {
       this.dirty = false
       try {
-        if (this.handle && (!this.busy || this.renderedGeneration !== this.generation)) {
+        const bubbleId = this.manager.activeMessageId(this.chatId)
+        const shouldMove = this.busy && this.repostTimer === undefined && bubbleId > 0 && bubbleId < this.latestChatMessage
+        if (this.handle && (!this.busy || this.renderedGeneration !== this.generation || shouldMove)) {
           this.handle = undefined
-          await this.manager.complete(this.chatId)
+          await this.manager.complete(this.chatId, shouldMove)
         }
         if (!this.busy) continue
         const state: StatusState = { kind: 'activity', snapshot: {

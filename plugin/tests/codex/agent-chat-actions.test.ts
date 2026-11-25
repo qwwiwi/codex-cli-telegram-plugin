@@ -4,6 +4,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgentChatActions } from '../../src/codex/chat-actions.js'
 
+test('hides the transport label in native replies and preserves file-only delivery', async () => {
+  const sent: string[] = []
+  const actions = new AgentChatActions({
+    async sendMessage(_chat, text) { sent.push(text); return { message_id: 24 } },
+    async editMessageText() {}, async pinChatMessage() {}, async unpinChatMessage() {}, async setMessageReaction() {},
+  }, '123', { async sendFile(path) { sent.push(path); return 25 } })
+  expect((await actions.call('text', { action: 'reply', text: '**Ответ в чате:** Проверю' }, () => true)).success).toBe(true)
+  expect((await actions.call('file', { action: 'reply', text: 'Ответ в чате:', files: ['result.txt'] }, () => true)).success).toBe(true)
+  expect(sent).toEqual(['Проверю', 'result.txt'])
+})
+
 test('recovers a known target and can send an attachment as a quoted interim reply', async () => {
   const root = mkdtempSync(join(tmpdir(), 'krot-agent-targets-'))
   const calls: unknown[][] = []

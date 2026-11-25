@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import type { Message } from 'grammy/types'
 import { atomicWriteInRoot } from '../autonomy/store.js'
 import type { DownloadResult, TelegramApi } from '../channel/tools.js'
+import { normalizeChatReply } from './continuation.js'
 import { object } from './rpc.js'
 
 export type ChatAction = 'pin' | 'unpin' | 'react' | 'edit' | 'get'
@@ -242,7 +243,9 @@ export class AgentChatActions {
     download?: DownloadAction): Promise<boolean> {
     const execution = this.pending.then(async () => {
       if (!current()) return false
-      const { action, target, text, emoji, files } = args
+      const { action, target, emoji, files } = args
+      const normalized = action === 'reply' && typeof args.text === 'string' ? normalizeChatReply(args.text) : args.text
+      const text = normalized === '' && normalized !== args.text ? undefined : normalized
       const id = target === 'last_reply' ? this.lastReply : typeof target === 'number' ? target : undefined
       const message = id === undefined ? undefined : this.targets.get(id)
       const validText = typeof text === 'string' && text.trim().length > 0 && text.length <= 3900

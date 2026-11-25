@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { TelegramApi } from '../channel/tools.js'
+import { escapeHtml } from '../format/html.js'
 import { redactSecrets } from '../safety/redact.js'
 import { permissionDecisionKeyboard, renderPermissionCard } from '../telegram/permission-gate-ui.js'
 import type { ApprovalDecision, ApprovalRequest } from './session.js'
@@ -42,9 +43,14 @@ export class ApprovalCards {
     }
 
     const tool = { network: 'Сетевой доступ', stdin: 'Ввод в терминал', command: 'Bash', file: 'Edit', mcp: 'MCP' }[request.kind]
-    const reason = redactSecrets(request.reason?.trim().slice(0, 400) || 'Действие требует твоего подтверждения.', this.secrets)
-    const preview = renderPermissionCard(tool, reason, operation)
-    const summary = renderPermissionCard(tool, reason, '')
+    const reason = redactSecrets((request.reason?.trim().slice(0, 400) ?? '').replace(
+      /\bgit config\/hook execution surface needs confirmation\b/giu,
+      'Команда Git может запускать скрипты или менять настройки их запуска.',
+    ), this.secrets)
+    const notice = redactSecrets(request.notice?.trim().slice(0, 400) ?? '', this.secrets)
+    const pendingReason = [reason || 'Действие требует твоего подтверждения.', notice].filter(Boolean).join('\n\n')
+    const preview = renderPermissionCard(tool, pendingReason, operation)
+    const summary = '🔐 <b>Запрос подтверждения</b>' + (reason ? '\n\nПричина: ' + escapeHtml(reason) : '')
     if (preview.length > 4000) return Promise.resolve('decline')
 
     const id = randomUUID()

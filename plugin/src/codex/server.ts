@@ -1,9 +1,10 @@
+import { randomUUID } from 'node:crypto'
 import { mkdirSync, realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { Bot } from 'grammy'
 import type { Message } from 'grammy/types'
 import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
-import { carriesExpandableBlockquote, createTelegramApi } from '../channel/tools.js'
+import { carriesExpandableBlockquote, createTelegramApi, type TelegramApi } from '../channel/tools.js'
 import { getStatePaths, loadConfig, resolveAskGuardMode, resolveHudEnabled, resolveOutboxEnabled, RuntimeEnvSchema } from '../config.js'
 import { splitMessage } from '../format/chunk.js'
 import { isTelegramHtmlParseError, markdownToTelegramHtml } from '../format/html.js'
@@ -34,7 +35,7 @@ import { CardCleanup } from './card-cleanup.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
 import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import {
-  automaticContinuation, directOwnerTask, followUpInstructions, hideContinuationMarker, ownerExecutionTask,
+  automaticContinuation, directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
   ownerStatusCheck, ownerTaskBlocked, ownerTaskContinuationInput, ownerTaskWithdrawn, publicProgress,
   takeContinuation, unfinishedOwnerTask, type ContinuationContext,
 } from './continuation.js'
@@ -45,6 +46,11 @@ import { CodexInbox, type InboxReply } from './inbox.js'
 import { startExternalTasks } from './external.js'
 import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-delivery.js'
 import { deliverReplyPart, type PartStatus } from './reply-delivery.js'
+import {
+  BridgeRestart, bridgeRestartDirectInstructions, bridgeRestartInstructions, bridgeRestartReply,
+  bridgeRestartVerificationInstructions, ownerRequestedBridgeRestart, ownerRequestedRestartVerification, restartOwnerText,
+} from './restart-bridge.js'
+import { BridgeRestartHandoff, isRestartVerificationMessage } from './restart-handoff.js'
 import { readHandoffContext } from './handoff-context.js'
 import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   downloadQuotedAttachment, safeActionTarget, type ChatAction } from './chat-actions.js'
@@ -65,7 +71,8 @@ import type { TodoItem } from '../schemas.js'
 const autonomyInstructions = 'Для большой задачи составь план и обновляй его по мере работы. ' +
   'О существенном результате или блокере сообщай во время работы отдельной публичной репликой «Веха: …» или «Ответ в чате: …». ' +
   'В рабочем отчёте начни с текущего результата, выдели первую строку жирным и отдели смысловые части пустой строкой. ' +
-  'Несколько проверок или изменений перечисляй списком, команды и пути выделяй обратными кавычками. ' +
+  'Для сравнений и последовательности шагов соблюдай правила оформления из AGENTS.md агента. ' +
+  'Команды и пути выделяй обратными кавычками. ' +
   'В промежуточном сообщении укажи, что проверено и какой шаг идёт дальше. ' +
   'Делегируй независимые части нативным субагентам Codex, если инструменты доступны и это помогает задаче. ' +
   'Продолжай работу после промежуточных результатов до проверенного итога или реального блокера. ' +
@@ -116,7 +123,7 @@ async function main(): Promise<void> {
     secrets,
     createRichLatch(),
   )
-  const telegram = createReliableTelegramApi(safeTelegram, log, {
+  const reliableTelegram = createReliableTelegramApi(safeTelegram, log, {
     deadLetter: record => writeDeadLetter(paths, 'outbound', { ...record, error: redactSecrets(record.error, secrets) }),
   })
   let onDeferredDelivery: OutboxOptions['onDelivered']
@@ -127,6 +134,7 @@ async function main(): Promise<void> {
   let flushing: Promise<void> | undefined
   let outboxTimer: ReturnType<typeof setInterval> | undefined
   let watchdogTimer: ReturnType<typeof setInterval> | undefined
+  let workerStatusTimer: ReturnType<typeof setInterval> | undefined
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined
   let goalRecoveryTimer: ReturnType<typeof setTimeout> | undefined
   const memory = config.memory.enabled && config.memory.workspace_path ? new MemoryWriter({
@@ -141,9 +149,9 @@ async function main(): Promise<void> {
   }, log) : undefined
   const poller = new TelegramPoller({ bot, config, statePaths: paths, log, onUpdate: update => bot.handleUpdate(update) })
   const statusApi = {
-    sendMessage: telegram.sendMessage,
-    editMessageText: telegram.editMessageText,
-    sendChatAction: telegram.sendChatAction,
+    sendMessage: reliableTelegram.sendMessage,
+    editMessageText: reliableTelegram.editMessageText,
+    sendChatAction: reliableTelegram.sendChatAction,
     deleteMessage: async (chatId: string, id: number) => { await bot.api.deleteMessage(chatId, id) },
   }
   const statusConfig = { ...config, status: { ...config.status } }
@@ -154,6 +162,25 @@ async function main(): Promise<void> {
     orphanStore: new FileOrphanStore(paths.statusOrphans, log),
   })
   const work = new CodexWorkStatus(status, String(ownerId), config.status, secrets)
+  function trackDelivery<T extends { message_id: number } | { fallback: true }>(chat: string, result: T): T {
+    if (chat === String(ownerId) && 'message_id' in result) work.repost(result.message_id)
+    return result
+  }
+  const telegram: TelegramApi = {
+    ...reliableTelegram,
+    async sendMessage(chat, text, options) {
+      return trackDelivery(chat, await reliableTelegram.sendMessage(chat, text, options))
+    },
+    async sendRichMessage(chat, text, options) {
+      return trackDelivery(chat, await reliableTelegram.sendRichMessage(chat, text, options))
+    },
+    async sendDocument(chat, path, options) {
+      return trackDelivery(chat, await reliableTelegram.sendDocument(chat, path, options))
+    },
+    async sendPhoto(chat, path, options) {
+      return trackDelivery(chat, await reliableTelegram.sendPhoto(chat, path, options))
+    },
+  }
   status.setLivenessProbe(() => work.busy)
   const cards = new CardCleanup(paths.root, String(ownerId), log)
   const approvals = process.env.KROT_CODEX_APPROVALS === '1'
@@ -204,6 +231,7 @@ async function main(): Promise<void> {
     albums.flushAll()
     clearInterval(outboxTimer)
     clearInterval(watchdogTimer)
+    clearInterval(workerStatusTimer)
     clearInterval(questionTimer)
     clearTimeout(recoveryTimer)
     clearTimeout(goalRecoveryTimer)
@@ -259,6 +287,21 @@ async function main(): Promise<void> {
     let plans: TodoItem[] = []
     let milestoneThread = ''
     let lastNativePlan: { turnId: string; pending: boolean } | undefined
+    const selfRestartEnabled = process.platform === 'linux' && process.env.KROT_CODEX_SELF_RESTART === '1'
+    const restartHandoff = selfRestartEnabled && !proxy ? new BridgeRestartHandoff(paths.root, randomUUID(), ownerId) : undefined
+    const bridgeRestart = new BridgeRestart({
+      idle: () => !stopping && !task && !work.busy && !codex.isRunning && !goalActive && !externalQuestion &&
+        !resetting && !recoveringInbox && !recoveringGoal && !deliveringGoal && !approvals?.isPending &&
+        !questions.isPending && !inbox.active && inbox.size === 0 && !inbox.uncertainFollowUp &&
+        Object.keys(inbox.recoveredAlbums).length === 0,
+      notify: () => telegram.sendMessage(ownerChat, 'Перезапускаюсь. Итоговый ответ доставлен.', {}),
+      restart: () => {
+        log.info('Restarting bridge after owner notification')
+        process.exitCode = 75
+        shutdown()
+      },
+      onNotifyError: () => log.warn('Could not notify owner about requested restart'),
+    })
     const announced = new Set<string>()
     function setGoalActive(active: boolean): void {
       goalActive = active
@@ -368,7 +411,7 @@ async function main(): Promise<void> {
               plans = [...plans.slice(-9), { content, status: 'completed' }]
               void hud.updateNow(ownerChat)
             }
-            void sendFinalText(progress.text, false).then(() => work.repost()).catch(() => undefined)
+            void sendFinalText(progress.text, false).catch(() => undefined)
           }
         }
       },
@@ -410,6 +453,13 @@ async function main(): Promise<void> {
     })
     if (codex.currentThread) controls.remember(codex.currentThread)
     await codex.initialize()
+    workerStatusTimer = setInterval(() => {
+      if (!stopping) {
+        void work.reconcileChildren(child => codex.threadIsIdle(child))
+        if (selfRestartEnabled) void bridgeRestart.check()
+      }
+    }, 3000)
+    workerStatusTimer.unref()
     await bot.init()
     if (String(bot.botInfo.id) !== String(env.TELEGRAM_EXPECTED_BOT_ID)) {
       throw new Error('Configured Telegram token does not match the expected bot')
@@ -480,6 +530,7 @@ async function main(): Promise<void> {
     }
 
     async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number): Promise<void> {
+      text = normalizeChatReply(text)
       if (!text) return
       const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
       const question = questionConfig.enabled ? detectOpenQuestion(redactSecrets(text, secrets)) : undefined
@@ -611,6 +662,7 @@ async function main(): Promise<void> {
     })
     onDeferredDelivery = (item, id) => {
       if (item.chatId !== ownerChat) return
+      work.repost(id)
       agentChat.remember(id, true, true)
       if (questionConfig.enabled && item.question) {
         const { code, snippet } = item.question
@@ -923,6 +975,7 @@ async function main(): Promise<void> {
               await send('Дождись завершения текущей задачи или останови её через /stop.')
               return
             }
+            cancelPendingBridgeRestart()
             await codex.openArchive(await claudeArchiveContext(archive, rest[0], secrets, rest[2]))
             controls.selectGoal(undefined)
             await send('Открыл диалог Codex с контекстом из архива Claude. Можешь продолжить разговор.')
@@ -966,6 +1019,7 @@ async function main(): Promise<void> {
             await send('Дождись завершения текущей задачи или отправь /stop.')
             return
           }
+          if (id !== codex.currentThread) cancelPendingBridgeRestart()
           await codex.resume(id)
           plans = []
           milestoneThread = ''
@@ -1041,8 +1095,14 @@ async function main(): Promise<void> {
       })
     }
 
+    function cancelPendingBridgeRestart(): void {
+      bridgeRestart.cancel()
+      try { restartHandoff?.cancel() } catch { log.warn('Could not cancel saved restart verification') }
+    }
+
     async function cancelCurrentTurn(): Promise<boolean> {
       stopEpoch++
+      cancelPendingBridgeRestart()
       inbox.cancelContinuation()
       controls.setPendingOwnerTask(codex.currentThread)
       approvals?.cancelAll()
@@ -1154,10 +1214,12 @@ async function main(): Promise<void> {
             return
           }
         }
+        cancelPendingBridgeRestart()
         await memory?.snapshotBoundary('clear')
         codex.reset()
         plans = []
-        await send('Следующее сообщение начнёт новый диалог Codex.')
+        if (name === 'new') await telegram.sendMessage(ownerChat, '<b>Новая сессия</b> — контекст очищен.', { parse_mode: 'HTML' })
+        else await send('Следующее сообщение начнёт новый диалог Codex.')
         void hud.updateNow(ownerChat)
       } finally {
         resetting = false
@@ -1281,6 +1343,11 @@ async function main(): Promise<void> {
         const input = await prepareMessages(messages)
         if (stopping || inbox.uncertainFollowUp?.message_id !== id) return
         if (input.kind === 'input' && epoch === stopEpoch) {
+          if (selfRestartEnabled && ownerRequestedBridgeRestart(restartOwnerText(messages[0]!, input.ownerTranscript), !proxy)) {
+            inbox.finishFollowUp(id, true)
+            resumeInbox(messages[0])
+            return
+          }
           accepted = await codex.steer([followUpInstructions, agentChatInstructions, chatContext(messages), input.text]
             .filter(Boolean).join('\n\n'), id, input.images, turnId)
           completedRequest = true
@@ -1382,6 +1449,10 @@ async function main(): Promise<void> {
         await applyChatAction(action, ctx.message, text ?? '')
         return
       }
+      if (selfRestartEnabled && ownerRequestedBridgeRestart(restartOwnerText(ctx.message), !proxy)) {
+        await acceptInput(ctx.message)
+        return
+      }
       const turnId = codex.steerableTurn
       if (!action && text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
           (task || goalActive || codex.isRunning) && process.env.KROT_CODEX_SIDE_REPLY === '1' &&
@@ -1430,7 +1501,7 @@ async function main(): Promise<void> {
       }
     }
 
-    async function deliverReply(reply: InboxReply, messageId: number): Promise<void> {
+    async function deliverReply(reply: InboxReply, messageId: number): Promise<boolean> {
       await sendFinalText(reply.text, reply.files.length > 0, reply.replyTo, messageId)
       for (const [index, file] of reply.files.entries()) {
         const key = 'file:' + index
@@ -1451,6 +1522,7 @@ async function main(): Promise<void> {
           'Текст доступен через /cc export.',
         ].filter(Boolean).join('\n'))
       }
+      return parts.includes('sent') && !failed && !uncertain
     }
 
     async function continuationReply(context: ContinuationContext | undefined, report: string,
@@ -1497,10 +1569,11 @@ async function main(): Promise<void> {
     async function finishOrdinaryReply(epoch: number, recovering = false): Promise<void> {
       const active = inbox.active
       if (active?.outcome.stage !== 'ready') return
-      const { reply, continueGoal } = active.outcome
+      const { reply, continueGoal, restartBridge, restartVerification } = active.outcome
       const id = active.messages[0]!.message_id
+      let delivered: boolean
       try {
-        await deliverReply(reply, id)
+        delivered = await deliverReply(reply, id)
         deliveryRetryAt = 0
       } catch (error) {
         const limited = parse429(error)
@@ -1516,19 +1589,35 @@ async function main(): Promise<void> {
           controls.setPendingOwnerTask(thread)
         }
       }
+      let shouldRestart = selfRestartEnabled && delivered && restartBridge && !continueGoal && epoch === stopEpoch
+      if (shouldRestart && restartVerification) {
+        const thread = codex.currentThread
+        let alreadyRestored = false
+        try {
+          const previous = restartHandoff?.pending()
+          alreadyRestored = previous?.threadId === thread && previous.ownerMessageId === id
+          shouldRestart = !alreadyRestored && restartHandoff?.request(thread, id) === true
+        } catch { shouldRestart = false; log.warn('Could not save restart verification') }
+        if (!shouldRestart && !alreadyRestored) await send('Не удалось сохранить проверку после перезапуска. Мост продолжает работу.')
+      }
       inbox.finish(id)
+      if (shouldRestart && epoch === stopEpoch) bridgeRestart.request()
     }
 
     function startNext(): void {
       if (task || stopping || resetting || recoveringInbox || recoveringGoal || deliveringGoal ||
           goalActive || externalQuestion || codex.isRunning) return
+      try { restartHandoff?.recover(inbox) } catch { log.warn('Could not restore a saved restart verification') }
       let messages: Message[] | undefined
       try { messages = inbox.take() } catch {
         log.warn('Could not claim the next Telegram message')
         return
       }
       const first = messages?.[0]
-      if (!messages || !first) return
+      if (!messages || !first) {
+        if (selfRestartEnabled) void bridgeRestart.check()
+        return
+      }
       const chatId = ownerChat
       const epoch = stopEpoch
       work.begin(first.message_id > 0 ? first.message_id : undefined)
@@ -1539,6 +1628,12 @@ async function main(): Promise<void> {
           mirror.event('turn')
         }
         try {
+          const verification = isRestartVerificationMessage(first.message_id)
+          const origin = verification ? restartHandoff?.verification(first.message_id) : undefined
+          if (verification && !origin) {
+            inbox.finish(first.message_id)
+            return
+          }
           let cancelled = false
           cancelMedia = () => { cancelled = true }
           const input = await prepareMessages(messages)
@@ -1557,7 +1652,10 @@ async function main(): Promise<void> {
           const editTarget = first.text && first.reply_to_message && !first.forward_origin &&
             requestedChatAction(first.text) === 'edit' ? first.reply_to_message : undefined
           const ownerText = !editTarget && !first.forward_origin ? (first.text ?? first.caption)?.trim() : undefined
-          const taskText = directOwnerTask(first, input.ownerTranscript, !!editTarget)
+          const taskText = verification ? undefined : directOwnerTask(first, input.ownerTranscript, !!editTarget)
+          const restartTaskText = restartOwnerText(first, input.ownerTranscript)
+          const mayRestartBridge = selfRestartEnabled && ownerRequestedBridgeRestart(restartTaskText, !proxy)
+          const verificationEligible = !!restartHandoff && mayRestartBridge && ownerRequestedRestartVerification(restartTaskText)
           if (ownerTaskWithdrawn(taskText) || ownerExecutionTask(taskText)) {
             controls.setPendingOwnerTask(codex.currentThread)
           }
@@ -1571,6 +1669,9 @@ async function main(): Promise<void> {
           inbox.start(first.message_id, {
             ...(continuation ? { continuation: continuation.context } : {}),
             ...(leaseCompletion ? { lease: leaseCompletion.ticket } : {}),
+            ...(mayRestartBridge ? { mayRestartBridge: true } : {}),
+            ...(verificationEligible ? { verificationEligible: true } : {}),
+            ...(first.voice && taskText && taskText.length <= 4000 ? { voiceTaskText: redactSecrets(taskText, secrets) } : {}),
           })
           let latestTurnId: string | undefined
           const saveTurn = (turnId: string) => {
@@ -1579,6 +1680,18 @@ async function main(): Promise<void> {
           }
           const handoff = memory && config.memory.workspace_path && !codex.status.hasThread
             ? await readHandoffContext(config.memory.workspace_path, secrets).catch(() => '') : ''
+          if (origin) {
+            const ready = origin.threadId === codex.currentThread && await codex.previousTurnIdle().catch(() => false)
+            if (!ready || origin.threadId !== codex.currentThread || epoch !== stopEpoch) {
+              if (epoch === stopEpoch) {
+                inbox.complete(first.message_id, {
+                  text: 'Мост запущен. Не удалось восстановить предыдущий диалог для проверки.', files: [],
+                })
+                await finishOrdinaryReply(epoch)
+              } else inbox.finish(first.message_id)
+              return
+            }
+          }
           let result = await codex.run([
             attachmentInstructions, leases.instructions(), agentChatInstructions, chatContext(messages),
             handoff,
@@ -1587,6 +1700,8 @@ async function main(): Promise<void> {
               ? 'Чтобы предложить мандат, начни вопрос с [LEASE: точный объём; ttl=24h] и дай отдельные варианты «Да» и «Нет».'
               : '',
             [autonomyInstructions, continuation?.instructions, leaseCompletion?.instructions,
+              mayRestartBridge && (verificationEligible ? bridgeRestartVerificationInstructions : bridgeRestartInstructions),
+              mayRestartBridge && !proxy && bridgeRestartDirectInstructions,
               sameTaskStatus && 'Владелец спросил о состоянии. В этом ходе дай только отчёт и при необходимости проверь состояние чтением. ' +
                 'Если по той же задаче остался разрешённый шаг, укажи его и передай в следующий ход служебной строкой. ' +
                 'Изменения выполняй после того, как мост подтвердит, что отчёт относится к сохранённому поручению.',
@@ -1617,17 +1732,20 @@ async function main(): Promise<void> {
             return
           }
           const planPending = latestTurnId !== undefined && lastNativePlan?.turnId === latestTurnId && lastNativePlan.pending
-          const interim = question.take(result.text) ? undefined
+          const requestedRestart = bridgeRestartReply(result.text, mayRestartBridge, false, verificationEligible).requested
+          const interim = question.take(result.text) || requestedRestart ? undefined
             : await continuationReply(continuation?.context, result.text, epoch, planPending)
           if (interim === undefined) rememberBlocker(first, taskText, result.text, epoch)
           const completed = interim === undefined && leaseCompletion
             ? await leaseCompletion.complete(result.text) : hideLeaseCompletions(interim ?? result.text)
+          const restart = bridgeRestartReply(completed, mayRestartBridge, interim !== undefined, verificationEligible)
           const targetId = first.reply_to_message?.message_id
-          const extracted = extractAttachments(hideQuestionMarker(hideContinuationMarker(completed)))
+          const extracted = extractAttachments(hideQuestionMarker(hideContinuationMarker(restart.text)))
           const reply = { ...extracted, text: editTarget ? extracted.text :
             leases.finalReply(extracted.text, resolveAskGuardMode(config, log)),
           ...(targetId === undefined ? {} : { replyTo: targetId }) }
-          if (!editTarget) inbox.complete(first.message_id, { ...reply, text: redactSecrets(reply.text, secrets) }, interim !== undefined)
+          if (!editTarget) inbox.complete(first.message_id, { ...reply, text: redactSecrets(reply.text, secrets) },
+            interim !== undefined, restart.requested && epoch === stopEpoch, restart.verify)
           await recordMemory(codex.currentThread, input.text, reply.text, Date.now() - began)
           if (reply.text && editTarget) {
             try {
@@ -1714,16 +1832,24 @@ async function main(): Promise<void> {
               for (const message of active.messages) acknowledge(message)
               const targetId = active.messages[0]?.reply_to_message?.message_id
               const context = active.work?.continuation
-              const interim = await continuationReply(context, answer, epoch)
-              if (interim === undefined && context && !context.statusQuestion) {
-                rememberBlocker(active.messages[0]!, context.objective, answer, epoch)
+              const mayRestart = selfRestartEnabled && active.work?.mayRestartBridge === true
+              const mayVerify = !!restartHandoff && active.work?.verificationEligible === true
+              const requestedRestart = bridgeRestartReply(answer, mayRestart, false, mayVerify).requested
+              const interim = requestedRestart ? undefined : await continuationReply(context, answer, epoch)
+              const original = active.messages[0]!
+              const ownerTaskText = isRestartVerificationMessage(original.message_id) ? undefined
+                : active.work?.voiceTaskText ?? directOwnerTask(original)
+              if (interim === undefined && !context?.statusQuestion) {
+                rememberBlocker(original, ownerTaskText, answer, epoch)
               }
               const completed = interim === undefined && active.work?.lease
                 ? await leases.completion(active.work.lease).complete(answer) : hideLeaseCompletions(interim ?? answer)
-              const extracted = extractAttachments(hideQuestionMarker(hideContinuationMarker(completed)))
+              const restart = bridgeRestartReply(completed, mayRestart, interim !== undefined, mayVerify)
+              const extracted = extractAttachments(hideQuestionMarker(hideContinuationMarker(restart.text)))
               const reply = { ...extracted, text: leases.finalReply(extracted.text, resolveAskGuardMode(config, log)),
                 ...(targetId === undefined ? {} : { replyTo: targetId }) }
-              inbox.complete(active.messages[0]!.message_id, { ...reply, text: redactSecrets(reply.text, secrets) }, interim !== undefined)
+              inbox.complete(original.message_id, { ...reply, text: redactSecrets(reply.text, secrets) },
+                interim !== undefined, restart.requested && epoch === stopEpoch, restart.verify)
               await finishOrdinaryReply(epoch, true)
               if (!active.work?.continuation && hideContinuationMarker(answer) !== answer) {
                 await send('Сохранил промежуточный ответ. Автоматическое продолжение этой задачи не удалось восстановить.')

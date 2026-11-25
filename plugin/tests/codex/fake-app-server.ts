@@ -6,10 +6,32 @@ let turnNumber = 0
 let activeTurn = ''
 let pendingApproval = ''
 let childTurn = ''
+let resolveMcpDuringLookup: { requestId: string; threadId: string; turnId: string } | undefined
+let repeatedApproval: { prefix: string; results: Map<string, string> } | undefined
 const goalState: { current: { objective: string; status: string; origin: string } | null } = { current: null }
 
 for await (const line of createInterface({ input: process.stdin })) {
-  const { id, method, params } = JSON.parse(line)
+  const { id, method, params, result } = JSON.parse(line)
+  if (!method && repeatedApproval && typeof id === 'string' && id.startsWith(repeatedApproval.prefix)) {
+    const { prefix, results } = repeatedApproval
+    results.set(id, result?.decision ?? 'unsupported')
+    if (results.size === 2) {
+      emit({ id: prefix + '3', method: 'item/commandExecution/requestApproval', params: {
+        threadId, turnId: activeTurn, itemId: 'item-3', command: 'printf test', cwd: '/workspace',
+      } })
+    } else if (results.size === 3) {
+      emit({ method: 'item/completed', params: {
+        threadId, turnId: activeTurn,
+        item: { type: 'agentMessage', phase: 'final_answer',
+          text: [1, 2, 3].map(index => results.get(prefix + index)).join(',') },
+      } })
+      emit({ method: 'turn/completed', params: {
+        threadId, turn: { id: activeTurn, status: 'completed' },
+      } })
+      repeatedApproval = undefined
+    }
+    continue
+  }
   if (!method && id === pendingApproval) {
     const response = JSON.parse(line)
     emit({ method: 'item/completed', params: {
@@ -67,8 +89,14 @@ for await (const line of createInterface({ input: process.stdin })) {
       respond({ data: [{ items: [{ type: 'agentMessage', text: 'Example' }] }], nextCursor: null })
       break
     case 'thread/read':
+      if (resolveMcpDuringLookup?.threadId === params.threadId) {
+        emit({ method: 'serverRequest/resolved', params: resolveMcpDuringLookup })
+        resolveMcpDuringLookup = undefined
+      }
       respond({ thread: {
-        id: params.threadId, cwd: process.cwd(), sessionId: threadId, parentThreadId: threadId,
+        id: params.threadId === 'wrong-thread' ? 'other-thread' : params.threadId,
+        status: { type: ({ 'idle-child': 'idle', 'unloaded-child': 'notLoaded', 'wrong-thread': 'idle' } as Record<string, string>)[params.threadId] ?? 'active' },
+        cwd: process.cwd(), sessionId: threadId, parentThreadId: threadId,
         source: { subAgent: { thread_spawn: { parent_thread_id: threadId, depth: 1 } } },
       } })
       break
@@ -114,16 +142,26 @@ for await (const line of createInterface({ input: process.stdin })) {
       }
       if (params.input[0].text.startsWith('mcp-approval:')) {
         const scenario = params.input[0].text
+        const github = scenario.includes(':github')
         respond({ turn: { id: activeTurn } })
         emit({ method: 'turn/started', params: { threadId, turn: { id: activeTurn } } })
         pendingApproval = 'mcp-approval-' + turnNumber
+        const worker = scenario.endsWith('resolved')
+        if (worker) {
+          resolveMcpDuringLookup = { requestId: pendingApproval, threadId: 'mcp-worker', turnId: activeTurn + '-worker' }
+          emit({ method: 'turn/started', params: {
+            threadId: resolveMcpDuringLookup.threadId, turn: { id: resolveMcpDuringLookup.turnId },
+          } })
+        }
         emit({ id: pendingApproval, method: 'mcpServer/elicitation/request', params: {
-          threadId, turnId: scenario.endsWith('stale') ? 'wrong-turn' : activeTurn,
-          serverName: 'example-tasks', mode: scenario.endsWith('url') ? 'url' : 'form',
+          threadId: resolveMcpDuringLookup?.threadId ?? threadId,
+          turnId: resolveMcpDuringLookup?.turnId ?? (scenario.endsWith('stale') ? 'wrong-turn' : activeTurn),
+          serverName: github ? 'codex_apps' : 'example-tasks', mode: scenario.endsWith('url') ? 'url' : 'form',
           message: 'Allow opening this test task?',
           requestedSchema: { type: 'object', properties: {} },
-          _meta: { codex_approval_kind: 'mcp_tool_call', tool_name: 'task_read',
-            tool_params: { id: 42 }, persist: 'always' },
+          _meta: { codex_approval_kind: 'mcp_tool_call', tool_name: github ? 'github.create_tree' : 'task_read',
+            tool_params: github ? { repository_full_name: 'example/private', tree: [{ content: 'internal fixture' }] }
+              : { id: 42 }, persist: 'always' },
         } })
         break
       }
@@ -137,6 +175,16 @@ for await (const line of createInterface({ input: process.stdin })) {
         ].join('\n')
         respond({ turn: { id: activeTurn } })
         emit({ method: 'turn/started', params: { threadId, turn: { id: activeTurn } } })
+        if (scenario === 'approval:repeated') {
+          const prefix = 'repeated-approval-' + turnNumber + '-'
+          repeatedApproval = { prefix, results: new Map() }
+          for (const index of [1, 2]) {
+            emit({ id: prefix + index, method: 'item/commandExecution/requestApproval', params: {
+              threadId, turnId: activeTurn, itemId: 'item-' + index, command: 'printf test', cwd: '/workspace',
+            } })
+          }
+          break
+        }
         childTurn = activeTurn + '-child'
         if (scenario.startsWith('approval:child')) {
           emit({ method: 'turn/started', params: { threadId: 'child', turn: { id: childTurn } } })

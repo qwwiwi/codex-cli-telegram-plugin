@@ -67,7 +67,7 @@ test('one visible Telegram approval is bound to the owner, chat and message', as
   expect(await result).toBe('accept')
   expect(edits[0]).toEqual({
     id: 7,
-    text: '🔐 <b>Запрос подтверждения</b>\n\nИнструмент: <code>Bash</code>\nПричина: Действие требует твоего подтверждения.\n\n<b>✅ Разрешено</b>',
+    text: '🔐 <b>Запрос подтверждения</b>\n\n<b>✅ Разрешено</b>',
     keyboard: { inline_keyboard: [] },
   })
   expect(cards.resolve(key, 123, 123, 7)).toBe(false)
@@ -76,14 +76,17 @@ test('one visible Telegram approval is bound to the owner, chat and message', as
 test('renders the legacy confirmation card and escapes the Codex command', async () => {
   const { cards, messages, edits } = fixture()
   const result = cards.request({
-    kind: 'command', target: 'printf "<test>"', cwd: '/workspace', reason: 'Write outside workspace',
+    kind: 'command', target: 'printf "<test>"', cwd: '/workspace',
+    reason: 'git config/hook execution surface needs confirmation <test>',
+    notice: 'Та же команда может один раз выполниться вне песочницы.',
   })
   await Promise.resolve()
   const { text, options } = messages[0]!
   expect(options.parse_mode).toBe('HTML')
   expect(text).toContain('🔐 <b>Запрос подтверждения</b>')
   expect(text).toContain('Инструмент: <code>Bash</code>')
-  expect(text).toContain('Причина: Write outside workspace')
+  expect(text).toContain('Причина: Команда Git может запускать скрипты или менять настройки их запуска. &lt;test&gt;')
+  expect(text).toContain('Та же команда может один раз выполниться вне песочницы.')
   expect(text).toContain('<pre>/workspace\nprintf "&lt;test&gt;"</pre>')
   const buttons = options.reply_markup!.inline_keyboard[0]!
   expect(buttons.map(button => button.text)).toEqual(['✅ Allow', '❌ Deny'])
@@ -91,7 +94,7 @@ test('renders the legacy confirmation card and escapes the Codex command', async
   expect(await result).toBe('decline')
   expect(edits[0]).toEqual({
     id: 7,
-    text: '🔐 <b>Запрос подтверждения</b>\n\nИнструмент: <code>Bash</code>\nПричина: Write outside workspace\n\n<b>❌ Запрещено</b>',
+    text: '🔐 <b>Запрос подтверждения</b>\n\nПричина: Команда Git может запускать скрипты или менять настройки их запуска. &lt;test&gt;\n\n<b>❌ Запрещено</b>',
     keyboard: { inline_keyboard: [] },
   })
 })

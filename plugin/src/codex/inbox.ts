@@ -9,9 +9,11 @@ import type { PartStatus } from './reply-delivery.js'
 const filename = 'codex-inbox.json'
 const limit = 16
 export type InboxReply = { text: string; files: string[]; replyTo?: number }
-type Work = { continuation?: ContinuationContext; lease?: LeaseTicket }
+type Work = { continuation?: ContinuationContext; lease?: LeaseTicket; mayRestartBridge?: true;
+  verificationEligible?: true; voiceTaskText?: string }
 type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string } |
-  { stage: 'ready'; reply: InboxReply; continueGoal?: true; delivery?: Record<string, PartStatus> }
+  { stage: 'ready'; reply: InboxReply; continueGoal?: true; restartBridge?: true; restartVerification?: true;
+    delivery?: Record<string, PartStatus> }
 type Active = { messages: Message[]; outcome: Outcome; work?: Work }
 type Pending = { ready: Message[][]; albums: Record<string, Message[]>; accepted: number[]; active?: Active;
   followUp?: Message[]; followUpIndex?: number }
@@ -72,7 +74,7 @@ export class CodexInbox {
     }
   }
 
-  receive(message: Message): 'accepted' | 'duplicate' | 'full' {
+  receive(message: Message, prioritize = false): 'accepted' | 'duplicate' | 'full' {
     if (!this.isOwner(message)) throw new Error('Codex inbox owner mismatch')
     if (this.state.accepted.includes(message.message_id)) return 'duplicate'
     const group = message.media_group_id
@@ -85,7 +87,10 @@ export class CodexInbox {
       if (existing.length >= 10) return 'full'
       this.save({ ...this.state, accepted, albums: { ...this.state.albums, [group]: [...existing, message] } })
     } else {
-      this.save({ ...this.state, accepted, ready: [...this.state.ready, [message]] })
+      const ready = prioritize ? [[message], ...this.state.ready] : [...this.state.ready, [message]]
+      const followUpIndex = this.state.followUpIndex
+      this.save({ ...this.state, accepted, ready,
+        ...(prioritize && followUpIndex !== undefined ? { followUpIndex: followUpIndex + 1 } : {}) })
     }
     return 'accepted'
   }
@@ -130,10 +135,14 @@ export class CodexInbox {
     this.updateActive(id, { stage: 'running', turnId })
   }
 
-  complete(id: number, reply: InboxReply, continueGoal?: boolean): void {
+  complete(id: number, reply: InboxReply, continueGoal?: boolean, restartBridge?: boolean, restartVerification?: boolean): void {
     const previous = this.state.active?.outcome
-    const pending = continueGoal ?? (previous?.stage === 'ready' && previous.continueGoal)
-    this.updateActive(id, { stage: 'ready', reply, ...(pending ? { continueGoal: true } : {}) })
+    const ready = previous?.stage === 'ready' ? previous : undefined
+    const pending = continueGoal ?? ready?.continueGoal
+    const restart = restartBridge ?? ready?.restartBridge
+    const verify = restartVerification ?? ready?.restartVerification
+    this.updateActive(id, { stage: 'ready', reply, ...(pending ? { continueGoal: true } : {}),
+      ...(!pending && restart ? { restartBridge: true, ...(verify ? { restartVerification: true } : {}) } : {}) })
   }
 
   replyPart(id: number, key: string): PartStatus | undefined {
@@ -160,8 +169,10 @@ export class CodexInbox {
 
   cancelContinuation(): void {
     const active = this.state.active
-    if (!active?.work?.continuation) return
-    const { continuation: _, ...work } = active.work
+    if (!active) return
+    const { continuation, mayRestartBridge, verificationEligible, voiceTaskText, ...work } = active.work ?? {}
+    const restart = active.outcome.stage === 'ready' && active.outcome.restartBridge
+    if (!continuation && !mayRestartBridge && !verificationEligible && !voiceTaskText && !restart) return
     const outcome = active.outcome.stage === 'ready'
       ? { stage: 'ready' as const, reply: active.outcome.reply,
         ...(active.outcome.delivery ? { delivery: active.outcome.delivery } : {}) } : active.outcome

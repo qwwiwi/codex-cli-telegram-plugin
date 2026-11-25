@@ -135,10 +135,8 @@ export type StatusState =
   | { kind: 'stopped'; reason?: string }
   | { kind: 'error'; reason?: string }
 
-// Cap on the in-memory tool-call buffer per active chat. Gateway uses 10
-// (gateway.py:1876-1879); render window is 5 (`activity-renderer.ts`
-// `ACTIVITY_WINDOW`). Keeping more than we render lets the "+N earlier"
-// summary stay accurate after collapses without an unbounded buffer.
+// Cap on the in-memory tool-call buffer per active chat. Keep earlier calls
+// available for updates while the renderer shows the three most recent.
 const ACTIVITY_MAX_BUFFER = 10
 
 // Throttle non-Agent tool edits to once per this many ms. Agent dispatches
@@ -707,6 +705,11 @@ export class StatusManager {
 
   isActive(chatId: string): boolean {
     return this.entries.has(chatId)
+  }
+
+  activeMessageId(chatId: string): number {
+    // The returned start() handle can still have id 0 after a lazy send.
+    return this.entries.get(chatId)?.handle.messageId ?? 0
   }
 
   // Time-bounded "turn closed" check. Returns true only while a chat is
@@ -1538,7 +1541,7 @@ export class StatusManager {
       // (reply/Stop deleted it) — so this is a trailing result, never new work
       // to visualize. Genuine in-flight subagents keep the bubble alive and
       // never hit this branch. Time-independent, unlike the isClosed() window.
-      if (event.subagentContinuation === true) return
+      if ('subagentContinuation' in event && event.subagentContinuation === true) return
       const initial: StatusState = {
         kind: 'activity',
         snapshot: this.buildSnapshot([], 'reasoning', this.now()),
@@ -1722,7 +1725,7 @@ export class StatusManager {
     }
   }
 
-  async complete(chatId: string): Promise<void> {
+  async complete(chatId: string, discardBubble = false): Promise<void> {
     // Mark the turn closed BEFORE any early-return so the lazy-open gate
     // in recordActivityByChatId blocks trailing tool hooks (PostToolUse
     // of the reply tool, post-answer reasoning) from resurrecting a
@@ -1802,13 +1805,13 @@ export class StatusManager {
     // just return / swallow the error in those cases. So whenever the delete
     // is not performed OR fails, fall back to a terminal edit — exactly what
     // cancel() does — so the bubble can't stay alive showing activity.
-    const canDelete =
-      this.config.status.delete_on_complete && this.telegramApi.deleteMessage !== undefined
+    // Moving the bubble discards the old copy even if normal completion
+    // retains a terminal status.
     const deleteMessage = this.telegramApi.deleteMessage
     return this.runLifecycle(chatId, async () => {
-      if (canDelete) {
+      if (deleteMessage && (discardBubble || this.config.status.delete_on_complete)) {
         try {
-          await deleteMessage!(chatId, messageId)
+          await deleteMessage(chatId, messageId)
           return
         } catch (err) {
           // Stale message, deleted by user, rate limit, or transient error.

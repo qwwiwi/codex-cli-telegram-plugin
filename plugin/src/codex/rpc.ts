@@ -82,11 +82,17 @@ export class CodexRpc {
     this.write({ method: 'initialized' })
   }
 
-  request(method: string, params: Json): Promise<Json> {
+  request(method: string, params: Json, nonFatalTimeoutMs?: number): Promise<Json> {
     if (this.stopped) return Promise.reject(new Error('Codex App Server has stopped'))
     const id = this.nextId++
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.close(), 30_000)
+      const timer = setTimeout(() => {
+        if (nonFatalTimeoutMs === undefined) this.close()
+        else {
+          this.pending.delete(id)
+          reject(new Error('Codex did not answer the request'))
+        }
+      }, nonFatalTimeoutMs ?? 30_000)
       this.pending.set(id, { resolve, reject, timer })
       this.write({ id, method, params })
     })

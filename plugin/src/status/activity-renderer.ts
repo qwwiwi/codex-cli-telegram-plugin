@@ -1,5 +1,5 @@
 // Activity renderer — ports gateway.py:1506-1612 (humanize/summarize/mask)
-// and gateway.py:1761-1784 (rolling activity window).
+// and renders the recent activity in Telegram's working bubble.
 //
 // All output destined for Telegram (or any log) flows through `maskSecrets`
 // at the last possible moment. Callers may pass tool input verbatim — the
@@ -228,9 +228,8 @@ export interface ActivityCall {
   readonly detail: string
   // Pre-rendered humanized HTML for the line (e.g. `reading <code>foo.ts</code>`)
   // or `null`/absent when the tool doesn't have a richer label (TodoWrite,
-  // unknown). The HTML is already secret-masked + escape-safe — its internal
-  // `<code>` and `<b>` tags are emitted verbatim inside the `<pre>` body,
-  // while non-tag content was passed through `escapeHtml` at construction.
+  // unknown). The renderer extracts the displayed text before shortening it
+  // and escaping the final line.
   // Optional so legacy callers (test fixtures) without humanized can build
   // ActivityCall literals; renderer treats `undefined` the same as `null`.
   readonly humanized?: string | null
@@ -247,89 +246,36 @@ export interface ActivitySnapshot {
   readonly thought?: string
 }
 
-const ACTIVITY_WINDOW = 5
+const ACTIVITY_WINDOW = 3
+const ACTIVITY_LINE_LIMIT = 45
+const ACTIVITY_THOUGHT_LIMIT = 128
+const ACTIVITY_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" } as const
 
-// Telegram editMessageText rejects messages > 4096 chars. Cap the inner
-// `<pre>` body well below that limit (room for the wrapping tags + safety
-// margin in case maskSecrets or escape expands a line).
-const PRE_BODY_MAX_CHARS = 3900
+function compactActivityLine(text: string, limit: number): string {
+  const characters = Array.from(maskSecrets(text).replace(/\s+/gu, ' ').trim())
+  if (characters.length <= limit) return characters.join('')
+  return characters.slice(0, limit - 1).join('').trimEnd() + '…'
+}
 
-/**
- * Render the full `<pre>working -- Ns\n\n[reasoning…]\n\n▸ …</pre>` block.
- * Ports `_render`/`_render_activity` from gateway.py:1740-1784.
- *
- * Lines are escaped individually so a humanized line (which carries safe
- * inline HTML like `<code>foo.ts</code>`) lands verbatim while plain-detail
- * lines and the timer header get standard escaping. Body is capped at
- * `PRE_BODY_MAX_CHARS` so a runaway summary can never blow past Telegram's
- * 4096-char editMessageText limit (review M2).
- */
 export function renderActivityBlock(
   snapshot: ActivitySnapshot,
   nowMs: number,
 ): string {
   const elapsedSec = Math.max(0, Math.floor((nowMs - snapshot.startedAtMs) / 1000))
-  const lines: string[] = [escapeHtml(`working -- ${elapsedSec}s`)]
+  const lines = [`working -- ${elapsedSec}s`]
+  const thought = snapshot.thought && compactActivityLine(snapshot.thought, ACTIVITY_THOUGHT_LIMIT)
+  if (thought) lines.push('', thought)
 
-  // Streaming thoughts win over the static placeholder. The thought is shown
-  // in BOTH phases (above the tool trail) so the narration stays visible while
-  // a tool runs — the "alive" effect. It is pre-shaped/redacted; escape each
-  // line at the render boundary like every other line in the block.
-  if (snapshot.thought !== undefined && snapshot.thought.length > 0) {
-    lines.push('')
-    for (const tline of snapshot.thought.split('\n')) {
-      lines.push(escapeHtml(tline))
-    }
-  } else if (snapshot.phase === 'reasoning') {
-    lines.push('')
-    lines.push(escapeHtml('reasoning...'))
-  }
-
-  if (snapshot.calls.length > 0) {
-    lines.push('')
-    const total = snapshot.calls.length
-    const window = Math.min(ACTIVITY_WINDOW, total)
-    const recent = snapshot.calls.slice(total - window)
-    if (total > recent.length) {
-      lines.push(escapeHtml(`▸ ... +${total - recent.length} earlier`))
-    }
-    for (const call of recent) {
-      if (call.humanized) {
-        // Humanized string is already HTML-safe: inner identifiers were
-        // escaped at construction (see humanizeTool), inline tags are
-        // intentional. Re-mask defensively against any post-store mutation.
-        lines.push(`▸ ${maskSecretsPreserveTags(call.humanized)}`)
-      } else {
-        // Plain detail — single escape at render boundary so a Grep pattern
-        // like `"recordActivity"` lands as `&quot;recordActivity&quot;` once,
-        // not twice (review §1).
-        lines.push(escapeHtml(`▸ ${maskSecrets(call.detail)}`))
-      }
-    }
-  }
-
-  let body = lines.join('\n').trim()
-  if (body.length > PRE_BODY_MAX_CHARS) {
-    // Truncate at a line boundary so we don't split an HTML entity.
-    const truncated = body.slice(0, PRE_BODY_MAX_CHARS)
-    const lastNl = truncated.lastIndexOf('\n')
-    const head = lastNl > 0 ? truncated.slice(0, lastNl) : truncated
-    body = `${head}\n…+truncated`
-  }
-  return `<pre>${body}</pre>`
-}
-
-/**
- * Re-mask a humanized HTML line without disturbing the inline tags. The
- * masking rules only touch IPs, secret paths, long tokens, Telegram bot
- * tokens, and Supabase hosts — none of those overlap with the `<code>`/`<b>`
- * tag bodies emitted by humanizeTool (we already mask path/cmd content
- * before wrapping). So a plain pass is safe; this is kept as a separate
- * function for clarity and to localize future changes if a mask rule ever
- * threatens an HTML tag.
- */
-function maskSecretsPreserveTags(html: string): string {
-  return maskSecrets(html)
+  const summaries = snapshot.calls.slice(-ACTIVITY_WINDOW).flatMap(call => {
+    const detail = call.humanized ? call.humanized.replace(/<\/?(?:code|b|i)>/giu, '')
+      .replace(/&(amp|lt|gt|quot|#39);/gu, (_, entity: keyof typeof ACTIVITY_ENTITIES) => ACTIVITY_ENTITIES[entity])
+      : call.detail
+    const summary = compactActivityLine(detail, ACTIVITY_LINE_LIMIT)
+    return summary ? [`▸ ${summary}`] : []
+  })
+  if (summaries.length) lines.push('', ...summaries)
+  else if (!thought && snapshot.phase === 'reasoning') lines.push('', 'reasoning...')
+  return `<pre>${lines.map(escapeHtml).join('\n')}</pre>`
 }
 
 /**
