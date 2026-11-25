@@ -46,10 +46,9 @@ const DEFAULT_SPAWN_WRAPPER_PATH = resolve(
 )
 
 // Environment variables that, if present in the plugin's own env, must
-// NEVER be inherited by the spawned `claude` tmux session. Telegram /
-// Groq / gbrain credentials belong to the plugin orchestrator, not to
-// the user-facing claude instance — leaking them gives a compromised
-// session unintended escalation paths.
+// NEVER be inherited by the spawned `claude` tmux session. Service
+// credentials belong to the plugin orchestrator. Passing them to a child
+// session would give that session unintended access.
 //
 // TASK-6 fix (2026-05-27): the previous L7 implementation only WARNED
 // when these were present and still passed the full parent env to
@@ -78,10 +77,8 @@ const SENSITIVE_ENV_VARS = [
 //   PATH    — required to locate python3 (hooks) and the claude binary
 //             if it was not pre-resolved by server.ts (H8). Without
 //             PATH the child shell cannot start anything.
-//   HOME    — claude reads ~/.claude/*, ~/.agent-lab/*, ssh keys, etc.
-//             Hooks resolve workspace via ${HOME}/.agent-lab/... when
-//             CLAUDE_WORKSPACE_DIR is unset; HOME is the canonical
-//             fallback root for user data.
+//   HOME    — claude and hooks resolve user configuration and workspace
+//             paths relative to HOME when no explicit path is configured.
 //   USER    — some tools (git, ssh) read $USER instead of getlogin().
 //   LANG / LC_ALL — UTF-8 locale; without these claude / python emit
 //             encoding errors on Cyrillic content.
@@ -116,11 +113,8 @@ const TMUX_CHILD_ENV_ALLOWLIST = [
 // listed keys as a defence-in-depth — if someone accidentally adds
 // `PATH_API_KEY` to the allowlist it still gets dropped.
 //
-// Prefix list (Opus MED-B #21, 2026-05-27): namespaces known to carry
-// orchestrator credentials that must never reach user-visible claude
-// sessions. Expanded from the original GBRAIN/OPENAI/ANTHROPIC/TELEGRAM
-// set to cover the secondary providers we hit in EdgeLab + DCA + Edge
-// Lab infra (AWS, Supabase, Stripe, GitHub, NPM).
+// Prefix list: service namespaces known to carry orchestrator credentials
+// that must never reach user-visible Claude sessions.
 //
 // Suffix list: literal credential-shaped tail tokens.
 //   * TOKEN / API_KEY / SECRET / PASSWORD / PRIVATE_KEY — original set.
@@ -215,7 +209,7 @@ export interface TmuxSessionPoolOptions {
   stateDir: string
   // Workspace root used for persona-relative path resolution by hooks
   // and as the canonical CLAUDE_WORKSPACE_DIR exported into the tmux
-  // session. Typically `~/.agent-lab/thrall/.claude`.
+  // session.
   workspaceDir: string
   // Working directory for the spawned claude process. When provided,
   // tmux runs `new-session -c {chatsBasePath}` so that claude picks up
@@ -286,7 +280,7 @@ export class TmuxSessionPool {
     // chatsBasePath is the cwd handed to tmux — claude's per-workspace
     // `.claude/settings.json` lookup is relative to cwd, so this MUST
     // point at the directory whose `.claude/` subdir contains our
-    // hooks registration. Default mirrors the canonical Thrall layout
+    // hooks registration. Default mirrors the main workspace layout
     // (`{workspace}/chats/.claude/settings.json`).
     this.chatsBasePath = opts.chatsBasePath ?? join(opts.workspaceDir, 'chats')
     this.claudeBinary = opts.claudeBinary ?? 'claude'
@@ -652,9 +646,9 @@ export class TmuxSessionPool {
     // C3 fix (2026-05-23): refuse to spawn for a chat without an
     // explicit ChatPolicy entry, even if it sits in allowlist.chats.
     // A missing policy entry means SessionStart can't load persona +
-    // system_reminder, PreToolUse can't load deny rules — master Thrall
+    // system_reminder, PreToolUse can't load deny rules — the main process
     // would launch without isolation. Hard error is better than a
-    // silent persona-less spawn that leaks gbrain MCP into a public
+    // silent persona-less spawn that leaks private MCP tools into a public
     // group.
     if (!this.policy.chats[chatId]) {
       throw new Error(

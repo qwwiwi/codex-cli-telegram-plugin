@@ -4,7 +4,7 @@
 // The original trim mirrored gateway.py: keep the last N *lines*. Line count
 // is a poor proxy for size — 600 lines of ~200-char Russian snippets is ~76 KB
 // against a 20 KB cap, so the file parked permanently ABOVE the threshold and
-// re-trimmed on every single append. Live effect on example-agent: recent.md and
+// re-trimmed on every single append. As a result, recent.md and
 // handoff.md sat at 52k chars each, blowing the 40k context budget they are
 // @-included into.
 //

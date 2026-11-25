@@ -29,7 +29,7 @@ test('external task endpoint requires its bearer and owner, and uses the caller 
     if (jobs.has(id)) return 'duplicate'
     jobs.set(id, message)
     return 'accepted'
-  })
+  }, undefined, { agentId: 'example-agent' })
   try {
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('Expected TCP address')
@@ -37,14 +37,16 @@ test('external task endpoint requires its bearer and owner, and uses the caller 
     for (const route of ['/health', '/healthz']) {
       expect(await (await fetch('http://127.0.0.1:' + address.port + route)).json()).toEqual({ status: 'ok' })
     }
-    const submit = (chatId: number, token = 'synthetic-test-secret') => fetch(
+    const submit = (chatId: number, token = 'synthetic-test-secret', agentId?: string) => fetch(
       'http://127.0.0.1:' + address.port + '/hooks/agent', {
         method: 'POST', headers: { authorization: 'Bearer ' + token, 'idempotency-key': 's-job' },
-        body: JSON.stringify({ message: 'do this', chatId, agentId: 'dashi-channel' }),
+        body: JSON.stringify({ message: 'do this', chatId, agentId }),
       },
     )
     expect((await submit(123, 'bad')).status).toBe(401)
     expect((await submit(99)).status).toBe(403)
+    expect((await submit(123, undefined, 'other-agent')).status).toBe(404)
+    expect((await submit(123, undefined, 'example-agent')).status).toBe(200)
     expect((await submit(123)).status).toBe(200)
     expect((await submit(123)).status).toBe(200)
     expect([...jobs.values()]).toEqual(['do this'])
@@ -85,7 +87,7 @@ test('accepts a legacy listener task for the configured owner and deduplicates r
         body: JSON.stringify(value),
       },
     )
-    const task = { _task_id: 47, from_agent: 'example-agent', title: 'Отчёт', body: 'Проверь очередь.', context: 'Тест.' }
+    const task = { _task_id: 47, from_agent: 'example-sender', title: 'Отчёт', body: 'Проверь очередь.', context: 'Тест.' }
     expect((await submit(task, 'wrong')).status).toBe(401)
     expect((await submit({ ...task, chatId: 456 })).status).toBe(400)
     expect((await submit({ ...task, _task_id: 'no-id' })).status).toBe(400)

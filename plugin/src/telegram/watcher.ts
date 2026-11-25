@@ -1,25 +1,21 @@
-// InboundWatcher — auto-reply «Тралл занят» when the warchief sends plain
+// InboundWatcher — auto-reply «Агент занят» when the owner sends plain
 // text while a Claude session is mid-tool. Sits between OOB resolution and
 // the gate/notify call in `handleInboundText` — OOB always takes priority,
 // and the watcher NEVER replaces the channel notification (auto-reply AND
 // gate-and-notify both fire on a busy chat).
 //
-// Behaviour contract (plan §2.2, warchief defaults 2026-05-20):
+// Behaviour:
 //   * Disabled (`config.watcher.enabled === false`) → no-op, reason='disabled'.
 //   * Not busy (per ProgressReporter.isBusy) → no-op, reason='not-busy'.
 //   * Debounced — within `config.watcher.debounce_ms` of the last successful
 //     auto-reply for THIS chat → no-op, reason='debounced'.
 //   * Send fails — caught, reason='send-failed', lastReplyMs NOT updated so
 //     the next message can retry.
-//   * Otherwise — `sendMessage` quote-replies the warchief's message via
+//   * Otherwise — `sendMessage` quote-replies the owner's message via
 //     `reply_to_message_id`, lastReplyMs updates, return `{ replied: true }`.
 //
-// Tone constraints (rules.md):
-//   * No emoji in production paths. The warchief explicitly asked for «🔧»
-//     prefix on auto-reply (visual cue that Тралл is mid-tool — single
-//     character, anchored, NOT a decorative emoji string).
-//   * HTML output through `escapeHtml` for the tool name; the safe-wrapper
-//     also validates HTML before send.
+// The auto-reply uses «🔧» to indicate tool activity. The tool name is
+// HTML-escaped and the Telegram wrapper validates HTML before sending.
 
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
@@ -164,7 +160,7 @@ export class InboundWatcher {
  * When `busyText` is a non-empty string (config.watcher.busy_text), it
  * REPLACES the legacy tool-name message verbatim (HTML-escaped) — this is
  * the Level 1 mid-turn ack («✋ Принял, добавлю к текущей задаче»), a positive
- * "saw it, will fold it in" signal instead of the technical «Тралл занят,
+ * "saw it, will fold it in" signal instead of the technical «Агент занят,
  * активный инструмент: …». Empty/undefined falls back to the legacy body.
  *
  * @param toolName Active tool name (legacy message only); undefined → «…».
@@ -176,7 +172,7 @@ export function composeAutoReply(toolName: string | undefined, busyText?: string
     return escapeHtml(busyText)
   }
   const tool = toolName ?? '…'
-  return `🔧 Тралл занят, активный инструмент: <code>${escapeHtml(tool)}</code>. Жди или /stop.`
+  return `🔧 Агент занят, активный инструмент: <code>${escapeHtml(tool)}</code>. Жди или /stop.`
 }
 
 /**

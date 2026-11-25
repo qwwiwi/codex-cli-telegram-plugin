@@ -82,8 +82,7 @@ export type MultichatPolicy = z.infer<typeof MultichatPolicySchema>
  * {@link loadPolicyFromPath} instead; this `loadPolicy` variant exists
  * for the default-derive case (workspace_dir → `<dir>/policy.yaml`).
  *
- * @param basePath directory containing `policy.yaml` (typically
- *   `~/.agent-lab/thrall/.claude/chats`)
+ * @param basePath directory containing `policy.yaml` in the configured workspace
  * @returns validated, fully-typed multichat policy
  */
 export function loadPolicy(basePath: string): MultichatPolicy {
@@ -159,7 +158,7 @@ export function loadPolicyFromPath(absolutePath: string): MultichatPolicy {
  * Returns `null` when the chat is not declared in policy.yaml — the
  * caller must treat this as "chat not configured" (typically a hard
  * drop in the gate). Group chat ids are negative, so always pass the
- * id as a string (e.g. `"-1003784643974"`).
+ * id as a string (e.g. `"-1000000000123"`).
  *
  * @param policy loaded multichat policy
  * @param chatId stringified Telegram chat id
@@ -266,7 +265,7 @@ export function assertValidChatId(chatId: string): void {
   // regex accepts them but Telegram never emits leading zeroes, and
   // their existence would mean two distinct strings ("1" and "01") map
   // to the same logical chat after parseInt normalisation downstream.
-  // Allowed forms: "0", "1", "12345", "-1", "-1003784643974".
+  // Allowed forms: "0", "1", "12345", "-1", "-1000000000123".
   // Disallowed: "01", "00", "-01", "-0123".
   const body = chatId.startsWith('-') ? chatId.slice(1) : chatId
   if (body.length > 1 && body.startsWith('0')) {
@@ -311,7 +310,7 @@ export function getChatPolicyOrDeny(
  * Semantics:
  *   * `policy === null` (legacy single-DM mode, multichat disabled):
  *     return `true`. Preserves the pre-multichat behaviour where the
- *     warchief's DM always streams progress.
+ *     owner's DM always streams progress.
  *   * `policy` loaded but chat absent from `policy.chats[…]`:
  *     return `false`. No fallback to a global default — an unlisted
  *     chat MUST NOT receive interim "Печатает.../tool" edits even if
@@ -345,7 +344,7 @@ export function shouldStreamForChat(
  * driven by the `tmux_mirror` boolean rather than `streaming`. Public
  * group chats with no entry in policy get `false` — the pane mirror
  * leaks tool calls, file paths, and reasoning chunks that must never
- * surface outside the warchief's DM.
+ * surface outside the owner's DM.
  *
  * Used by tmux-mirror.ts (in TASK-2).
  *

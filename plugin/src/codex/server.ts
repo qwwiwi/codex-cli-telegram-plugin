@@ -1119,7 +1119,7 @@ async function main(): Promise<void> {
       try {
         const background = work.hasBackground
         const stopped = await cancelCurrentTurn()
-        const text = background && proxy ? 'Останавливаю фоновые задачи. Процесс Codex перезапустится.' :
+        const text = background && proxy ? 'Запрашиваю остановку фоновых задач Codex.' :
           stopped ? 'Останавливаю текущую задачу.' : 'Сейчас нет активной задачи Codex.'
         const notice = send(text)
         if (background && proxy) {
@@ -1444,7 +1444,7 @@ async function main(): Promise<void> {
         return
       }
       const action = text && ctx.message.reply_to_message && !ctx.message.forward_origin
-        ? requestedChatAction(text) : undefined
+        ? requestedChatAction(text, agentName) : undefined
       if (action && action !== 'edit') {
         await applyChatAction(action, ctx.message, text ?? '')
         return
@@ -1650,7 +1650,7 @@ async function main(): Promise<void> {
             return
           }
           const editTarget = first.text && first.reply_to_message && !first.forward_origin &&
-            requestedChatAction(first.text) === 'edit' ? first.reply_to_message : undefined
+            requestedChatAction(first.text, agentName) === 'edit' ? first.reply_to_message : undefined
           const ownerText = !editTarget && !first.forward_origin ? (first.text ?? first.caption)?.trim() : undefined
           const taskText = verification ? undefined : directOwnerTask(first, input.ownerTranscript, !!editTarget)
           const restartTaskText = restartOwnerText(first, input.ownerTranscript)
@@ -1889,6 +1889,7 @@ async function main(): Promise<void> {
             request: (request, signal) => stopping ? Promise.resolve('decline') : approvals.request(request, signal),
           } } : {}),
         } : undefined, {
+        ...(env.KROT_CODEX_AGENT_ID ? { agentId: env.KROT_CODEX_AGENT_ID } : {}),
         ...(config.ask_user_question.enabled ? { ask: {
           timeoutMs: config.ask_user_question.timeout_ms,
           async request(inputs, signal) {

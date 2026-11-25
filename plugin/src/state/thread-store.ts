@@ -1,4 +1,4 @@
-// Per-chat forum-topic memory (Pavel 2026-06-09).
+// Per-chat forum-topic memory.
 //
 // THE BUG: a reply to a message that arrived inside a forum topic landed in
 // the supergroup's General topic, because nothing carried the inbound

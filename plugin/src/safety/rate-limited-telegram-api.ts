@@ -2,7 +2,7 @@
 //
 // Goal: make Telegram's per-chat / per-bot rate limits invisible to callers.
 // A burst of replies (e.g. a multi-part report) used to surface as a 429
-// from Bot API with retry_after ≈ 300s — long enough that the warchief lost
+// from Bot API with retry_after ≈ 300s — long enough that the owner lost
 // sight of what the agent was doing. This wrapper enforces pacing BEFORE
 // the request leaves the process and transparently retries on 429.
 //
@@ -315,7 +315,6 @@ export function createRateLimitedTelegramApi(
   // limit does not count it — and charging it to the message budget meant the
   // status bubble (a frame every ~2.5s) filled that budget and the "typing"
   // indicator died exactly during a turn, the only time it means anything
-  // (2026-09-05: 5246 pulses dropped vs 202 sent on example-agent).
   // Non-blocking by design: a pulse that arrives late says nothing, so it is
   // dropped rather than queued.
   function tryConsumeTypingQuota(state: ChatState): boolean {

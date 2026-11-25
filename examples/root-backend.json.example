@@ -1,0 +1,6 @@
+{
+  "socket": "/run/example-codex/app-server.sock",
+  "workspace": "/srv/example-codex/workspace",
+  "telegram_inbox": "/srv/example-telegram/inbox",
+  "restart_unit": null
+}

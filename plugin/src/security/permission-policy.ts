@@ -47,7 +47,7 @@ export interface PermissionVerdict {
 
 /** One tier's matchers. All fields optional; absent = matches nothing. */
 export interface PolicyRules {
-  /** fnmatch globs against the tool name (e.g. "mcp__dashi-gbrain-*"). */
+  /** fnmatch globs against the tool name (e.g. "mcp__example-*"). */
   readonly tools?: readonly string[]
   /** fnmatch globs against file_path for Read/Edit/Write/NotebookEdit. */
   readonly read_paths?: readonly string[]
@@ -1243,33 +1243,10 @@ function systemctlMutation(commandLower: string): boolean {
   return false
 }
 
-// ── own comms channel — the ONE systemctl mutation that stays a hard brake ──
-//
-// Warchief 2026-06-14: zero confirm cards (he drives the session via send-keys),
-// so a mutating systemctl on a NORMAL service runs silently. The single
-// exception is the agent's OWN comms channel: stopping/restarting it severs the
-// warchief's Telegram link to the agent mid-task. That is irreversible-in-the-
-// moment, so it stays a HARD-DENY (it never showed a card anyway — it's a brake,
-// not a prompt). Matches the channel systemd unit and the gateway daemon by
-// name, anywhere in a mutating systemctl invocation.
-//
-// OWN channel only (warchief 2026-06-18): the channel unit is derived from
-// AGENT_ID (systemd sets AGENT_ID=example-agent → channel-example-agent). Restarting a
-// SIBLING channel (channel-example-agent from example-agent) is a legitimate, authorized op
-// and must NOT be denied — the previous broad `channel-[a-z0-9_-]+` regex caught
-// every sibling and hard-blocked authorized cross-channel restarts. When
-// AGENT_ID is absent (tests, unknown context) we fall back to the conservative
-// broad match: better to over-protect the warchief link than under-protect it.
-//
-// The gateway alternatives stay broad — the `*-gateway` / `gateway.{service,py}`
-// daemons are retired, so a hard-deny on them is harmless and loses no
-// capability. The bare `gateway` alternative covers systemd shorthand
-// (`systemctl stop gateway` ≡ `gateway.service`) and instance units
-// (`gateway@0.service`); the trailing `(?![a-z0-9_-])` boundary keeps it from
-// over-matching a different daemon whose name merely starts with "gateway"
-// (e.g. `gatewayd`) — Codex review HIGH. `[a-z0-9_]+-gateway` (no `-` inside the
-// prefix class) keeps the alternative linear — `[a-z0-9_-]*-gateway` is O(n²) on
-// a long hyphen run (Opus review LOW).
+// Protect the bridge's own service so a command cannot cut off delivery.
+// Keep the legacy channel and gateway matches for existing policy users.
+// AGENT_ID selects the legacy channel. With no valid ID the guard covers all
+// legacy channel names. The gateway prefix uses no hyphens to stay linear.
 const GATEWAY_UNIT_ALT = '[a-z0-9_]+-gateway|gateway(?:@[a-z0-9_.:-]+)?(?:\\.(?:service|py))?'
 
 function ownChannelUnitRe(): RegExp {
@@ -1277,26 +1254,11 @@ function ownChannelUnitRe(): RegExp {
   // AGENT_ID is interpolated into a regex, so accept only safe unit-name chars;
   // anything else (or empty) falls back to the conservative broad channel match.
   const channelAlt = /^[a-z0-9_-]+$/.test(id) ? `channel-${id}` : 'channel-[a-z0-9_-]+'
-  return new RegExp(`(?:${channelAlt}|${GATEWAY_UNIT_ALT})(?![a-z0-9_-])`, 'i')
+  return new RegExp(`(?:^|[^a-z0-9_-])(?:krotov-telegram|${channelAlt}|${GATEWAY_UNIT_ALT})(?![a-z0-9_-])`, 'i')
 }
 
 function mutatesOwnChannel(commandLower: string): boolean {
   return systemctlMutation(commandLower) && ownChannelUnitRe().test(commandLower)
-}
-
-// example-gateway is a SEPARATE agent service (Pavel's Hermes agent), NOT any
-// channel agent's comms link — the broad `*-gateway` alt above over-matches it.
-// Exempt it so the own-channel brake never fires on it (warchief 2026-07-19).
-const HERMES_GATEWAY_RE = /\bexample-gateway\b/i
-
-// The agent's OWN LIVE channel unit (channel-<AGENT_ID>), only when AGENT_ID is
-// a safe concrete id. Distinguished from retired gateway daemons and the broad
-// AGENT_ID-unset fallback so Variant B downgrades ONLY the live own channel to a
-// confirm card, while retired gateways / the broad match stay a hard-deny brake.
-function ownLiveChannel(commandLower: string): boolean {
-  const id = (process.env.AGENT_ID ?? '').toLowerCase().trim()
-  if (!/^[a-z0-9_-]+$/.test(id)) return false
-  return new RegExp(`channel-${id}(?![a-z0-9_-])`, 'i').test(commandLower)
 }
 
 // ── pipe-to-interpreter: STRUCTURAL network-source → exec detection ──────
@@ -2346,28 +2308,10 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (bashReferencesSecret(rawCommand, secretPathAllowlist)) {
       return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
     }
-    // Mutating systemctl on a comms channel severs the warchief's Telegram link.
-    // Lives in the hard-deny pass (NOT step 4) so a mixed command that also trips
-    // a confirm builtin (git-exec-surface, sudo, pipe-interpreter) cannot change
-    // the verdict here — Codex review HIGH. Variant B, single-confirm (warchief
-    // 2026-07-19):
-    //   * example-gateway is a SEPARATE agent service — exempt (falls through to
-    //     the normal policy flow → default allow).
-    //   * the agent's OWN LIVE channel-<AGENT_ID> is left to self-restart-guard.py,
-    //     which returns `ask` (one owner card + "final action" semantics). We do
-    //     NOT confirm/deny it here — with `deny>ask>allow` precedence the single
-    //     guard `ask` survives this pass's fall-through to default allow, so the
-    //     owner is prompted exactly ONCE (no double card).
-    //   * retired gateway comms daemons and the broad AGENT_ID-unset match stay a
-    //     hard-DENY brake (unchanged).
-    if (
-      commandLower !== undefined &&
-      systemctlMutation(commandLower) &&
-      !HERMES_GATEWAY_RE.test(commandLower) &&
-      !ownLiveChannel(commandLower) &&
-      ownChannelUnitRe().test(commandLower)
-    ) {
-      return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel' }
+    // Keep this in the hard-deny pass so another part of a mixed command
+    // cannot downgrade the verdict to a confirmation.
+    if (commandLower !== undefined && mutatesOwnChannel(commandLower)) {
+      return { tier: 'deny', reason: 'changing the bridge service with systemctl would cut off the owner’s Telegram connection', matchedRule: 'builtin:deny:own-channel' }
     }
   }
 

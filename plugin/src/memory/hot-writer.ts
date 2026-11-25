@@ -134,7 +134,7 @@ export function snippet(s: string, max = 200): string {
 }
 
 /**
- * Strip the dashi inbound envelope so recent.md stores the real message, not
+ * Strip the Telegram inbound envelope so recent.md stores the real message, not
  * the `<channel ... message_id="...">` wrapper and `<media kind="voice"
  * file_id="...">` descriptors. Those tags front-load every prompt, so a raw
  * snippet() captured ~190 chars of metadata and pushed the actual text out of

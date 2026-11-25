@@ -197,12 +197,9 @@ export class GuestQueryRegistry {
    * True while a guest turn is still RUNNING — the webhook's half of the
    * bubble gate. Wider than hasUnanswered() on purpose.
    *
-   * The answer is not the end of the turn. Live evidence (example-agent, 2026-10-17):
-   * `answerGuestQuery` at 12:26:32.669, then `sendMessage` to the owner's DM at
-   * 12:26:32.816 — the PostToolUse/reasoning hooks that follow the reply tool
-   * are what paint the bubble, and by then confirm() had already flipped the
-   * entry to `answered`. So an answered query keeps the signal alive via a
-   * tail, and only endTurn() (driven by the Stop hook) retires it.
+   * PostToolUse and reasoning hooks can paint a status bubble after
+   * `answerGuestQuery` has marked the query answered. Keep the signal alive
+   * until the Stop hook calls endTurn().
    *
    * @param maxAgeMs ceiling on both halves, so a turn whose Stop never arrives
    *   stops suppressing instead of muting the owner's DM indefinitely.

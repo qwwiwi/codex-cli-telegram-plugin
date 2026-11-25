@@ -1,6 +1,4 @@
-// Config loader with Zod validation and state-dir path resolution.
-// All env vars and config.json keys are validated at boundary; defaults
-// embed canary values (bot 0, prince 0).
+// Config loader with Zod validation and state-directory path resolution.
 
 import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
@@ -31,7 +29,7 @@ export const MultichatConfigSchema = z.object({
   state_dir: z.string().optional(),
   workspace_dir: z.string().optional(),
   // Route private DMs through the per-chat router too (2026-06-11). Default
-  // OFF preserves the thrall topology — "main Telegram → master session,
+  // OFF preserves the legacy routing topology — "main Telegram → master session,
   // group chats → multichat" (see handlers.ts hybrid-routing gate). When ON,
   // a private DM that has its own entry in policy.chats gets its own per-chat
   // tmux session instead of falling through to the legacy master notify, so
@@ -97,7 +95,7 @@ export const AppConfigSchema = z.object({
     // without ever killing the indicator of an active task.
     ttl_ms: z.number().int().positive().default(1_800_000),
     delete_on_complete: z.boolean().default(true),
-    // Warchief request 2026-05-27: the bare «Печатает...» bubble is visual
+    // Owner request 2026-05-27: the bare «Печатает...» bubble is visual
     // noise on top of the TmuxMirror status card. When true, StatusManager
     // skips the initial sendMessage while state is `typing` — the bubble is
     // created lazily on the first thinking/tool/activity transition. Native
@@ -155,9 +153,8 @@ export const AppConfigSchema = z.object({
     // Native Telegram header indicator («печатает…»), driven by sendChatAction
     // on a fixed 4 s pulse (CHAT_ACTION_PULSE_MS in status-manager.ts). It is
     // NOT a message, so it never touches the per-chat message budget — but it
-    // IS an API call, and a flood ban is earned by the DAILY call volume: on
-    // 2026-09-11 Ringmaster's pulse alone was 11 761 of 23 707 calls (49.6%)
-    // over 24 h of continuous work, half the traffic that got the bot banned.
+    // is an API call. Typing pulses can account for a large share of daily
+    // calls during continuous work.
     // Set `enabled: false` per channel to drop the indicator entirely and keep
     // only the status bubble (which stays configurable via interval_ms).
     // Optional block — absent → indicator ON, legacy configs need no migration.
@@ -271,7 +268,7 @@ export const AppConfigSchema = z.object({
   // stale is dropped silently as an orphan.
   //
   // collapse_completed_after: keep last N completed items in the rendered
-  // list, older ones collapse to «+M завершено ранее» — the warchief wants
+  // list, older ones collapse to «+M завершено ранее» — the owner wants
   // to see the active milestone, not a wall of done items.
   task_mirror: z.object({
     enabled: z.boolean().default(true),
@@ -279,8 +276,8 @@ export const AppConfigSchema = z.object({
     session_ttl_ms: z.number().int().positive().default(10 * 60 * 1000),
     collapse_completed_after: z.number().int().nonnegative().default(5),
   }).default({}),
-  // InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
-  // warchief sends plain text while a Claude session is mid-tool. Debounced
+  // InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Агент занят» when the
+  // owner sends plain text while a Claude session is mid-tool. Debounced
   // per chat (debounce_ms = 10s by default) so a burst of messages doesn't
   // bury the conversation in auto-acks. Busy threshold is the ProgressReporter
   // lastActivityMs window — anything more recent than busy_threshold_ms
@@ -293,7 +290,7 @@ export const AppConfigSchema = z.object({
     debounce_ms: z.number().int().nonnegative().default(10_000),
     busy_threshold_ms: z.number().int().positive().default(30_000),
     // Mid-turn ack text (Level 1, 2026-06-04). When set, the auto-reply uses
-    // this verbatim (HTML-escaped) INSTEAD of the legacy «Тралл занят,
+    // this verbatim (HTML-escaped) INSTEAD of the legacy «Агент занят,
     // активный инструмент: …» tool-name message. Lets each agent pick a
     // positive tone — e.g. «✋ Принял, добавлю к текущей задаче» — signalling
     // a message that arrived mid-turn was seen and will be folded in.
@@ -306,7 +303,7 @@ export const AppConfigSchema = z.object({
   // the message is deleted (re-sends on next poll).
   //
   // Default-OFF: pane content can include unexpected secrets, and the
-  // warchief should opt in explicitly. Enable via config.json or env.
+  // owner should opt in explicitly. Enable via config.json or env.
   // pane_target follows the `session:window.pane` syntax — empty string
   // means «use the session in $TMUX env at startup».
   tmux_mirror: z.object({
@@ -341,14 +338,14 @@ export const AppConfigSchema = z.object({
     // Anchor mode for the rolling mirror. `latest_inbound_only` (default,
     // 2026-05-22) drops every pane segment up to and including the last
     // `← <channel>: …` preview Claude Code emitted — only what the agent
-    // is doing AFTER the warchief's most recent message remains. Falls
+    // is doing AFTER the owner's most recent message remains. Falls
     // back to `full_pane` automatically when no preview exists in the
     // current capture (fresh session). Set to `full_pane` to mirror the
     // whole pane (pre-2026-05-22 behaviour).
     mode: z.enum(['full_pane', 'latest_inbound_only']).default('latest_inbound_only'),
     // Max lines kept in the rendered mirror, post-filter. Default 14 —
     // empirically that fits one iPhone-screen worth of Telegram <pre>
-    // content (the warchief asked for ≤70% screen height on 2026-05-22).
+    // content (the owner asked for ≤70% screen height on 2026-05-22).
     // Truncation removes from the TOP (oldest), preserving the live
     // tail, and prepends a `… +N lines` marker that counts toward the
     // cap. Set to 0 to disable (uncapped, only the 4096-char body cap
@@ -371,7 +368,7 @@ export const AppConfigSchema = z.object({
   multichat: MultichatConfigSchema.default({}),
   // AskUserQuestion relay (Phase ?, 2026-05-27, PRX-1 TASK-6). Bridges
   // Claude Code's native AskUserQuestion tool requests into Telegram so
-  // the warchief can answer from his phone while a session runs headless.
+  // the owner can answer from Telegram while a session runs headless.
   //
   // Default OFF: until a smoke run on staging proves the round-trip,
   // AskUserQuestion still flows through the native Claude Code UI and
@@ -381,7 +378,7 @@ export const AppConfigSchema = z.object({
   // `allowed_user_ids` left undefined means «inherit from permission_relay
   // at runtime» — TASK-1 / TASK-3 must resolve `?? permission_relay
   // .allowed_user_ids` at the moment they need a recipient set. We
-  // deliberately do NOT copy the default here: duplicating the warchief
+  // deliberately do NOT copy the default here: duplicating the owner
   // id would create two sources of truth that can drift. The fallback
   // is enforced in code (see resolveAskUserQuestionAllowedUserIds below)
   // so a single change to permission_relay.allowed_user_ids propagates
@@ -389,7 +386,7 @@ export const AppConfigSchema = z.object({
   //
   // `timeout_ms` caps how long the relay waits for a Telegram answer
   // before emitting a `request_timeout` event and letting Claude fall
-  // back to its native flow. 5 min matches typical warchief response
+  // back to its native flow. 5 min matches typical owner response
   // latency without leaving stale callbacks behind.
   //
   // `max_preview_chars` bounds the per-option preview rendered in the
@@ -500,6 +497,8 @@ export type AppConfig = z.infer<typeof AppConfigSchema>
 // ─────────────────────────────────────────────────────────────────────
 
 export const RuntimeEnvSchema = z.object({
+  XDG_STATE_HOME: z.string().optional(),
+  KROT_CODEX_AGENT_ID: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).optional(),
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_STATE_DIR: z.string().optional(),
   TELEGRAM_CONFIG_FILE: z.string().optional(),
@@ -671,6 +670,10 @@ function parseCsvChatIds(csv: string): Array<number | string> {
   return ids
 }
 
+function resolveStateRoot(env: RuntimeEnv): string {
+  return env.TELEGRAM_STATE_DIR ?? join(env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'krotov-plugin')
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   let parsedEnv: RuntimeEnv
   try {
@@ -680,8 +683,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   }
 
   // Resolve state dir (we need it to find default config.json path).
-  const stateRoot = parsedEnv.TELEGRAM_STATE_DIR
-    ?? join(homedir(), '.claude', 'channels', 'example-channel')
+  const stateRoot = resolveStateRoot(parsedEnv)
   const configPath = parsedEnv.TELEGRAM_CONFIG_FILE ?? join(stateRoot, 'config.json')
 
   // Read config.json if it exists. Missing file is fine — defaults apply.
@@ -908,7 +910,7 @@ export type StatePaths = {
 }
 
 export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
-  const root = env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'example-channel')
+  const root = resolveStateRoot(env)
   return {
     root,
     env: join(root, '.env'),

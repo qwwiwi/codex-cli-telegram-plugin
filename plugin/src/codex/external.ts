@@ -22,7 +22,8 @@ type QuestionInput = {
   id: string; question: string; isOther: true; multiSelect: boolean
   options: { label: string; description: string }[]
 }
-type LegacyHooks = {
+type ExternalTaskOptions = {
+  agentId?: string
   ask?: { timeoutMs: number; request: (questions: QuestionInput[], signal: AbortSignal) =>
     Promise<Record<string, { answers: string[] }> | undefined> }
   react?: (messageId: number) => Promise<boolean>
@@ -103,8 +104,9 @@ function readLegacyTask(value: unknown): { taskId: string; message: string } | u
 }
 
 export async function startExternalTasks(port: number, token: string, chatId: string, enqueue: Queue,
-  policy?: PolicyApproval, hooks: LegacyHooks = {}) {
+  policy?: PolicyApproval, options: ExternalTaskOptions = {}) {
   const dedicatedPolicy = policy?.token !== token ? policy : undefined
+  const agentId = options.agentId ?? 'krotov'
   const savedAnswers = new Map<string, { digest: string; answers: Record<string, string>; at: number }>()
   let asking = false
 
@@ -125,7 +127,7 @@ export async function startExternalTasks(port: number, token: string, chatId: st
       // replies using its persisted ready outcome.
       if (path === answerPath) return reply(res, 403, { status: 'unauthorized' })
       if (path === fallbackPath) return reply(res, 503, { status: 'fallback_reply_unavailable' })
-      if (path === receiptPath && !hooks.react) return reply(res, 503, { status: 'reactions_unavailable' })
+      if (path === receiptPath && !options.react) return reply(res, 503, { status: 'reactions_unavailable' })
       const limit = path === questionPath ? ASK_BODY_LIMIT_BYTES : path === receiptPath ? REACT_BODY_LIMIT_BYTES
         : approvalRoute ? PERMISSION_REQUEST_BODY_LIMIT_BYTES : BODY_LIMIT_BYTES
       if (Number(req.headers['content-length']) > limit) return reply(res, 413, { error: 'payload too large' })
@@ -133,19 +135,19 @@ export async function startExternalTasks(port: number, token: string, chatId: st
       if (body.tooLarge) return reply(res, 413, { error: 'payload too large' })
       let raw: unknown
       try { raw = JSON.parse(body.buf.toString('utf8')) } catch { return reply(res, 400, { error: 'invalid json' }) }
-      if (path === receiptPath && hooks.react) {
+      if (path === receiptPath && options.react) {
         const parsed = receipt.safeParse(raw)
         if (!parsed.success) return reply(res, 400, { error: 'invalid payload' })
         if (parsed.data.chat_id !== chatId) return reply(res, 403, { error: 'chatId not in allowlist' })
         try {
-          if (!await hooks.react(parsed.data.message_id)) return reply(res, 403, { error: 'unknown inbound message' })
+          if (!await options.react(parsed.data.message_id)) return reply(res, 403, { error: 'unknown inbound message' })
           return reply(res, 200, { status: 'reacted' })
         } catch { return reply(res, 200, { status: 'react_failed' }) }
       }
       if (path === questionPath) {
         const parsed = AskUserQuestionRequestSchema.strict().safeParse(raw)
         if (!parsed.success) return reply(res, 400, { error: 'invalid payload' })
-        const ask = hooks.ask
+        const ask = options.ask
         if (!ask) return reply(res, 200, { status: 'pass_through' })
         const { session_id, tool_use_id, questions, timeout_ms } = parsed.data
         const key = JSON.stringify([session_id, tool_use_id])
@@ -219,7 +221,7 @@ export async function startExternalTasks(port: number, token: string, chatId: st
       if (payload.success) {
         if (!payload.data.message.trim()) return reply(res, 400, { error: 'invalid payload' })
         if (payload.data.chatId !== chatId) return reply(res, 403, { error: 'chatId not in allowlist' })
-        if (payload.data.agentId !== undefined && !['krotov', 'dashi-channel', 'example-agent'].includes(payload.data.agentId)) {
+        if (payload.data.agentId !== undefined && payload.data.agentId !== agentId) {
           return reply(res, 404, { error: 'agent not found' })
         }
         message = payload.data.message

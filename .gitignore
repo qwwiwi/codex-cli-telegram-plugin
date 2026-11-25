@@ -3,6 +3,7 @@ node_modules/
 .env.*
 *.env
 !.env.example
+root-backend.json
 secrets/
 /state/
 /logs/

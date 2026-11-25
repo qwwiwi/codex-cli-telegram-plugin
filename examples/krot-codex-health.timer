@@ -1,5 +1,5 @@
 [Unit]
-Description=Check example-agent Codex App Server every minute
+Description=Check the configured Codex App Server every minute
 
 [Timer]
 OnBootSec=45s

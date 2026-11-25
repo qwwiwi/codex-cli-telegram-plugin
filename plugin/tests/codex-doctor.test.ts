@@ -3,8 +3,22 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { probeProxy, runDoctor } from '../scripts/doctor.js'
+import { getStatePaths, loadConfig, RuntimeEnvSchema } from '../src/config.js'
 
 const token = '100001:fake-token-with-enough-characters'
+
+test('omitted routing configuration leaves Telegram identity and access unconfigured', () => {
+  const root = mkdtempSync(join(tmpdir(), 'krotov-config-'))
+  try {
+    const env = { TELEGRAM_BOT_TOKEN: token, XDG_STATE_HOME: root }
+    const config = loadConfig(env)
+    expect(config.bot_id).toBeUndefined()
+    expect(config.allowed_user_ids).toEqual([])
+    expect(config.allowed_chat_ids).toEqual([])
+    expect(config.permission_relay.allowed_user_ids).toEqual([])
+    expect(getStatePaths(config, RuntimeEnvSchema.parse(env)).root).toBe(join(root, 'krotov-plugin'))
+  } finally { rmSync(root, { force: true, recursive: true }) }
+})
 
 test('doctor verifies ChatGPT login through the configured App Server connection', async () => {
   const command = [process.execPath, join(import.meta.dir, 'codex', 'fake-app-server.ts')] as const

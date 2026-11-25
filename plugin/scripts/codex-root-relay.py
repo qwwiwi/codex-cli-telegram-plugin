@@ -1,16 +1,32 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -Es
 """Relay Krot's narrow stdio protocol to the private root Codex socket."""
 
 import asyncio
 import json
 import os
+import re
+import signal
+import stat
 import sys
+import tempfile
 
-SOCKET = "/run/example/rpc.sock"
-WORKSPACE = "/srv/example/workspace"
-TELEGRAM_INBOX = "/srv/example/live-state/inbox"
 MAX_MESSAGE = 16 * 1024 * 1024
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_SPOOL_BYTES = 128 * 1024 * 1024
+MAX_SPOOL_IMAGES = 128
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+THREAD_OPEN = {"thread/start", "thread/resume", "thread/fork"}
 CHAT_TOOL_CALL = "item/tool/call"
+MCP_ELICITATION = "mcpServer/elicitation/request"
+# Match the hosted publishing tools previewed by mcp-approval.ts.
+MCP_GITHUB_WRITES = {
+    "github.create_blob", "github.create_tree", "github.create_commit", "github.create_ref",
+    "github.update_ref", "github.create_branch", "github.create_pull_request", "github.push_files",
+}
+MCP_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,100}")
+GITHUB_REPOSITORY = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9-]{0,38}/[a-zA-Z0-9_.-]{1,100}")
+SENSITIVE_ARG = re.compile(r"token|authorization|password|credential|secret|api[_-]?key", re.IGNORECASE)
+WORKER_ID = re.compile(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}")
 # Only this client-owned catalog may cross the root relay. Match chat-actions.ts.
 CHAT_TOOL = {
     "type": "function",
@@ -57,6 +73,197 @@ APPROVALS = {
 }
 
 
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def open_directories(parent_fd, parts):
+    directory = os.dup(parent_fd)
+    try:
+        for part in parts:
+            child = os.open(part, DIRECTORY_FLAGS, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        return directory
+    except OSError:
+        os.close(directory)
+        raise
+
+
+def image_parts(path, inbox):
+    prefix = inbox.rstrip(os.sep) + os.sep
+    if not isinstance(path, str) or "\0" in path or not path.startswith(prefix):
+        return None
+    parts = path[len(prefix):].split(os.sep)
+    return parts if all(part not in ("", ".", "..") for part in parts) else None
+
+
+class MediaSpool:
+    def __init__(self, inbox, parent="/run"):
+        self.inbox = inbox
+        self.parent = parent
+        self.inbox_fd = None
+        self.directory = None
+        self.bytes = 0
+        self.files = 0
+
+    def read_image(self, path, limit):
+        parts = image_parts(path, self.inbox)
+        if not parts:
+            raise ValueError("Invalid image path")
+        if self.inbox_fd is None:
+            root = os.open("/", DIRECTORY_FLAGS)
+            try:
+                self.inbox_fd = open_directories(root, self.inbox.split("/")[1:])
+            finally:
+                os.close(root)
+        directory = open_directories(self.inbox_fd, parts[:-1])
+        try:
+            descriptor = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                source = os.fstat(descriptor)
+                if (not stat.S_ISREG(source.st_mode) or source.st_nlink != 1
+                        or source.st_uid != os.fstat(self.inbox_fd).st_uid or not 0 < source.st_size <= limit):
+                    raise ValueError("Unsafe image source")
+                # O_PATH identifies the inode before attempting to open it for reading.
+                with open("/proc/self/fd/" + str(descriptor), "rb") as stream:
+                    contents = stream.read(limit + 1)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory)
+        if not 0 < len(contents) <= limit:
+            raise ValueError("Image exceeds the spool budget")
+        return contents
+
+    def stage(self, inputs):
+        images = inputs[1:]
+        if not images:
+            return inputs
+        if self.files + len(images) > MAX_SPOOL_IMAGES:
+            raise ValueError("Image count exceeds the spool budget")
+        if self.directory is None:
+            if self.parent == "/run" and os.geteuid() != 0:
+                raise ValueError("Image staging requires the root relay")
+            self.directory = tempfile.TemporaryDirectory(prefix="krotov-media-", dir=self.parent)
+        paths = []
+        size = 0
+        try:
+            for image in images:
+                path = image["path"]
+                data = self.read_image(path, min(MAX_IMAGE_BYTES, MAX_SPOOL_BYTES - self.bytes - size))
+                suffix = os.path.splitext(path)[1].lower()
+                if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+                    suffix = ""
+                with tempfile.NamedTemporaryFile(dir=self.directory.name, suffix=suffix, delete=False) as copy:
+                    paths.append(copy.name)
+                    copy.write(data)
+                size += len(data)
+        except (OSError, ValueError):
+            for path in paths:
+                os.unlink(path)
+            raise
+        self.files += len(paths)
+        self.bytes += size
+        return [inputs[0], *({"type": "localImage", "path": path} for path in paths)]
+
+    def close(self):
+        if self.inbox_fd is not None:
+            os.close(self.inbox_fd)
+        if self.directory is not None:
+            self.directory.cleanup()
+
+
+def valid_mcp_form(params, opened, workers):
+    params = as_dict(params)
+    thread = params.get("threadId")
+    turn = params.get("turnId")
+    server = params.get("serverName")
+    message = params.get("message")
+    meta = as_dict(params.get("_meta"))
+    tool = meta.get("tool_name")
+    schema = as_dict(params.get("requestedSchema"))
+    if (not isinstance(thread, str) or (thread not in opened and workers.get(thread) not in opened)
+            or not isinstance(turn, str) or not 0 < len(turn) <= 128
+            or not isinstance(server, str) or not MCP_NAME.fullmatch(server)
+            or not isinstance(tool, str) or not MCP_NAME.fullmatch(tool)
+            or params.get("mode") != "form" or params.get("environmentId") not in (None, "local")
+            or meta.get("codex_approval_kind") != "mcp_tool_call"
+            or not isinstance(message, str) or not message.strip() or len(message) > 400
+            or schema.get("type") != "object" or schema.get("properties") != {}
+            or schema.get("required") not in (None, [])):
+        return False
+    if server == "codex_apps":
+        args = as_dict(meta.get("tool_params"))
+        repository = args.get("repository_full_name")
+        owner, repo = args.get("owner"), args.get("repo")
+        if repository is None and isinstance(owner, str) and isinstance(repo, str):
+            repository = owner + "/" + repo
+        return (tool in MCP_GITHUB_WRITES and ("force" not in args or args["force"] is False)
+                and isinstance(repository, str) and bool(GITHUB_REPOSITORY.fullmatch(repository))
+                and not repository.endswith(("/.", "/..")) and not any(SENSITIVE_ARG.search(key) for key in args))
+    return not tool.lower().startswith("github.")
+
+
+def valid_mcp_decision(result):
+    if not isinstance(result, dict):
+        return False
+    if result.get("action") == "accept":
+        return result.keys() == {"action", "content"} and result["content"] == {}
+    return result.keys() == {"action"} and result["action"] in ("decline", "cancel")
+
+
+def observe_workers(message, opened, workers):
+    if "id" in message or message.get("method") not in ("item/started", "item/completed"):
+        return
+    params = as_dict(message.get("params"))
+    parent = params.get("threadId")
+    if not isinstance(parent, str):
+        return
+    session = parent if parent in opened else workers.get(parent)
+    if session not in opened:
+        return
+    item = as_dict(params.get("item"))
+    if item.get("type") == "subAgentActivity" and item.get("kind") in ("started", "interacted"):
+        children = [item.get("agentThreadId")]
+    elif item.get("type") == "collabAgentToolCall":
+        children = [child for child, state in as_dict(item.get("agentsStates")).items()
+                    if as_dict(state).get("status") in ("running", "pendingInit")]
+    else:
+        return
+
+    for child in children:
+        if not isinstance(child, str) or not WORKER_ID.fullmatch(child) or child == parent or child in opened:
+            continue
+        if len(workers) >= 128 and child not in workers:
+            del workers[next(iter(workers))]
+        workers[child] = session
+
+
+def worker_metadata(thread, requested, opened, expected_session, workspace):
+    thread = as_dict(thread)
+    session = thread.get("sessionId")
+    parent = thread.get("parentThreadId")
+    source = as_dict(thread.get("source"))
+    subagent = as_dict(source.get("subAgent"))
+    spawn = as_dict(subagent.get("thread_spawn"))
+    depth = spawn.get("depth")
+    if (thread.get("id") != requested or thread.get("cwd") != workspace
+            or not isinstance(session, str) or session not in opened
+            or (expected_session is not None and session != expected_session)
+            or not isinstance(parent, str) or spawn.get("parent_thread_id") != parent
+            or type(depth) is not int or depth < 1 or (depth == 1 and parent != session)):
+        return {}
+    visible = {
+        "id": requested, "cwd": workspace, "parentThreadId": parent, "sessionId": session,
+        "source": {"subAgent": {"thread_spawn": {"parent_thread_id": parent, "depth": depth}}},
+    }
+    status = as_dict(thread.get("status")).get("type")
+    if status in ("idle", "notLoaded", "active"):
+        visible["status"] = {"type": status}
+    return visible
+
+
 def valid_answers(result):
     if not isinstance(result, dict) or result.keys() != {"answers"}:
         return False
@@ -94,7 +301,19 @@ def valid_chat_result(result):
             and isinstance(items[0]["text"], str) and 0 < len(items[0]["text"]) <= 8192)
 
 
-def allowed_request(message, opened, approval_threads=()):
+def valid_turn_input(inputs, telegram_inbox, max_text_length):
+    if not isinstance(inputs, list) or not 1 <= len(inputs) <= 11:
+        return False
+    item = inputs[0]
+    return (isinstance(item, dict) and item.keys() == {"type", "text", "text_elements"}
+            and item["type"] == "text" and isinstance(item["text"], str)
+            and 0 < len(item["text"]) <= max_text_length and item["text_elements"] == []
+            and all(isinstance(image, dict) and image.keys() == {"type", "path"}
+                    and image["type"] == "localImage" and image_parts(image["path"], telegram_inbox)
+                    for image in inputs[1:]))
+
+
+def allowed_request(message, opened, config, approval_threads=(), observed_workers=()):
     method = message.get("method")
     params = message.get("params", {})
     if method not in ALLOWED or not isinstance(params, dict) or not params.keys() <= ALLOWED[method]:
@@ -103,15 +322,17 @@ def allowed_request(message, opened, approval_threads=()):
         return "capabilities" not in params or params["capabilities"] == {
             "experimentalApi": True, "requestAttestation": False,
         }
-    if method in {"thread/start", "thread/resume", "thread/fork"}:
+    if method in THREAD_OPEN:
         return (
-            params.get("cwd") == WORKSPACE
+            params.get("cwd") == config.workspace
             and params.get("approvalPolicy") == "on-request"
             and params.get("sandbox") == "workspace-write"
             and ("dynamicTools" not in params or params["dynamicTools"] == [CHAT_TOOL])
-            and (method != "thread/fork" or
-                 (isinstance(params.get("threadId"), str) and params["threadId"] in opened
+            and (method == "thread/start" or
+                 (isinstance(params.get("threadId"), str) and 0 < len(params["threadId"]) <= 128
                   and params.get("excludeTurns") is True))
+            and (method != "thread/fork" or
+                 params["threadId"] in opened)
         )
     if method == "account/read":
         return params.get("refreshToken") is False
@@ -119,7 +340,7 @@ def allowed_request(message, opened, approval_threads=()):
         return params == {"limit": 100, "includeHidden": False}
     if method == "thread/read":
         thread = params.get("threadId")
-        return (isinstance(thread, str) and (thread in opened or thread in approval_threads)
+        return (isinstance(thread, str) and (thread in opened or thread in approval_threads or thread in observed_workers)
                 and params.get("includeTurns") is False)
     if method in {"thread/goal/get", "thread/goal/set", "thread/goal/clear"}:
         thread = params.get("threadId")
@@ -128,13 +349,14 @@ def allowed_request(message, opened, approval_threads=()):
         if method != "thread/goal/set":
             return params == {"threadId": thread}
         objective = params.get("objective")
+        budget = params.get("tokenBudget")
+        valid_objective = (isinstance(objective, str) and 0 < len(objective) <= 4000
+                           and "tokenBudget" in params and (budget is None or budget == 60000))
         if params.get("origin") == "automatic":
-            return (params.get("status") == "active" and isinstance(objective, str)
-                    and 0 < len(objective) <= 4000 and params.get("tokenBudget") == 60000)
+            return params.get("status") == "active" and valid_objective
         return (
             params.get("origin") == "user" and params.get("status") in {"active", "paused"}
-            and ((objective is None and "tokenBudget" not in params) or
-                 (isinstance(objective, str) and 0 < len(objective) <= 4000 and params.get("tokenBudget") == 60000))
+            and ((objective is None and "tokenBudget" not in params) or valid_objective)
         )
     if method == "thread/turns/list":
         thread = params.get("threadId")
@@ -145,8 +367,23 @@ def allowed_request(message, opened, approval_threads=()):
             and params.get("sortDirection") == "desc" and isinstance(cursor, str)
             and len(cursor) <= 2048
         )
-    if method == "thread/compact/start":
-        return isinstance(params.get("threadId"), str) and bool(params["threadId"])
+    if method in {"thread/compact/start", "turn/start", "turn/steer", "turn/interrupt"}:
+        thread = params.get("threadId")
+        if not isinstance(thread, str) or thread not in opened:
+            return False
+        if method == "thread/compact/start":
+            return True
+        if method == "turn/interrupt":
+            turn = params.get("turnId")
+            return isinstance(turn, str) and 0 < len(turn) <= 128
+        inputs = params.get("input")
+        if method == "turn/start":
+            return valid_turn_input(inputs, config.telegram_inbox, MAX_MESSAGE)
+        turn = params.get("expectedTurnId")
+        client_id = params.get("clientUserMessageId")
+        return (isinstance(turn, str) and 0 < len(turn) <= 128 and isinstance(client_id, str)
+                and client_id.isascii() and client_id.isdecimal() and len(client_id) <= 16
+                and valid_turn_input(inputs, config.telegram_inbox, 100000))
     if method == "thread/inject_items":
         thread = params.get("threadId")
         items = params.get("items")
@@ -164,25 +401,6 @@ def allowed_request(message, opened, approval_threads=()):
                 and len(part["text"]) <= 90000
                 and part["text"].startswith(("Архив Claude Code, выбранный владельцем как справочный контекст.",
                                              "Мандаты владельца Telegram для этой задачи Codex.")))
-    if method == "turn/steer":
-        thread = params.get("threadId")
-        turn = params.get("expectedTurnId")
-        client_id = params.get("clientUserMessageId")
-        inputs = params.get("input")
-        if (not isinstance(thread, str) or thread not in opened or not isinstance(turn, str)
-                or not 0 < len(turn) <= 128 or not isinstance(client_id, str)
-                or not client_id.isascii() or not client_id.isdecimal() or len(client_id) > 16
-                or not isinstance(inputs, list) or not 1 <= len(inputs) <= 11):
-            return False
-        item = inputs[0]
-        return (isinstance(item, dict) and item.keys() == {"type", "text", "text_elements"}
-                and item["type"] == "text" and isinstance(item["text"], str)
-                and 0 < len(item["text"]) <= 100000 and item["text_elements"] == []
-                and all(isinstance(image, dict) and image.keys() == {"type", "path"}
-                        and image["type"] == "localImage" and isinstance(path := image["path"], str)
-                        and path.startswith(TELEGRAM_INBOX + "/")
-                        and os.path.realpath(path).startswith(TELEGRAM_INBOX + "/")
-                        for image in inputs[1:]))
     return True
 
 
@@ -191,59 +409,66 @@ def write(message):
     sys.stdout.flush()
 
 
-async def relay():
+async def relay(config):
     import websockets
 
     pending = {}
     requests = {}
     opened = set()
+    observed_workers = {}
     restart_task = None
+    spool = MediaSpool(config.telegram_inbox)
     reader = asyncio.StreamReader(limit=MAX_MESSAGE)
     await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer
     )
-    async with websockets.unix_connect(SOCKET, uri="ws://localhost/", max_size=MAX_MESSAGE) as server:
-        async def restart_backend():
+    async with websockets.unix_connect(config.socket, uri="ws://localhost/", max_size=MAX_MESSAGE) as server:
+        async def restart_backend(unit):
             await asyncio.sleep(0.7)
             child = await asyncio.create_subprocess_exec(
-                "/usr/bin/systemctl", "--no-block", "restart", "example-backend.service",
+                "/usr/bin/systemctl", "--no-block", "restart", unit,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            if await child.wait() == 0:
-                # The restart transaction may wait for the Telegram bridge. Signal only
-                # the backend cgroup now so a running command stops independently.
-                await asyncio.create_subprocess_exec(
-                    "/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGTERM",
-                    "example-backend.service",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
+            await child.wait()
 
         async def to_server():
             nonlocal restart_task
             while line := await reader.readline():
                 message = json.loads(line)
+                message_id = message.get("id")
                 if message.get("method") == "krot/background/stop":
                     if message.get("params") == {} and type(message.get("id")) is int:
-                        if restart_task is None:
-                            restart_task = asyncio.create_task(restart_backend())
-                        write({"id": message["id"], "result": {"scheduled": True}})
+                        unit = config.restart_unit
+                        if unit is not None and restart_task is None:
+                            restart_task = asyncio.create_task(restart_backend(unit))
+                        write({"id": message_id, "result": {"scheduled": unit is not None}})
                     continue
                 if "method" in message:
+                    method = message["method"]
                     approval_threads = {
-                        thread for method, thread in pending.values() if method in APPROVALS
+                        thread for method, thread, _ in pending.values() if method in APPROVALS
                     }
-                    accepted = allowed_request(message, opened, approval_threads)
-                    if accepted and "id" in message and message["method"] in (
-                        "thread/start", "thread/resume", "thread/fork", "thread/turns/list"
-                    ):
-                        requests[message["id"]] = message["method"]
-                    if accepted and message["method"] == "thread/read" and message["params"]["threadId"] not in opened:
-                        requests[message["id"]] = "child-metadata"
-                elif message.get("id") in pending:
-                    method, _ = pending.pop(message["id"])
+                    accepted = allowed_request(message, opened, config, approval_threads, observed_workers)
+                    if accepted and method in ("turn/start", "turn/steer"):
+                        try:
+                            message["params"]["input"] = spool.stage(message["params"]["input"])
+                        except (OSError, ValueError):
+                            accepted = False
+                    if accepted and "id" in message and (method in THREAD_OPEN or method == "thread/turns/list"):
+                        requests[message_id] = (method, message["params"].get("threadId"))
+                    if accepted and "id" in message and method == "thread/read":
+                        thread = message["params"]["threadId"]
+                        if thread not in opened:
+                            requests[message_id] = ("child-metadata", (thread, observed_workers.get(thread)))
+                elif type(message_id) in (str, int) and message_id in pending:
+                    method, _, _ = pending.pop(message_id)
                     result = message.get("result")
+                    if method == MCP_ELICITATION:
+                        if set(message) != {"id", "result"} or not valid_mcp_decision(result):
+                            message = {"id": message_id, "result": {"action": "cancel"}}
+                        await server.send(json.dumps(message))
+                        continue
                     if method == CHAT_TOOL_CALL:
                         if set(message) != {"id", "result"} or not valid_chat_result(result):
                             message = {"id": message["id"], "error": {"code": -32601, "message": "Krot relay denied tool response"}}
@@ -260,32 +485,54 @@ async def relay():
 
                 if accepted:
                     await server.send(json.dumps(message))
-                elif "id" in message:
+                elif "method" in message and "id" in message:
                     write({"id": message["id"], "error": {"code": -32601, "message": "Krot relay denied request"}})
 
         async def to_client():
             async for value in server:
                 message = json.loads(value)
+                observe_workers(message, opened, observed_workers)
+                if message.get("method") == "serverRequest/resolved" and "id" not in message:
+                    resolution = as_dict(message.get("params"))
+                    request_id = resolution.get("requestId")
+                    entry = pending.get(request_id) if type(request_id) in (str, int) else None
+                    if (entry and entry[0] == MCP_ELICITATION
+                            and resolution.get("threadId") in (None, entry[1])
+                            and resolution.get("turnId") in (None, entry[2])):
+                        del pending[request_id]
                 if "method" in message and "id" in message:
                     method = message["method"]
                     params = message.get("params")
+                    if method == MCP_ELICITATION and (
+                        type(message["id"]) not in (str, int) or not valid_mcp_form(params, opened, observed_workers)
+                    ):
+                        await server.send(json.dumps({"id": message["id"], "result": {"action": "cancel"}}))
+                        continue
                     if method == CHAT_TOOL_CALL and not valid_chat_call(params, opened):
                         await server.send(json.dumps({
                             "id": message["id"], "error": {"code": -32601, "message": "Krot relay denied tool request"},
                         }))
                         continue
-                    thread = params.get("threadId") if isinstance(params, dict) else None
-                    pending[message["id"]] = (method, thread if isinstance(thread, str) else None)
+                    params = as_dict(params)
+                    thread = params.get("threadId")
+                    pending[message["id"]] = (method, thread if isinstance(thread, str) else None, params.get("turnId"))
                 elif message.get("id") in requests:
-                    method = requests.pop(message["id"])
+                    method, scope = requests.pop(message["id"])
                     result = message.get("result")
-                    if isinstance(result, dict):
+                    if method in THREAD_OPEN:
+                        thread = as_dict(as_dict(result).get("thread"))
+                        thread_id = thread.get("id")
+                        if (isinstance(thread_id, str) and 0 < len(thread_id) <= 128 and thread.get("cwd") == config.workspace
+                                and (thread_id == scope if method == "thread/resume" else thread_id not in opened)):
+                            opened.add(thread_id)
+                        else:
+                            message = {"id": message["id"], "error": {"code": -32601, "message": "Krot relay denied thread result"}}
+                    elif isinstance(result, dict):
                         if method == "child-metadata":
-                            thread = result.get("thread") or {}
-                            message["result"] = {"thread": {
-                                key: thread.get(key)
-                                for key in ("id", "cwd", "source", "parentThreadId", "sessionId")
-                            }}
+                            thread, expected_session = scope
+                            message["result"] = {"thread": worker_metadata(
+                                result.get("thread"), thread, opened, expected_session, config.workspace,
+                            )}
                         elif method == "thread/turns/list":
                             for turn in result.get("data", []):
                                 turn["items"] = [
@@ -293,21 +540,39 @@ async def relay():
                                     if item.get("type") == "userMessage" or
                                     (item.get("type") == "agentMessage" and item.get("phase") != "commentary")
                                 ]
-                        else:
-                            thread = result.get("thread") or {}
-                            if thread.get("cwd") == WORKSPACE and isinstance(thread.get("id"), str):
-                                opened.add(thread["id"])
                 write(message)
 
         tasks = [asyncio.create_task(to_server()), asyncio.create_task(to_client())]
-        done, remaining = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in remaining:
-            task.cancel()
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            spool.close()
         for task in done:
             task.result()
+
+
+async def run_relay(config):
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        await relay(config)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 1:
         sys.exit("This relay accepts no arguments")
-    asyncio.run(relay())
+    from root_backend import load_config
+
+    try:
+        config = load_config()
+    except (OSError, ValueError):
+        sys.exit("Trusted root backend configuration is unavailable")
+    asyncio.run(run_relay(config))

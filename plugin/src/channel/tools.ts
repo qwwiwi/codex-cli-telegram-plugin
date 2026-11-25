@@ -118,7 +118,7 @@ export interface SendMessageOpts {
   // Deliver without a push notification. Set by progress surfaces whose
   // messages are indicators, not reports — the status bubble above all: it is
   // re-created on every turn (and once per turn-like gap), and each send buzzed
-  // the owner's phone (Pavel 2026-10-29: 17 bubble respawns in 7 minutes).
+  // the owner's phone (repeated bubble respawns).
   // Edits never push, so only the initial send needs it.
   disable_notification?: boolean
   // Opt OUT of the reliable layer's outbound-activity stamp. Set by INTERNAL

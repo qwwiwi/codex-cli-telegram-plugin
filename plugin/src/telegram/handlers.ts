@@ -119,7 +119,7 @@ export interface AlbumEntry {
    *  (those builds dropped unaddressed fragments at the gate, so anything
    *  on disk was addressed at the time). */
   addressedAtPush?: boolean
-  /** Forum-topic thread id of this fragment (Pavel 2026-06-09). First
+  /** Forum-topic thread id of this fragment. First
    *  defined value wins on flush so the reply lands in the same topic. */
   threadId?: number
 }
@@ -137,7 +137,7 @@ export interface AlbumDispatchDeps {
   // concatenated). Otherwise the legacy MCP notify path runs.
   router?: MultichatRouter
   policy?: MultichatPolicy
-  // Forum-topic memory (Pavel 2026-06-09): record the album's inbound topic
+  // Forum-topic memory: record the album's inbound topic
   // so a reply that omits thread_id still lands in the same topic.
   threadStore?: ThreadStore
 }
@@ -172,8 +172,8 @@ export interface HandlerDeps {
   // tests still compile — when absent, every media message goes through
   // the single-media path (no album merging).
   albumBuffer?: AlbumBuffer<AlbumEntry>
-  // PR-A3 (2026-05-20): InboundWatcher fires an auto-reply «Тралл занят»
-  // when the warchief sends plain text mid-tool. Optional so older tests
+  // PR-A3 (2026-05-20): InboundWatcher fires an auto-reply «Агент занят»
+  // when the owner sends plain text mid-tool. Optional so older tests
   // compile — when absent, the watcher branch is skipped and behaviour
   // matches the pre-A3 path. Insertion point in handleInboundText sits
   // AFTER OOB resolution and BEFORE gateAndNotify: OOB still wins, and
@@ -421,7 +421,7 @@ function watcherAllowed(
 // allowed sender's message would trigger auto-reply and tmux-mirror
 // bump even when the bot was not addressed. That leaks bot activity
 // (typing bubble, status edits, mirror re-anchor) on every normal
-// group message — the warchief and other speakers would see the bot
+// group message — the owner and other speakers would see the bot
 // "react" to traffic that wasn't directed at it.
 //
 // Composite gate: allowlist-pass (chat/sender) AND addressing-pass
@@ -447,7 +447,7 @@ function isSideEffectAllowed(
 // no-op when the watcher isn't configured — older tests stay compatible.
 //
 // Bug #3 (TASK-4): use `isSideEffectAllowed` (allowlist AND addressing)
-// so a non-addressed group message never triggers «Тралл занят».
+// so a non-addressed group message never triggers «Агент занят».
 function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
   if (!deps.watcher) return
   if (!isSideEffectAllowed(ctx, deps.config, deps.policy)) return
@@ -466,7 +466,7 @@ function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
 
 // Fire-and-forget mirror bump. Triggered by an inbound message from an
 // allowed sender so the rolling tmux-mirror message is re-anchored at
-// the bottom of the chat (warchief asked for this 2026-05-20: the mirror
+// the bottom of the chat (owner asked for this 2026-05-20: the mirror
 // was scrolling up out of view as the conversation progressed). Reuses
 // the same allowlist gate as the watcher so a non-allowed message never
 // disturbs the mirror. `bump` is optional on TmuxMirrorControl, so when
@@ -550,10 +550,8 @@ function isPolicyRouterMisconfig(
 // Variant A (2026-06-11): whether a NON-group chat (a private DM) should be
 // routed to its own per-chat tmux session instead of falling through to the
 // legacy master notify. True only when `multichat.route_private` is enabled
-// AND the chat has its own entry in `policy.chats`. Deployments that keep the
-// flag off (default) — e.g. the thrall topology — are unaffected: their DMs
-// still land in the master session. A DM with no policy entry also stays on
-// the legacy path regardless of the flag (fail-closed).
+// AND the chat has its own entry in `policy.chats`. With the flag off or no
+// policy entry, the DM still lands in the main session.
 function shouldRoutePrivate(
   config: AppConfig,
   policy: MultichatPolicy | undefined,
@@ -650,7 +648,7 @@ async function gateAndNotify(
   }
 
   // Group/supergroup addressing gate: only senders in `mention_allowlist`
-  // (typically just the warchief) may summon the bot via @-mention or
+  // (typically just the owner) may summon the bot via @-mention or
   // reply-to-bot. Silent drop — no reaction, no notify, no router dispatch.
   // DM passes through unchanged because isAddressedToBot returns true for
   // private chats regardless of the allowlist parameter.
@@ -699,9 +697,8 @@ async function gateAndNotify(
   }
 
   // Remember the inbound forum topic for this chat so the reply / status
-  // surfaces default into the SAME topic instead of the supergroup's General
-  // (Pavel 2026-06-09). A General-topic / private message clears any stale
-  // thread. Recorded once the message is gated, before any outbound traffic.
+  // surfaces default into the same topic. A General-topic or private message
+  // clears any stale thread. Record it before any outbound traffic.
   const inboundThreadId = threadIdOf(ctx)
   deps.threadStore?.record(decision.chatId, inboundThreadId)
 
@@ -715,7 +712,7 @@ async function gateAndNotify(
   // Router path: route GROUP/supergroup chats to their per-chat tmux
   // session via the file-based inbox. Private DMs fall through to the
   // legacy sendChannelNotification path below by default so they land in
-  // the master (channel-thrall) session — the warchief's main Telegram
+  // the master session — the owner's main Telegram
   // channel lives there (explicit requirement 2026-05-28). Variant A
   // (2026-06-11) opts a deployment INTO routing private DMs too, via
   // `multichat.route_private` + a per-chat policy entry (see
@@ -1397,7 +1394,7 @@ export async function sendAlbumNotification(
   // forward_origin on every fragment of a forwarded album.
   const albumForward = album.messages.find((m) => m.forward !== undefined)?.forward
 
-  // First defined forum-topic thread wins (Pavel 2026-06-09) — so the album
+  // First defined forum-topic thread wins — so the album
   // reply lands in the same topic. Record it as the chat's default thread too,
   // matching gateAndNotify's single-message behaviour.
   const albumThreadId = album.messages.find((m) => m.threadId !== undefined)?.threadId
@@ -1406,7 +1403,7 @@ export async function sendAlbumNotification(
   // Router path: GROUP albums go to the per-chat session (merged caption
   // + every downloaded media path). Private-DM albums fall through to the
   // legacy notify path below by default, landing in the master
-  // (channel-thrall) session — symmetric with the single-message branch
+  // session — symmetric with the single-message branch
   // in gateAndNotify, including the variant-A `route_private` opt-in.
   // Reuse the `isGroup` local set above (isGroupChatId(ids.chatId)) — it
   // is the only group signal here since the original Context/chatType is
@@ -1549,7 +1546,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
 
   // fix/eyes-on-read (2026-05-28): the 👀 read receipt is NO LONGER set
   // here. Setting it at bot-receive time made 👀 mean "the bot saw the
-  // update", not "Thrall read it" — if a turn was busy, the message queued
+  // update", not "the agent read it" — if a turn was busy, the message queued
   // while the eyes already showed, so the signal lied. The reaction now
   // fires deterministically from the Stop hook (scripts/read-receipt-hook.ts
   // → POST /hooks/react) once the message has actually entered and been read
@@ -1561,7 +1558,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
   // priority over the AskUserQuestion «Other» text consumer. Previously the
   // Other-text path ran first and would swallow a perfectly-formed
   // `yes <id>` / `no <id>` reply — the permission relay timed out and the
-  // warchief's intent was lost. SECURITY gate: live permission verdict
+  // owner's intent was lost. SECURITY gate: live permission verdict
   // wins so the approve/deny channel cannot be hijacked by a parallel
   // AskUserQuestion prompt.
   //
@@ -1607,7 +1604,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
   // consumption. Runs AFTER the permission-reply gate so a live `yes <id>`
   // / `no <id>` verdict is never swallowed (FIX-T1 F3). The UI itself
   // enforces:
-  //   - approver allowlist (only the warchief may answer)
+  //   - approver allowlist (only the owner may answer)
   //   - reply_to_message_id matches the awaiting prompt (FIX-T1 F4 — narrow
   //     hijack surface; only an explicit reply to «Введи ответ» consumes
   //     the awaiting slot, freeform text falls through to channel forward)
@@ -1684,7 +1681,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
   }
 
   // PR-A3 watcher hook (after OOB resolution, before gate/notify): if Claude
-  // is mid-tool for this chat, auto-reply «Тралл занят». Gated on the
+  // is mid-tool for this chat, auto-reply «Агент занят». Gated on the
   // allowlist — only allowed senders in allowed chats can trigger it.
   // Fire-and-forget — channel-notification latency must NOT depend on the
   // auto-reply round-trip. Auto-reply does NOT replace the channel notification
@@ -1725,7 +1722,7 @@ function voiceTranscribeDeps(deps: HandlerDeps): VoiceTranscribeDeps {
 
 export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promise<void> {
   // PR-A3: same watcher hook as text. Media handlers must surface
-  // «Тралл занят» too — otherwise a busy-session photo/voice silently waits.
+  // «Агент занят» too — otherwise a busy-session photo/voice silently waits.
   maybeTriggerWatcher(ctx, deps)
   maybeBumpMirror(ctx, deps)
   const buildPhoto = (): Promise<MediaDescriptor[]> =>
@@ -1854,16 +1851,14 @@ export async function handleInboundSticker(ctx: Context, deps: HandlerDeps): Pro
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Rich Message inbound (Pavel 2026-10-10: «Пересылаю ему сообщение, а он
-// не видит»).
+// Rich Message inbound.
 //
 // A message Telegram rendered as a Rich Message (Bot API 10.1) carries NO
 // `text` and NO `caption` — the body is a block tree under `rich_message`.
 // Forwarding such a message therefore matched NONE of the per-type
 // subscriptions (`message:text` needs `text`), so it fell off the end of the
-// middleware chain: the 👀 receipt fired, then nothing. Two forwards to
-// example-agent and one to example-agent vanished that way, with no error and no
-// dead-letter to point at.
+// middleware chain: the 👀 receipt fired, then the forward was lost without
+// an error or dead-letter entry.
 //
 // The quote path already knew how to read the tree (buildReplyContext →
 // flattenRichMessage); this reuses that flattener for the inbound body.

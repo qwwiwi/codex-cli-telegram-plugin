@@ -98,7 +98,7 @@ export type TelegramForwardOrigin =
 
 // Attribution of a forwarded message, as handed to the agent. UNTRUSTED: every
 // string here is chosen by the original author (a display name can say anything,
-// including "Pavel" or a fake instruction), so it ships inside the
+// including a misleading name or instruction), so it ships inside the
 // <untrusted_metadata> envelope and never as trusted prose.
 // A type alias, not an interface, for the same reason UntrustedReplyContext is
 // one: renderUntrustedMetadata takes Record<string, unknown>, and only an

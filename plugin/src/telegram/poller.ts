@@ -101,7 +101,7 @@ const FLOOD_JITTER_MIN_MS = 100
 const FLOOD_JITTER_MAX_MS = 500
 
 // Update types we want from Telegram. Anything else is silently dropped
-// by the API. Mirrors the grammY default plus what canary handlers use.
+// by the API. Mirrors the grammY default plus the updates handled by this bridge.
 const ALLOWED_UPDATES: ReadonlyArray<Exclude<keyof Update, 'update_id'>> = [
   'message',
   'edited_message',
@@ -467,6 +467,7 @@ export class TelegramPoller {
    */
   async start(): Promise<void> {
     const { bot, config, log } = this.deps
+    if (config.bot_id === undefined) throw new Error('Configured Telegram bot ID is required before polling')
 
     // 1. getMe sanity check — verify token is valid and bot_id matches.
     //    grammY's bot.init() does the same getMe internally; we call it

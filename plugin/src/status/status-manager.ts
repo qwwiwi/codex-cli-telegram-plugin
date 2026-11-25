@@ -46,7 +46,7 @@ import {
  *   ONLY — any caller still wired to it would otherwise re-introduce
  *   the fail-OPEN regression CRITICAL #1 / HIGH #9 (codex review
  *   2026-05-27) eliminated: pre-fix this function returned `true` for
- *   chats absent from `policy.chats`, leaking warchief streaming into
+ *   chats absent from `policy.chats`, leaking owner streaming into
  *   misconfigured public groups. Re-implemented as a thin shim around
  *   the fail-CLOSED primitive so legacy imports get the correct
  *   semantics automatically (FIX-C bug #4, codex status #4).
@@ -221,7 +221,7 @@ export interface StatusManagerDeps {
   //
   // Semantics (delegated to {@link shouldStreamForChat}):
   //   * `null` / omitted — legacy single-DM mode. Every chat streams
-  //     (preserves pre-multichat behaviour where only the warchief's
+  //     (preserves pre-multichat behaviour where only the owner's
   //     DM existed).
   //   * `MultichatPolicy` loaded — chat must be present with
   //     `streaming: 'progress'`. Missing entries OR `streaming: 'off'`
@@ -230,7 +230,7 @@ export interface StatusManagerDeps {
   // The gate is consulted per call rather than memoised at construction
   // because StatusManager is a singleton across all chats — a
   // construction-time boolean (legacy `streamingEnabled` option) leaked
-  // warchief DM behaviour into public groups when the chosen anchor
+  // owner DM behaviour into public groups when the chosen anchor
   // chat had `streaming: 'progress'` (codex review 2026-05-27,
   // CRITICAL #1 / HIGH #9).
   policy?: MultichatPolicy | null
@@ -321,7 +321,7 @@ interface InternalEntry {
   // commit the id so it can act with its own semantics (delete vs «Остановлено»
   // edit), but do NOT neutralize it yourself". A supersede (startInternal)
   // detaches WITHOUT setting this, so createBubble's detached-entry guard knows
-  // to neutralize the orphaned send itself (frozen-working leak, Pavel 2026-06-08).
+  // to neutralize the orphaned send itself (frozen working bubble).
   teardownClaimed: boolean
   // Monotonic generation counter — incremented on every lifecycle
   // transition (start replaces an existing entry, complete, cancel).
@@ -817,7 +817,7 @@ export class StatusManager {
     // head, finds no entry yet (we have not entries.set), flips the chat
     // to "closed", and returns a no-op. Without this snapshot we would
     // then register a fully-tracked bubble that nothing ever closes — the
-    // stuck "working" block Pavel saw after /new. A false→true transition
+    // stuck "working" block after /new. A false→true transition
     // across the send means "the turn closed under us" → tear down.
     const closedBefore = this.isClosed(chatId)
 
@@ -832,14 +832,13 @@ export class StatusManager {
     // would re-acquire the lock and deadlock.
     const prev = this.entries.get(chatId)
     if (prev) {
-      // Mid-turn second message (Pavel writes msg2 while the agent is still
+      // Mid-turn second message (the owner sends a follow-up while the agent is still
       // working on msg1): start() fires again on the new inbound. Claude Code
       // QUEUES msg2 and folds it into the SAME turn at the next step, so there
       // is exactly one ongoing piece of work — and we must keep showing exactly
       // one bubble for it. The old supersede path deleted the live bubble and
       // recreated a fresh one, which reset the elapsed-seconds counter to 0 and
-      // made the "working" block flicker / vanish (Pavel, 2026-06-10 — "удаляет
-      // бабл / перестаёт думать / странно себя ведёт"). Instead KEEP the
+      // made the "working" block flicker or vanish. Keep the
       // existing live bubble running untouched — its timers, generation and
       // seconds carry on — and return its handle. The InboundWatcher fires the
       // «✋ Принял, добавлю к текущей задаче» ack separately, so the user sees
@@ -873,11 +872,8 @@ export class StatusManager {
         disable_notification: boolean
       } = {
         parse_mode: 'HTML',
-        // The bubble is an indicator, not a report: it is re-created once per
-        // turn, and Telegram pushes a notification for every send. Pavel got
-        // 17 of them in 7 minutes while a respawn loop ran (2026-10-29), and
-        // even one per turn is noise he never asked for. Edits never push, so
-        // silencing the initial send is the whole fix.
+        // Telegram pushes a notification for every send unless disabled.
+        // Keep the initial status bubble silent. Edits never push.
         disable_notification: true,
       }
       if (replyToMessageId !== undefined) sendOpts.reply_to_message_id = replyToMessageId
@@ -1010,7 +1006,7 @@ export class StatusManager {
     // Fire-and-forget initial chat action so the Telegram header shows
     // `typing…` immediately, not on the first pulse 4 s in. Keeps firing
     // even when the message bubble is suppressed — the native indicator
-    // is what the warchief still wants to see.
+    // is what the owner still wants to see.
     if (this.chatActionEnabled()) {
       void this.pulseChatAction(entry)
       entry.chatActionHandle = this.setTimer(
@@ -1162,7 +1158,7 @@ export class StatusManager {
       entry.handle.messageId = sent.message_id
       entry.lastText = text
       entry.bubbleSuppressed = false
-      // Detached-entry guard (frozen-working leak, Pavel 2026-06-08). The
+      // Detached-entry guard (frozen working bubble). The
       // await above yielded the event loop; a teardown may have detached this
       // entry from `entries`. If a supersede did it (NOT teardownClaimed), no
       // handler will ever close this bubble — tear it down here. complete/
@@ -1198,7 +1194,7 @@ export class StatusManager {
         })
         // MED-A #6 (Codex status #5): retry must preserve
         // `reply_to_message_id` so the recovered bubble stays in the
-        // same reply thread the warchief expects. Pre-fix retried
+        // same reply thread the owner expects. Pre-fix retried
         // with `{}`, dropping the entire sendOpts including the
         // reply target — the rolling status then appeared at the
         // bottom of the chat unconnected to the originating message.
@@ -1254,8 +1250,7 @@ export class StatusManager {
   // still in flight. createBubble runs outside the lifecycle lock, so its
   // `await sendMessage` opens a TOCTOU window: by the time the send resolves
   // the entry may no longer be the live one for its chat. Committing the id
-  // then would adopt a bubble nothing owns — the frozen "working" leak Pavel
-  // saw under final answers (2026-06-08). Mirrors complete()'s policy: delete
+  // then would adopt a bubble nothing owns — a frozen "working" bubble under the final answer. Mirrors complete()'s policy: delete
   // when possible, else terminal edit. Swallows benign / message-gone errors —
   // a failed neutralize must never back-pressure the hook path. Deliberately
   // does NOT touch orphanStore: the guarded caller returns BEFORE recording,
@@ -1359,7 +1354,7 @@ export class StatusManager {
    * Used by recordActivityByChatId (to keep THIS bubble alive) AND by the
    * webhook (to suppress the same session_stop reaching ProgressReporter /
    * TaskMirror, which otherwise finalize+evict and respawn a new message per
-   * mini-turn — the "new bubble every ~12s" spam Pavel reported 2026-06-29/30).
+   * mini-turn — repeated status bubbles).
    * Pure read; safe to call from any surface.
    */
   isContinuationStop(chatId: string, stopHookActive: boolean): boolean {
@@ -1474,7 +1469,7 @@ export class StatusManager {
       // background Task subagents: Claude Code injects each completion as a fresh
       // mini-turn that fires a Stop between injections while "esc to interrupt"
       // is still painted. Tearing down + respawning per injection spammed a new
-      // bubble every few seconds (Pavel, 2026-06-29/30). See isContinuationStop —
+      // bubble every few seconds. See isContinuationStop —
       // the SAME predicate gates the webhook's ProgressReporter/TaskMirror
       // dispatch so all three surfaces stay coalesced.
       if (this.isContinuationStop(chatId, event.stopHookActive === true)) {
@@ -1680,7 +1675,7 @@ export class StatusManager {
       if (thought !== null) entry.latestThought = thought
     }
 
-    // Async-gap guard (frozen-working leak, Pavel 2026-06-08). The
+    // Async-gap guard (frozen working bubble). The
     // streaming-thoughts transcript read above (and any future await on
     // this path) yields the event loop. If complete()/cancel() tore the
     // turn down meanwhile — removing this entry from `entries` and
@@ -1750,7 +1745,7 @@ export class StatusManager {
       // or a double-complete. Drop it here so the boot sweep can't later
       // "recover" a long-dead message id. Safe: a no-op complete() means
       // no active bubble exists for this chat to protect (frozen-working
-      // leak, Pavel 2026-06-08).
+      // bubble).
       this.orphanStore?.clear(chatId)
       return
     }
@@ -1797,7 +1792,7 @@ export class StatusManager {
     const messageId = entry.handle.messageId
     // Preferred path: delete the bubble outright. But a tracked bubble must
     // NEVER survive complete() still reading "working" — that is the
-    // recurring frozen-working leak (2026-06-07, Pavel): the entry is gone
+    // frozen working bubble: the entry is gone
     // from our map yet the Telegram message lingers in its last
     // "working/<tool>" render. The delete is skipped or can fail for several
     // reasons (delete_on_complete off, no deleteMessage surface, or a
@@ -1890,7 +1885,7 @@ export class StatusManager {
         const cls = classifyEditError(err)
         if (cls.kind === 'benign') return
         if (cls.kind === 'message_gone') {
-          // Cancel race: message already deleted (warchief tapped delete,
+          // Cancel race: message already deleted (owner tapped delete,
           // or it scrolled past Telegram's 48h edit window). Nothing to
           // do — the entry is already gone from our map.
           this.log.debug('status cancel target missing (ignored)', {
@@ -1917,7 +1912,7 @@ export class StatusManager {
     // that fire before the first non-typing transition.
     if (entry.disabled) return
     if (entry.bubbleSuppressed || entry.handle.messageId === 0) return
-    // Stale-entry guard (frozen-working leak, Pavel 2026-06-08). A caller may
+    // Stale-entry guard (frozen working bubble). A caller may
     // reach us across an await (streaming-thoughts transcript read, timer
     // tick) after complete()/cancel()/supersede already removed this entry
     // from `entries`. Editing now would revive a neutralized bubble back into
@@ -1986,9 +1981,8 @@ export class StatusManager {
           // deleteMessage coming back to us, not the user removing the
           // bubble. Recreating there leaves a bubble nobody will ever tear
           // down: the turn is already over, so no complete()/cancel() will
-          // follow. Live regression, example-agent 2026-11-02 19:54:58 MSK —
-          // deleteMessage ok, then 400 MESSAGE_ID_INVALID, then a fresh
-          // sendMessage that then ticked "working" forever.
+          // follow. A successful delete can precede a MESSAGE_ID_INVALID
+          // edit error. Avoid creating a replacement bubble in that case.
           // Detached covers EVERY way this entry can be dead: complete() and
           // cancel() both `entries.delete(chatId)` before the network delete,
           // and a supersede swaps the map value for a new entry. A dead

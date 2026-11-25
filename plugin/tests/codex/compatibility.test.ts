@@ -34,6 +34,17 @@ test('uses the operator-selected policy scope and declines invalid YAML safely',
   expect(assessPolicy('scopes: [', input).tier).toBe('deny')
 })
 
+test('protects the installer service from direct stop or restart commands', () => {
+  const policy = 'version: 1\ndefault_tier: allow'
+  const verdict = (command: string) => assessPolicy(policy, {
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command },
+  })
+  expect(verdict('systemctl --user restart krotov-telegram.service')).toMatchObject({
+    tier: 'deny', matchedRule: 'builtin:deny:own-channel',
+  })
+  expect(verdict('systemctl --user stop unrelated.service').tier).toBe('allow')
+})
+
 test('only eligible standalone questions can get a tool-free side reply', async () => {
   expect(sideQuestion('Отдельный вопрос: что такое JSON?')).toBe('что такое JSON?')
   expect(sideQuestion('Что такое JSON?')).toBe('Что такое JSON?')
@@ -47,7 +58,7 @@ test('a configured legacy command expands arguments as text and rejects paths', 
   try {
     mkdirSync(join(root, 'team'))
     writeFileSync(join(root, 'team', 'report.md'), '---\ndescription: Report\n---\nСделай отчёт для $ARGUMENTS.')
-    expect(legacyCommand(root, 'team:report', 'Рубик')).toBe('Сделай отчёт для Рубик.')
+    expect(legacyCommand(root, 'team:report', 'команды поддержки')).toBe('Сделай отчёт для команды поддержки.')
     expect(legacyCommand(root, '../report', '')).toBeUndefined()
   } finally { rmSync(root, { force: true, recursive: true }) }
 })

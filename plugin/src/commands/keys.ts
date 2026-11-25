@@ -1,6 +1,6 @@
 // /keys — deterministic keystrokes from Telegram into the agent's tmux pane.
 //
-// Problem (warchief, 2026-06-12): Claude Code's NATIVE interactive dialogs
+// Problem (owner, 2026-06-12): Claude Code's NATIVE interactive dialogs
 // (permission rules like `Bash(rm:*) requires confirmation`, model switch
 // prompts, trust dialogs) render in the terminal. The tmux mirror SHOWS them
 // in Telegram, but there was no way to ANSWER one remotely — the session sat
@@ -303,7 +303,7 @@ async function sendNamedKeyInner(
 // ─────────────────────────────────────────────────────────────────────
 // /clear, /compact & friends — RELIABLE control-command injection.
 //
-// Problem (warchief, 2026-07-01, verified empirically): the 3-shot
+// Problem (owner, 2026-07-01, verified empirically): the 3-shot
 // `sendSlashCommand` above (C-u / -l '/cmd' / Enter) is correct ONLY when the
 // pane is IDLE. It fails in two states:
 //   - BUSY: Claude Code QUEUES text typed while it is working; the command
@@ -405,8 +405,7 @@ function bottomChrome(text: string): string {
 // autocomplete popup is open. We OR both markers so idle is recognised in every
 // mode.
 //
-// …but the footer's CONTENT is also budget-dependent (2026-10-01, live capture
-// of `channel-ringmaster`): a session with background shells renders
+// The footer also changes when the session has background shells. It renders
 // `⏵⏵ accept edits on · 2 shells · ↓ to manage` and DROPS `(shift+tab to cycle)`
 // altogether — not a width clip (verified: widening to 200 columns did not bring
 // it back). Matching on individual hint segments therefore made idle detection
@@ -533,17 +532,15 @@ function composerRegion(text: string): string {
 //
 // Anchored to COLUMN 0, because a line anchor alone is not enough: prose can BE
 // the whole line (a quoted capture, a code block, a diff hunk). The column is
-// what actually separates them, and it is measured, not assumed — across 2109
-// lines of a live pane whose agent spent a day writing about `❯ /clear`
-// (/root/example-agent-workspace/my-pane-3000.txt) EVERY transcript occurrence is
+// what separates them. In pane captures containing `❯ /clear` in the
+// transcript, every transcript occurrence is
 // indented (`  ⎿ `, `● `, a diff's line number) and the only column-0 `❯` is the
 // composer. The TUI writes agent output through a gutter; what the TUI itself
 // emits — the prompt echo, a banner — starts flush left. Trailing whitespace is
 // tolerated (capture-pane may pad), leading whitespace is NOT.
 //
 // `wholeLine` markers must BE the line: a prompt echo is emitted alone on its
-// line — verified on two independent captures, the live channel-ringmaster pane
-// and capt3/snap-10, both `❯ /clear` and nothing else.
+// line. Both captures showed only `❯ /clear` on that line.
 //
 // KNOWN LIMIT, stated rather than papered over: text alone cannot distinguish a
 // genuine echo from a BYTE-IDENTICAL forgery — transcript content that is
@@ -613,7 +610,7 @@ function firedMarkers(name: string): readonly FiredMarker[] {
 // (the last 12 non-trailing-blank lines). An accepted command is echoed INTO
 // THE TRANSCRIPT, i.e. ABOVE the composer, and on a pane where the composer is
 // pinned to the bottom the echo falls outside that window entirely — live
-// channel-ringmaster capture, 80×24: echo on line 10, composer rule on line 21,
+// capture, 80×24: echo on line 10, composer rule on line 21,
 // so the window spans lines 13..24 and no text signal could see the echo. (The
 // polygon missed it because WITHOUT the plugin's three-line channels banner the
 // whole post-clear screen is 12 lines, so the window covered it by accident.)
@@ -765,8 +762,8 @@ function confirmedFired(name: string, snap: string, baseline: string): ConfirmSi
     // /clear success #3: the conversation was REPLACED. Collapse measures line
     // ARITHMETIC, and that arithmetic fails on a pane whose wipe makes the screen
     // LONGER: v2.1.215 reboots into a banner (logo, version, cwd, the channels
-    // warning) that can outnumber the conversation it replaced. example-agent, 2026-10-06
-    // 18:14: a clear that really ran (new session file, same second) polled
+    // warning) that can outnumber the conversation it replaced. In one test,
+    // a clear that really ran (new session file, same second) polled
     // `t=10` against a `t=6` baseline for the whole window and was reported
     // not-submitted to the owner. What a wipe guarantees is not fewer lines but
     // that NONE of the old ones are left, so measure exactly that.
@@ -794,7 +791,7 @@ function confirmedFired(name: string, snap: string, baseline: string): ConfirmSi
     // on screen and the footer is idle, so the clear ran"). It was introduced for
     // the already-clear session, where neither the marker count nor the
     // transcript can move; measuring that case frame-by-frame (polygon, 80×24,
-    // v2.1.215, captures in /root/example-agent-workspace/capt4) showed the inference
+    // v2.1.215) showed the inference
     // is unsound, not merely weak:
     //   +0.93s  the pane goes BUSY and the previous clear's echo is WIPED with
     //           the transcript it lived in — inside the confirm window there is
@@ -904,8 +901,8 @@ const DRAFT_TYPE_ATTEMPTS = 3
 // Each retype's settle window is this many times the previous one (6 → 12 → 24
 // polls ≈ 1.5s → 3s → 6s, ~11s of patience in total on the failure path).
 //
-// 2026-10-14: a FIXED 6-poll window per attempt refused the owner's /new to
-// example-agent with eighteen identical polls of a plain idle screen — a replica of
+// A fixed 6-poll window per attempt once refused /new after eighteen
+// identical polls of a plain idle screen. A replica of
 // draftPollShape over a fresh capture of that pane's EMPTY composer prints the
 // same `d=0 s=1 r=1 n=17`, so all 18 polls saw nothing typed. The pane was
 // healthy, mode-less, single-paned, and keys typed by hand landed at once, so
@@ -929,13 +926,8 @@ const DRAFT_POLL_WINDOW_GROWTH = 2
 // How long a pane must have been silent before its draft budget is widened, and
 // by how much.
 //
-// 2026-10-18: the owner's /new into channel-example-agent was refused with the FULL
-// growing window spent — `draftPolls: 42`, `durationMs: 12756`, `paneState:
-// idle`, every one of the 42 traces `idle d=0 s=0 r=1 n=22`. The pane had been
-// silent for SEVEN HOURS and the agent was paged out: `claude` held VmSwap
-// 122MB against VmRSS 325MB even while awake, on a host with 475MB free RAM and
-// 2570MB of swap in use. Keys landed (tmux exited 0 on all three retypes); the
-// TUI simply could not paint until its pages came back from disk.
+// A long-idle Claude Code process may be paged out. In that case tmux accepts
+// the keystrokes, but the TUI cannot paint until the process pages back in.
 //
 // So `d=0 s=0` has TWO root causes that look identical in the trace: dropped
 // keystrokes (cured by retyping, 2026-10-06) and a process paging back in

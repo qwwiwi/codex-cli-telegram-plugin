@@ -1,11 +1,10 @@
 [Unit]
-Description=Check the dedicated example-agent Codex App Server
-After=example-backend.service
+Description=Check the configured Codex App Server
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /run/example/codex-root-health.py
-RuntimeDirectory=krot-codex-health
+ExecStart=/usr/bin/python3 -Es /usr/libexec/krotov-plugin/codex-root-health.py
+RuntimeDirectory=krotov-plugin-health
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 UMask=0077

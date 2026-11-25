@@ -1,4 +1,4 @@
-// Orphaned-status-bubble recovery (root-cause fix, Pavel 2026-06-07).
+// Orphaned-status-bubble recovery.
 //
 // THE BUG: StatusManager's active bubble — the transient "Печатает…/🔧 tool"
 // Telegram message — and its 30-min auto-cancel TTL live ONLY in process

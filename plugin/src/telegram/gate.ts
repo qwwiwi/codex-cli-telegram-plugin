@@ -7,7 +7,7 @@
 // Scope B (multichat): when a MultichatPolicy is passed in, groups and
 // supergroups become allowed if (a) chatId is in policy.allowlist.chats
 // and (b) senderId is in policy.allowlist.users. The mention_allowlist
-// check (only the warchief may summon the bot via @mention) is delegated
+// check (only the owner may summon the bot via @mention) is delegated
 // to `addressing.ts` — see `isAddressedToBot(..., mentionAllowlist)` —
 // because it needs full grammy Context for mention parsing.
 //
@@ -65,7 +65,7 @@ export function gateTelegramMessage(
 
   // Group or supergroup.
   if (policy === undefined) {
-    // Open-group legacy mode (example-agent patch): serve allowlisted group
+    // Open-group legacy mode: serve allowlisted group
     // chats from the single master session. Any sender is permitted —
     // the addressing gate (@mention / reply-to-bot, enforced in the
     // handler) decides WHEN to respond. Outbound is bounded by the same

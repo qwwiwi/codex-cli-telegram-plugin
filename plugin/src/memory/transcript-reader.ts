@@ -7,7 +7,7 @@
 // at least one `{type: 'text', text: ...}` block — that's the text the
 // user would have seen at the end of the turn.
 //
-// dashi reply-tool capture (2026-06-05): on a dashi channel the agent
+// Telegram reply-tool capture: the agent
 // answers via the MCP `reply` tool, so the user-visible text lives in a
 // `{type:'tool_use', name:'…__reply', input:{text:…}}` block, NOT a text
 // block. Without handling this, every reply-tool turn produced no text
@@ -105,9 +105,9 @@ export async function readLastAssistantText(
           parts.push(block.text)
           continue
         }
-        // dashi reply-tool fallback: a `*__reply` tool call carries the
+        // Telegram reply-tool fallback: a `*__reply` tool call carries the
         // user-visible answer in `input.text`. Matched by name suffix so
-        // it's robust to the MCP server prefix (mcp__dashi-channel__reply).
+        // it's robust to the MCP server prefix (mcp__telegram__reply).
         if (
           block.type === 'tool_use' &&
           typeof block.name === 'string' &&

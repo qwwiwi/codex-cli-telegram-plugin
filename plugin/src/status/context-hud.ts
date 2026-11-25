@@ -21,7 +21,7 @@
 // that message instead of spamming a fresh one; if the user deleted it we
 // recreate it exactly once.
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
@@ -178,7 +178,7 @@ function modeLabel(permissionMode: string): string {
  * With a `work` view the card grows a mode line («режим: план» /
  * «выполнение», only when the permission mode is known) and a compact
  * «Задачи» section (renderStatusTasks) — the combined status pin the
- * warchief asked for on 2026-07-04: ONE pinned message = context + work.
+ * owner asked for on 2026-07-04: ONE pinned message = context + work.
  *
  * PURE — no I/O, no clock — so it is trivially unit-testable against fixed inputs.
  */
@@ -642,19 +642,6 @@ export class ContextHud {
     return join(this.stateDir, `context-hud-${safe}.json`)
   }
 
-  // Remove the persisted id after a successful delete — a file pointing at a
-  // deleted message is worse than no file (bump/updateNow would edit a ghost).
-  private clearPersisted(chatId: string): void {
-    try {
-      rmSync(this.persistPath(chatId), { force: true })
-    } catch (err) {
-      this.log.warn('context hud clearPersisted failed (ignored)', {
-        chat_id: chatId,
-        error: err instanceof Error ? err.message : String(err),
-      })
-    }
-  }
-
   private loadPersisted(chatId: string): number | undefined {
     try {
       const raw = readFileSync(this.persistPath(chatId), 'utf8')
@@ -824,7 +811,7 @@ export async function handleHudCallback(
   if (!result.ok) {
     // L10 (IT2-8): a SECOND answerCallbackQuery on the same query id is DROPPED by
     // Telegram, so the failure was invisible. Surface it VISIBLY with a fresh
-    // short message (empty keyboard) instead — the warchief must see that «Сжать»
+    // short message (empty keyboard) instead — the owner must see that «Сжать»
     // did not fire. Best-effort: a failed send must never throw out of the HUD.
     const notice = `🗜 <b>Сжать</b> — ${compactFailureToast(result.reason)}`
     try {

@@ -137,7 +137,7 @@ export interface TmuxMirrorControl {
   bump?(): Promise<void>
   // MED-A #2: recovery from a permanent Telegram error (403 / parse)
   // that flipped `disabled=true`. /mirror on calls reset() before
-  // start() so the warchief never has to restart the plugin.
+  // start() so the owner never has to restart the plugin.
   // Optional for source-compat with existing test stubs.
   reset?(): void
   status(): {
@@ -574,10 +574,8 @@ export async function handleOobCommand(
       //
       // 2026-09-30 regression fixed here: this branch used to only reply
       // «новая сессия» and emit `notifyChannel: '/new'`, i.e. it FORWARDED the
-      // literal text into the live session. Nothing ever cleared, the reply
-      // lied, and the command GREW the context it claimed to wipe. Ringmaster
-      // swallowed 19 owner `/new` that way → a single 8-day session, 390 MB,
-      // 89 auto-compacts, ending in a cgroup-throttle wedge. Never emit a
+      // literal text into the live session. Repeating the command grew the
+      // context it claimed to wipe. Never emit a
       // channel notification here: after a successful clear there is no
       // context to notify, and on failure the text would be plain noise.
       //
@@ -761,7 +759,7 @@ export async function handleOobCommand(
       }
       // Bare `/cc` panel REMOVED (owner request 2026-07-15). The one-tap keypad
       // exposed a 🧹 clear button that ran `/clear` on a single stray tap and
-      // silently wiped a session's context (example-agent, 2026-07-15). Bare `/cc` now
+      // silently wiped a session's context. Bare `/cc` now
       // renders NO inline keyboard — only the text passthrough `/cc <command>`
       // survives (an explicit, non-accidental action). The `ccmd:` callbacks are
       // disabled in server.ts so any panel still pinned in chat history is inert.

@@ -8,7 +8,7 @@ import { CodexInbox } from '../../src/codex/inbox.js'
 import { automaticContinuation } from '../../src/codex/continuation.js'
 
 const owner = { id: 100, is_bot: false as const, first_name: 'Owner' }
-const bot = { id: 1, is_bot: true as const, first_name: 'example-agent' }
+const bot = { id: 1, is_bot: true as const, first_name: 'Example Bot' }
 const chat = { id: owner.id, type: 'private' as const, first_name: owner.first_name }
 function message(id: number, extra: Partial<Message> = {}): Message {
   return { message_id: id, date: 1, chat, from: owner, ...extra } as Message
@@ -128,7 +128,9 @@ test('scopes pin, reaction and edit to the private quoted message and protects s
     async editMessageText(...args: unknown[]) { calls.push(['edit', ...args]) },
   }
   const reply = message(7, { from: bot, text: 'reply' })
-  expect(requestedChatAction('example-agent, закрепи этот ответ')).toBe('pin')
+  expect(requestedChatAction('Полярная звезда, пожалуйста, закрепи этот ответ', 'Полярная звезда')).toBe('pin')
+  expect(requestedChatAction('Полярная звезда, закрепи этот ответ', 'Другой агент')).toBeUndefined()
+  expect(requestedChatAction('закрепи этот ответ')).toBe('pin')
   await executeChatAction(api, '100', 1, 'pin', reply, '')
   await executeChatAction(api, '100', 1, 'edit', reply, 'corrected')
   await executeChatAction(api, '100', 1, 'edit', message(8, { text: 'user message' }), 'blocked')

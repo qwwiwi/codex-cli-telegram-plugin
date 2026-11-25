@@ -56,7 +56,7 @@ interface OpenQuestionPattern {
 const OQ_PATTERNS: ReadonlyArray<OpenQuestionPattern> = [
   // «скажи/скажешь «го»|«go»|«да»», «напиши «да»» — the call-to-action shape
   // this agent's own reply style ends on. The boundary right after the verb
-  // keeps «Скажительно» out, and requiring the go-token keeps «Напиши Рубику»
+  // keeps «Скажительно» out, and requiring the go-token keeps «Напиши коллеге»
   // out.
   {
     code: 'OQ_SAY_GO',

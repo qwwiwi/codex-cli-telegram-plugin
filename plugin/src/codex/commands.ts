@@ -34,20 +34,23 @@ export function codexAgentName(override: string | undefined, previousLabel: stri
   return 'Codex'
 }
 
-export function isStatusQuestion(text: string, agentName = 'Codex'): boolean {
-  const normal = (value: string) => value.trim().toLowerCase().replace(/ё/g, 'е')
-  let phrase = normal(text)
-  const name = normal(agentName)
-  const names = /^(?:example-agent|аг[ао]ним)$/u.test(name) ? ['example-agent', 'example-agent', 'Example Maintainer'] : [name]
-  for (const label of names) {
-    if (!label || !phrase.startsWith(label)) continue
-    const suffix = phrase.slice(label.length)
-    if (/^[,!:\s]/u.test(suffix)) {
-      phrase = suffix.replace(/^[,!:\s]+/u, '')
-      break
-    }
+function normalizeAddress(value: string): string {
+  return value.toLowerCase().replace(/ё/g, 'е')
+}
+
+export function stripAgentAddress(text: string, agentName: string): string {
+  const phrase = text.trim()
+  const name = agentName.trim()
+  const suffix = phrase.slice(name.length)
+  if (name && /^[,!:\s]/u.test(suffix) &&
+      normalizeAddress(phrase.slice(0, name.length)) === normalizeAddress(name)) {
+    return suffix.replace(/^[,!:\s]+/u, '')
   }
-  phrase = phrase.replace(/[?!.…]+$/u, '').trim()
+  return phrase
+}
+
+export function isStatusQuestion(text: string, agentName = 'Codex'): boolean {
+  const phrase = normalizeAddress(stripAgentAddress(text, agentName)).replace(/[?!.…]+$/u, '').trim()
   return /^(?:статус|как там|как продвигается|как идет работа|(?:ты )?(?:еще )?работаешь|на каком (?:ты )?этапе|что сейчас делаешь)$/u.test(phrase)
 }
 

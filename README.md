@@ -27,5 +27,6 @@
 
 [Память предпочтений, уроков и навыков](plugin/docs/learning.md) можно включить отдельно после первого запуска.
 
-Код развивается на основе [Krot-tg-plugin](https://github.com/example-owner/claude-reference)
-и [Dashi Channel](https://github.com/qwwiwi/dashi-plugin-claude-code). Лицензия [Apache 2.0](LICENSE).
+Отдельный Codex App Server можно подключить к мосту через локальное реле. Его адрес, каталоги и служба задаются на сервере администратора. [Настройка локального реле](plugin/docs/root-backend.md)
+
+Код начинался с Krot-tg-plugin и [Dashi Channel](https://github.com/qwwiwi/dashi-plugin-claude-code). Лицензия [Apache 2.0](LICENSE).

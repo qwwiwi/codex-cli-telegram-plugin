@@ -19,13 +19,10 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   `on-request` with its workspace sandbox. The owner sees the exact command or
   file diff. Set `permission_gate.timeout_ms` in the Telegram config to change
   the two-minute timeout.
-- To connect to a separately managed local Codex service, configure
-  `KROT_CODEX_PROXY` as the absolute path to a root-owned, no-argument
-  executable that relays stdin/stdout to the private Codex Unix socket. The
-  supplied `scripts/codex-root-relay.py` requires Python 3 and `websockets`
-  and limits the forwarded methods. Grant sudo only for that exact executable
-  without arguments. Keep the server socket private
-  and start the Telegram process as a dedicated non-root user.
+- For an existing host-managed Codex App Server, follow the [local relay setup](root-backend.md).
+  The relay uses a root-owned configuration file and the Telegram process runs as its own non-root user.
+- Set `KROT_CODEX_AGENT_ID` to match the destination identifier used by an external service.
+  The default is `krotov`. The webhook also accepts a request for the local bridge with `agentId` omitted.
 - Set `GROQ_API_KEY` to enable voice transcription. Photos are sent to Codex as image input. Documents up to 20 MB are stored in the private Telegram inbox. Codex receives the local path and up to 64 KiB of content for UTF-8 text documents.
 - Telegram albums are collected into one turn using `album.flush_ms`.
   While an owner turn is active, an assembled album can be delivered to that
@@ -61,11 +58,10 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   `ProtectSystem=strict`, allow writes to the hot-memory directory explicitly.
 - Set `outbox.enabled` to retry undelivered text after a Telegram flood ban.
   The bridge logs ambiguous delivery failures and avoids replaying them.
-- Install the example `krot-codex-health` systemd service and timer for the
-  supervised Linux backend. It restarts only the dedicated Codex App Server
-  after two failed local probes. The bridge separately attempts to interrupt a
-  silent turn after `status.ttl_ms`, while allowing managed worker processes
-  and pending approvals to continue.
+- The [local backend monitor](root-backend.md#проверка-и-мониторинг) probes the configured socket.
+  If the administrator enables restart and installs the timer, the monitor restarts the configured
+  service after two failed local probes. The bridge separately attempts to interrupt a silent turn
+  after `status.ttl_ms`, while allowing managed worker processes and pending approvals to continue.
 - A 👀 reaction acknowledges messages from the owner. The `status` block
   controls the `working -- Ns` bubble, its update cadence
   (`status.interval_ms`), and cleanup (`status.delete_on_complete`).
@@ -163,7 +159,7 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 
 Set both `TELEGRAM_WEBHOOK_PORT` and `TELEGRAM_WEBHOOK_TOKEN` to enable the
 loopback listener on `127.0.0.1`. POST the legacy envelope
-`{"message":"task text","chatId":123,"agentId":"dashi-channel"}` to
+`{"message":"task text","chatId":123,"agentId":"krotov"}` to
 `/hooks/agent` with the configured bearer token. The chat must be the configured
 owner chat. A 200 response means the request was persisted, and its result is
 delivered in Telegram. An optional `Idempotency-Key` prevents duplicate

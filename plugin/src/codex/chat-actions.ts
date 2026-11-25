@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import type { Message } from 'grammy/types'
 import { atomicWriteInRoot } from '../autonomy/store.js'
 import type { DownloadResult, TelegramApi } from '../channel/tools.js'
+import { stripAgentAddress } from './commands.js'
 import { normalizeChatReply } from './continuation.js'
 import { object } from './rpc.js'
 
@@ -13,8 +14,8 @@ export function isChatAction(value: string): value is ChatAction {
   return names.some(action => action === value)
 }
 
-export function requestedChatAction(text: string): ChatAction | undefined {
-  const phrase = text.trim().replace(/^(?:аг[ао]ним[\s,!:]+)?(?:пожалуйста[\s,!:]+)?/iu, '')
+export function requestedChatAction(text: string, agentName = 'Codex'): ChatAction | undefined {
+  const phrase = stripAgentAddress(text, agentName).replace(/^пожалуйста[\s,!:]+/iu, '')
   if (/^открепи(?:\s|$)/iu.test(phrase)) return 'unpin'
   if (/^закрепи(?:\s|$)/iu.test(phrase)) return 'pin'
   if (/^(?:поставь|добавь) реакцию(?:\s|$)/iu.test(phrase)) return 'react'

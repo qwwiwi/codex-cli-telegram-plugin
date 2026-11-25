@@ -4,39 +4,34 @@
 
 Подойдёт Ubuntu или Debian с systemd. Нужен обычный пользователь VPS с доступом к `sudo`, аккаунт ChatGPT с доступом к Codex, Telegram и право чтения репозитория. Все шаги установки выполняйте в Bash от одного и того же обычного пользователя.
 
-Если на новом VPS есть только `root`, выполните команды ниже от `root`. При создании пользователя задайте пароль для `sudo`. Настройте для `krotov` вход по SSH через панель хостинга или существующие настройки SSH и переподключитесь под ним. Если обычный пользователь уже есть, переходите к шагу 1.
-
-```bash
-apt update
-apt install -y sudo
-adduser krotov
-usermod -aG sudo krotov
-```
+Если на сервере доступен только `root`, создайте обычного пользователя средствами вашей системы и войдите под ним перед установкой. Имя пользователя выбираете вы.
 
 ## 1. Установите инструменты и скачайте репозиторий
 
 ```bash
 sudo apt update
 sudo apt install -y ca-certificates curl gh git jq nano unzip
-curl -fsSL https://bun.com/install | bash
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+```
+
+Установите Bun и Codex CLI по их официальным инструкциям. Если обе команды уже доступны в терминале, проверьте версии. [Bun](https://bun.com/docs/installation) · [Codex CLI](https://learn.chatgpt.com/docs/codex/cli)
+
+```bash
 bun --version
 codex --version
 ```
 
-Для текущего приватного репозитория войдите в GitHub под аккаунтом, которому дали доступ. Откройте показанную GitHub CLI ссылку в браузере на своём компьютере и введите одноразовый код.
+Для приватного репозитория войдите в GitHub под аккаунтом, которому дали доступ. Откройте показанную GitHub CLI ссылку в браузере на своём компьютере и введите одноразовый код. Для публичного репозитория можно начать с `read`.
 
 ```bash
 gh auth login --hostname github.com --git-protocol https --web
 gh auth setup-git --hostname github.com
-cd "$HOME"
-git clone https://github.com/example-owner/Krotov-plugin.git
+read -r -p 'Ссылка на ваш репозиторий Krotov-plugin: ' krotov_repo_url
+git clone -- "$krotov_repo_url" "$HOME/Krotov-plugin"
 cd "$HOME/Krotov-plugin/plugin"
 bun install --frozen-lockfile
 ```
 
-[Установка Bun](https://bun.com/docs/installation) · [Установка Codex CLI](https://learn.chatgpt.com/docs/codex/cli) · [Вход в GitHub CLI](https://cli.github.com/manual/gh_auth_login)
+[Вход в GitHub CLI](https://cli.github.com/manual/gh_auth_login)
 
 ## 2. Войдите в Codex через ChatGPT
 
@@ -103,15 +98,15 @@ chmod 600 .env
 nano .env
 ```
 
-Пример для пользователя `alex`. Замените значение токена, все ID и начало обоих путей своими данными. Для путей используйте полный путь из `printf`, например `/home/alex`. Папка состояния хранит данные моста и должна быть за пределами рабочей папки, где Codex работает с файлами.
+Подставьте токен, числовые ID и абсолютные пути к двум созданным каталогам. Папка состояния хранит данные моста и должна быть за пределами рабочей папки Codex.
 
 ```dotenv
-TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
-TELEGRAM_EXPECTED_BOT_ID=1234567890
-TELEGRAM_ALLOWED_USER_IDS=987654321
-TELEGRAM_ALLOWED_CHAT_IDS=987654321
-TELEGRAM_STATE_DIR=/home/alex/.local/state/krotov-plugin
-TELEGRAM_WORKSPACE_ROOT=/home/alex/krotov-workspace
+TELEGRAM_BOT_TOKEN=ВАШ_ТОКЕН_ИЗ_BOTFATHER
+TELEGRAM_EXPECTED_BOT_ID=ВАШ_BOT_ID
+TELEGRAM_ALLOWED_USER_IDS=ВАШ_OWNER_USER_ID
+TELEGRAM_ALLOWED_CHAT_IDS=ВАШ_PRIVATE_CHAT_ID
+TELEGRAM_STATE_DIR=/ABSOLUTE_STATE_DIR
+TELEGRAM_WORKSPACE_ROOT=/ABSOLUTE_WORKSPACE_DIR
 KROT_CODEX_APPROVALS=1
 # KROT_CODEX_AGENT_NAME="Имя вашего агента"
 ```
@@ -120,7 +115,7 @@ KROT_CODEX_APPROVALS=1
 
 ### Режим карточек для рискованных команд
 
-Для новой установки выберите `./install.sh --approval-mode risky --start`. Для уже запущенного бота выполните `./install.sh --approval-mode risky`, затем `systemctl --user restart krotov-telegram.service`, когда бот свободен.
+Для новой установки выберите `./install.sh --approval-mode risky --start`. Для уже запущенного бота выполните `./install.sh --approval-mode risky`, затем перезапустите службу моста, когда бот свободен.
 При ручной настройке добавьте `KROT_CODEX_APPROVAL_MODE=risky` рядом с `KROT_CODEX_APPROVALS=1` в `plugin/.env` и перезапустите мост. Чтобы вернуться к обычным карточкам Codex, выберите `--approval-mode standard` или укажите `KROT_CODEX_APPROVAL_MODE=standard`.
 
 Режим автоматически принимает однократные запросы Codex на известные диагностические команды, например `df -h`, `free -m`, чтение статуса службы и ограниченный вывод журнала конкретной пользовательской службы. В составной строке каждая команда должна подходить под правила диагностики. При запросе Codex на потенциально опасную или неясную команду карточка остаётся. Сеть, ввод в терминал и изменения файлов проходят обычную обработку подтверждений.
@@ -151,31 +146,25 @@ bun run start
 
 ## 6. Включите автозапуск на VPS
 
-Шаблон пользовательской службы рассчитан на пути из этой инструкции. Если поменяли расположение репозитория или Bun, исправьте `WorkingDirectory`, `ExecStart` и при необходимости `PATH` в скопированном файле. Служба использует того же пользователя и тот же `.env`, что и ручной запуск.
+Остановите ручной запуск. Затем выполните команды из корня своего клона. Установщик использует ваше окружение и уже заполненный `plugin/.env`.
 
 ```bash
-install -d "$HOME/.config/systemd/user"
-install -m 644 "$HOME/Krotov-plugin/examples/krotov-telegram.service" \
-  "$HOME/.config/systemd/user/krotov-telegram.service"
-sudo loginctl enable-linger "$(id -un)"
-systemctl --user daemon-reload
-systemctl --user enable --now krotov-telegram.service
-systemctl --user status krotov-telegram.service --no-pager
+cd "$HOME/Krotov-plugin"
+./install.sh --start
 loginctl show-user "$(id -un)" -p Linger
 ```
 
-В статусе ожидайте `active (running)`, а в последней строке — `Linger=yes`. Это позволяет службе запускаться при загрузке VPS и работать после выхода из SSH. Отправьте ещё одно сообщение боту. Чтобы проверить автозапуск, закройте SSH и отправьте сообщение снова, затем повторите проверку после плановой перезагрузки VPS.
+Если установщик попросит разрешить работу службы после выхода из терминала, выполните `sudo loginctl enable-linger "$(id -un)"` и повторите установку с `--start`. В последней строке ожидайте `Linger=yes`. Проверьте ответ бота после выхода из терминала.
+
+Для обслуживания введите имя службы, указанное установщиком.
 
 ```bash
-# Последние сообщения в журнале
-journalctl --user -u krotov-telegram.service -n 50 --no-pager
-# Перезапуск после изменения .env
-systemctl --user restart krotov-telegram.service
-# Остановка и отключение автозапуска
-systemctl --user disable --now krotov-telegram.service
+read -r -p 'Имя службы: ' krotov_unit
+systemctl --user status "$krotov_unit" --no-pager
+journalctl --user -u "$krotov_unit" -n 50 --no-pager
 ```
 
-Если `systemctl --user` не видит шину пользователя, откройте новое SSH-подключение напрямую под пользователем моста. В стандартной Ubuntu или Debian пользовательский systemd запускает `systemd-logind`.
+Для перезапуска после изменения `.env` выполните `systemctl --user restart "$krotov_unit"`. Если `systemctl --user` не видит шину пользователя, подключитесь к серверу напрямую под пользователем моста.
 
 ### Перезапуск моста из Telegram
 

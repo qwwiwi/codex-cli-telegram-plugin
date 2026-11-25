@@ -25,10 +25,9 @@ test('only standalone status questions can bypass the active turn', () => {
   for (const text of ['Как там сайт?', 'Как там? Добавь проверку.', 'Проверь, работает ли бот', 'Статус репозитория']) {
     expect(isStatusQuestion(text)).toBe(false)
   }
-  expect(isStatusQuestion('example-agent, как там?', 'example-agent')).toBe(true)
-  expect(isStatusQuestion('Полярная звезда, как там?', 'Полярная звезда')).toBe(true)
-  expect(isStatusQuestion('example-agent, как там?', 'Полярная звезда')).toBe(false)
-  expect(codexAgentName('  Полярная звезда  ', 'example-agent')).toBe('Полярная звезда')
-  expect(codexAgentName('bad\nname', 'example-agent')).toBe('example-agent')
+  expect(isStatusQuestion('ПОЛЯРНАЯ ЗВЕЗДА, как там?', 'Полярная звезда')).toBe(true)
+  expect(isStatusQuestion('Север, как там?', 'Полярная звезда')).toBe(false)
+  expect(codexAgentName('  Полярная звезда  ', 'Север')).toBe('Полярная звезда')
+  expect(codexAgentName('bad\nname', 'Север')).toBe('Север')
   expect(codexAgentName(undefined, undefined)).toBe('Codex')
 })
