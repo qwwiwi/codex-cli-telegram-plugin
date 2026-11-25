@@ -436,6 +436,7 @@ async function main(): Promise<void> {
           }
         }).finally(() => {
           deliveringGoal = false
+          if (hudReady && !stopping) void hud.bump(ownerChat)
           reconcileNotifiedGoal(thread)
           startNext()
         })
@@ -1097,7 +1098,7 @@ async function main(): Promise<void> {
         task = undefined
         work.finish()
         finishMirror('Сжатие завершено')
-        if (!stopping) void hud.updateNow(ownerChat)
+        if (!stopping) void hud.bump(ownerChat)
         startNext()
       })
     }
@@ -1377,6 +1378,8 @@ async function main(): Promise<void> {
         if (outcome === 'full') {
           await send('Очередь заполнена. Отправь это сообщение позже.')
         } else if (outcome === 'accepted') {
+          // Keep the HUD card under the owner's latest message (debounced in the HUD).
+          if (hudReady) void hud.bump(ownerChat)
           if (message.media_group_id) bufferAlbum(message.media_group_id, message)
           else resumeInbox(message)
         }
@@ -1780,7 +1783,8 @@ async function main(): Promise<void> {
           cancelMedia = undefined
           work.finish()
           finishMirror(progressResult)
-          if (!stopping) void hud.updateNow(chatId)
+          // Turn done: move the HUD card below the reply.
+          if (!stopping) void hud.bump(chatId)
         }
       })().catch(() => log.warn('Could not deliver the turn status')).finally(() => {
         task = undefined

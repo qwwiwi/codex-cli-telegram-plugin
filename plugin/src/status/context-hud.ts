@@ -21,7 +21,7 @@
 // that message instead of spamming a fresh one; if the user deleted it we
 // recreate it exactly once.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
@@ -48,7 +48,7 @@ const BAR_FILLED = '▰'
 const BAR_EMPTY = '▱'
 
 // bump() debounce window — collapses inbound-message bursts (multi-part voice,
-// albums) into a single in-place refresh. Mirrors TmuxMirror.BUMP_DEBOUNCE_MS.
+// albums) into a single delete+resend. Mirrors TmuxMirror.BUMP_DEBOUNCE_MS.
 const HUD_BUMP_DEBOUNCE_MS = 1500
 
 // Escape the model string for HTML parse mode. Model ids ("claude-opus-4-8")
@@ -241,10 +241,8 @@ export interface HudTelegramApi {
   sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
   pinChatMessage(chatId: string, messageId: number, opts: { disable_notification?: boolean }): Promise<void>
-  // Retained on the api surface (adapted from grammY at the composition root
-  // like pin) though bump no longer re-anchors: since the 2026-07-06 fork
-  // deviation bump edits the pinned card in place instead of delete+resend, so
-  // these are currently unused by the HUD but kept for parity/future use.
+  // bump() re-anchoring: delete the old card (deleting a pinned message also
+  // removes its pin), unpin as the fallback when delete is refused.
   deleteMessage(chatId: string, messageId: number): Promise<void>
   unpinChatMessage(chatId: string, messageId: number): Promise<void>
 }
@@ -436,24 +434,73 @@ export class ContextHud {
     return this.updateNow(chatId)
   }
 
-  // Refresh the pinned card on every inbound owner message (the handlers fire
-  // this BEFORE TmuxMirror.bump). FORK DEVIATION from upstream's re-anchor
-  // design, per owner request (edit-in-place, no pin spam) 2026-07-06: upstream
-  // deleted the old card + sent+pinned a fresh one on every message, which
-  // spawns a NEW pinned message after every message the owner sends. Here bump
-  // instead EDITS the existing pinned message in place (updateNow's edit-first
-  // path) so the pin stays put and only its content/percentage refreshes; a
-  // fresh message is created ONLY when the edit target is gone (updateNow →
-  // ensureMessage → sendFresh). Debounced per chat to collapse inbound bursts
-  // (HUD_BUMP_DEBOUNCE_MS); updateNow re-checks the owner/enabled gate and
-  // serializes per chat — both idempotent, so delegating is safe.
+  // Re-anchor the pinned card at the BOTTOM of the chat (the server fires this
+  // after an owner message is accepted and when a turn completes). Deletes the
+  // old message — which also removes its pin, so the one-pin invariant holds —
+  // and sends+pins a fresh one. When Telegram refuses the delete (bots cannot
+  // delete own messages older than 48h) we fall back to unpinChatMessage so two
+  // pins can never coexist. Debounced per chat: a bump inside the window
+  // (HUD_BUMP_DEBOUNCE_MS) does not move the card again, it only refreshes it
+  // in place via updateNow. Serialized and best-effort like every other HUD op.
   bump(chatId: string): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     const now = Date.now()
     const last = this.lastBumpAt.get(chatId)
-    if (last !== undefined && now - last < HUD_BUMP_DEBOUNCE_MS) return Promise.resolve()
+    if (last !== undefined && now - last < HUD_BUMP_DEBOUNCE_MS) return this.updateNow(chatId)
     this.lastBumpAt.set(chatId, now)
-    return this.updateNow(chatId)
+    return this.runSerialized(chatId, async () => {
+      try {
+        const { text, keyboard } = await this.renderCurrent(chatId)
+        const old = this.messageIds.get(chatId) ?? this.loadPersisted(chatId)
+        if (old !== undefined) {
+          this.messageIds.delete(chatId)
+          // `retired` = the old card can no longer hold a pin (deleted, or
+          // unpinned in place). Only a retired old card may be replaced —
+          // otherwise sending a fresh pinned card could yield TWO pins.
+          let retired = false
+          try {
+            await this.api.deleteMessage(chatId, old)
+            retired = true
+            // The persisted id now points at a deleted message. Drop it so a
+            // crash before sendFresh can't resurrect the stale id later.
+            this.clearPersisted(chatId)
+          } catch (err) {
+            this.log.warn('context hud bump delete failed (will unpin instead)', {
+              chat_id: chatId,
+              message_id: old,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+          if (!retired) {
+            try {
+              await this.api.unpinChatMessage(chatId, old)
+              retired = true
+            } catch (err) {
+              this.log.warn('context hud bump unpin failed (ignored)', {
+                chat_id: chatId,
+                message_id: old,
+                error: err instanceof Error ? err.message : String(err),
+              })
+            }
+          }
+          if (!retired) {
+            // Both legs failed — the old card may still be pinned. Keep it and
+            // refresh it in place instead of risking a second pin; edit()
+            // recreates the card once if it turns out to be gone already.
+            this.messageIds.set(chatId, old)
+            await this.edit(chatId, old, text, keyboard)
+            return
+          }
+        }
+        // sendFresh persists the new id (overwriting the stale one) and pins.
+        await this.sendFresh(chatId, text, keyboard)
+      } catch (err) {
+        this.log.warn('context hud bump failed (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    })
   }
 
   // Read the latest usage and reconcile the HUD message. Best-effort: never
@@ -659,6 +706,18 @@ export class ContextHud {
       // Missing file / malformed JSON → treat as "no persisted id".
     }
     return undefined
+  }
+
+  // Remove the persisted id (best-effort; a missing file is already "cleared").
+  private clearPersisted(chatId: string): void {
+    try {
+      rmSync(this.persistPath(chatId), { force: true })
+    } catch (err) {
+      this.log.warn('context hud persist clear failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
   }
 
   private persist(chatId: string, messageId: number): void {

@@ -1,0 +1,145 @@
+import { afterEach, expect, setSystemTime, test } from 'bun:test'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { ContextHud, type HudTelegramApi } from '../../src/status/context-hud.js'
+import { createLogger } from '../../src/log.js'
+
+const OWNER = '123'
+
+afterEach(() => { setSystemTime() })
+
+// A fake Telegram chat: messages in send order, so "the HUD is at the bottom"
+// means "the HUD id is the last key".
+function fixture(failures: { delete?: boolean; unpin?: boolean; send?: boolean } = {}) {
+  const gone = (desc: string): Error => Object.assign(new Error(desc), { error_code: 400, description: desc })
+  const messages = new Map<number, string>()
+  const calls: string[] = []
+  let next = 100
+  let renders = 0
+  const api: HudTelegramApi = {
+    async sendMessage(_chat, text) {
+      calls.push('send')
+      if (failures.send) throw new Error('send failed')
+      messages.set(++next, text)
+      return { message_id: next }
+    },
+    async editMessageText(_chat, id, text) {
+      calls.push('edit:' + id)
+      if (!messages.has(id)) throw gone('Bad Request: message to edit not found')
+      messages.set(id, text)
+    },
+    async pinChatMessage(_chat, id) { calls.push('pin:' + id) },
+    async unpinChatMessage(_chat, id) {
+      calls.push('unpin:' + id)
+      if (failures.unpin) throw new Error('unpin failed')
+    },
+    async deleteMessage(_chat, id) {
+      calls.push('delete:' + id)
+      if (failures.delete) throw new Error('message can\'t be deleted')
+      messages.delete(id)
+    },
+  }
+  const stateDir = mkdtempSync(join(tmpdir(), 'hud-bump-'))
+  const hud = new ContextHud({
+    api, log: createLogger('hud-bump-test'), sessionInfo: { get: () => ({}) }, windowTokens: 0,
+    ownerChatIds: [OWNER], stateDir, enabled: true,
+    render: () => ({ text: 'HUD ' + ++renders, keyboard: { inline_keyboard: [] } }),
+  })
+  const owner = (text: string): void => { messages.set(++next, text) }
+  const persisted = (): number =>
+    (JSON.parse(readFileSync(join(stateDir, `context-hud-${OWNER}.json`), 'utf8')) as { message_id: number }).message_id
+  return { hud, api, messages, calls, owner, persisted }
+}
+
+test('bump moves the HUD card to the bottom of the chat and persists the new id', async () => {
+  const { hud, messages, calls, owner, persisted } = fixture()
+  setSystemTime(new Date(1_000_000))
+  await hud.updateNow(OWNER)
+  const first = persisted()
+  owner('owner message')
+  owner('agent reply')
+  calls.length = 0
+
+  await hud.bump(OWNER)
+
+  const ids = [...messages.keys()]
+  const bottom = ids.at(-1)!
+  expect(messages.has(first)).toBe(false)
+  expect(bottom).not.toBe(first)
+  expect(messages.get(bottom)).toStartWith('HUD ')
+  expect(calls).toEqual(['delete:' + first, 'send', 'pin:' + bottom])
+  expect(persisted()).toBe(bottom)
+})
+
+test('a burst of bumps causes one delete+resend; later bumps in the window only refresh in place', async () => {
+  const { hud, messages, calls, owner, persisted } = fixture()
+  setSystemTime(new Date(1_000_000))
+  await hud.updateNow(OWNER)
+  owner('part 1')
+  calls.length = 0
+
+  await hud.bump(OWNER)
+  const moved = persisted()
+  owner('part 2')
+  setSystemTime(new Date(1_000_500))
+  await hud.bump(OWNER)
+  await hud.bump(OWNER)
+
+  expect(calls.filter(c => c === 'send')).toHaveLength(1)
+  expect(calls.filter(c => c.startsWith('delete:'))).toHaveLength(1)
+  expect(persisted()).toBe(moved)
+  // The in-window bump still refreshes the card's content.
+  expect(calls).toContain('edit:' + moved)
+
+  // After the debounce window the next bump moves it again.
+  setSystemTime(new Date(1_002_000))
+  await hud.bump(OWNER)
+  expect([...messages.keys()].at(-1)).toBe(persisted())
+  expect(persisted()).not.toBe(moved)
+})
+
+test('a refused delete falls back to unpin and still sends a fresh card at the bottom', async () => {
+  const { hud, messages, calls, owner, persisted } = fixture({ delete: true })
+  setSystemTime(new Date(1_000_000))
+  await hud.updateNow(OWNER)
+  const first = persisted()
+  owner('owner message')
+  calls.length = 0
+
+  await hud.bump(OWNER)
+
+  const bottom = [...messages.keys()].at(-1)!
+  expect(bottom).not.toBe(first)
+  expect(calls).toEqual(['delete:' + first, 'unpin:' + first, 'send', 'pin:' + bottom])
+  expect(persisted()).toBe(bottom)
+})
+
+test('bump never rejects when Telegram fails, and sends a card when none exists', async () => {
+  const broken = fixture({ delete: true, unpin: true, send: true })
+  setSystemTime(new Date(1_000_000))
+  await expect(broken.hud.bump(OWNER)).resolves.toBeUndefined()
+
+  const fresh = fixture()
+  await fresh.hud.bump(OWNER)
+  expect(fresh.calls).toEqual(['send', 'pin:101'])
+  expect(fresh.persisted()).toBe(101)
+})
+
+test('a card the owner already deleted is replaced by a fresh one at the bottom', async () => {
+  const { hud, messages, calls, owner, persisted } = fixture({ delete: true, unpin: true })
+  setSystemTime(new Date(1_000_000))
+  await hud.updateNow(OWNER)
+  const first = persisted()
+  messages.delete(first)
+  owner('owner message')
+  calls.length = 0
+
+  await hud.bump(OWNER)
+
+  const bottom = [...messages.keys()].at(-1)!
+  expect(bottom).not.toBe(first)
+  expect(messages.get(bottom)).toStartWith('HUD ')
+  expect(persisted()).toBe(bottom)
+})
