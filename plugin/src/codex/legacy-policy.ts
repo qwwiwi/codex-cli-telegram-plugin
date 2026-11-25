@@ -1,8 +1,9 @@
 import { load } from 'js-yaml'
 import { classifyToolCall, PermissionPolicySchema, type PermissionPolicy, type PermissionVerdict } from '../security/permission-policy.js'
 import { object } from './rpc.js'
+import { needsServerRiskCard } from './server-approval-policy.js'
 
-export function assessPolicy(yaml: string, value: unknown, scope = 'main'): PermissionVerdict {
+export function assessPolicy(yaml: string, value: unknown, scope = 'main', riskyApprovals = false): PermissionVerdict {
   const { tool_name: tool, tool_input: input, hook_event_name: event } = object(value)
   const deny = { tier: 'deny', reason: 'Не удалось проверить действие по правилам YAML.', matchedRule: 'hook:invalid' } as const
   let document: unknown
@@ -13,6 +14,12 @@ export function assessPolicy(yaml: string, value: unknown, scope = 'main'): Perm
   const classify = (toolName: string, toolInput: unknown) =>
     classifyToolCall({ toolName, toolInput, policy: parsed.data as PermissionPolicy, scope })
   const base = classify(tool, input)
+  if (riskyApprovals && base.tier === 'allow' && ['Bash', 'exec_command', 'shell_command'].includes(tool)) {
+    const { command } = object(input)
+    if (typeof command === 'string' && needsServerRiskCard(command)) {
+      return { tier: 'confirm', reason: 'Команда может удалить данные или изменить критичные настройки.', matchedRule: 'server:risk' }
+    }
+  }
   if (tool !== 'apply_patch' || base.tier === 'deny') return base
   const { command } = object(input)
   if (typeof command !== 'string') return deny

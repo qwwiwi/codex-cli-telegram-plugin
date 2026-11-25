@@ -8,7 +8,7 @@ async function main(): Promise<ReturnType<typeof policyHookOutput>> {
     const [policyFile, portText, tokenFile, scope] = process.argv.slice(2)
     if (!policyFile || !isAbsolute(policyFile) || statSync(policyFile).size > 64 * 1024) return policyHookOutput(false)
     const input = object(JSON.parse(await Bun.stdin.text()))
-    const verdict = assessPolicy(readFileSync(policyFile, 'utf8'), input, scope)
+    const verdict = assessPolicy(readFileSync(policyFile, 'utf8'), input, scope, process.env.KROT_CODEX_APPROVAL_MODE === 'risky')
     if (verdict.tier !== 'confirm') return policyHookOutput(verdict.tier === 'allow', verdict.reason)
     const port = Number(portText)
     if (!tokenFile || !isAbsolute(tokenFile) || !Number.isInteger(port) || port < 1 || port > 65535) return policyHookOutput(false)

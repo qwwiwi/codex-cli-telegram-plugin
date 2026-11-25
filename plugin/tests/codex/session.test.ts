@@ -10,13 +10,13 @@ const dirs: string[] = []
 const sessions: CodexSession[] = []
 
 function fixture(auth: string = 'chatgpt', approve?: (request: ApprovalRequest) => Promise<'accept' | 'decline' | 'cancel'>,
-  onActivity?: ConstructorParameters<typeof CodexSession>[0]['onActivity'], env = process.env) {
+  onActivity?: ConstructorParameters<typeof CodexSession>[0]['onActivity'], env = process.env, riskyApprovals = false) {
   const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-test-'))
   dirs.push(cwd)
   const stateFile = join(cwd, 'thread.json')
   const create = () => {
     const session = new CodexSession({
-      cwd: import.meta.dir, stateFile, env,
+      cwd: import.meta.dir, stateFile, env, riskyApprovals,
       command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), auth],
       ...(approve ? { approve } : {}),
       ...(onActivity ? { onActivity } : {}),
@@ -240,4 +240,27 @@ test('reuses one YAML decision for the same Codex command and asks again for a d
     expect(seen).toHaveLength(3)
     expect(seen.at(-1)?.target).toContain('+different')
   } finally { server.close() }
+})
+
+test('risky mode silently accepts only a routine local command and keeps the original approval path', async () => {
+  const seen: ApprovalRequest[] = []
+  const approve = async (request: ApprovalRequest) => {
+    seen.push(request)
+    return 'decline' as const
+  }
+  const ordinary = fixture('chatgpt', approve).create()
+  await ordinary.initialize()
+  expect((await ordinary.run('approval:routine')).text).toBe('decline')
+  expect(seen).toHaveLength(1)
+  seen.length = 0
+
+  const session = fixture('chatgpt', approve, undefined, process.env, true).create()
+  await session.initialize()
+  expect((await session.run('approval:routine')).text).toBe('accept')
+  expect(seen).toHaveLength(0)
+  expect((await session.run('approval:risky')).text).toBe('decline')
+  expect((await session.run('approval:routine-remote')).text).toBe('decline')
+  expect((await session.run('approval:network')).text).toBe('decline')
+  expect(seen.map(request => request.kind)).toEqual(['command', 'command', 'network'])
+  expect(seen[0]?.target).toContain('rm -r')
 })

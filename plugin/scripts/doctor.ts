@@ -96,6 +96,10 @@ export async function runDoctor(
     const fields = [...new Set(parsed.error.issues.map(issue => issue.path.join('.')))]
     checks.push({ status: 'error', message: `Проверьте переменные в plugin/.env: ${fields.join(', ')}.` })
   }
+  if (parsed.success && parsed.data.KROT_CODEX_APPROVAL_MODE === 'risky') {
+    report(env.KROT_CODEX_APPROVALS === '1', 'Включён режим карточек для рискованных команд.',
+      'Для KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1 в plugin/.env.')
+  }
   let config: ReturnType<typeof loadConfig> | undefined
   if (parsed.success) {
     try {

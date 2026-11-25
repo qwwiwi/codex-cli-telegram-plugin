@@ -3,6 +3,7 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rpc.js'
 import { sameFilePatch, type NativeFileChange } from './file-approval.js'
 import { agentChatTool, type AgentChatActions } from './chat-actions.js'
+import { isRoutineServerCommand } from './server-approval-policy.js'
 
 export type ApprovalDecision = 'accept' | 'decline' | 'cancel'
 export type ApprovalRequest = {
@@ -29,6 +30,7 @@ type Settings = {
   mayRunGoal?: (threadId: string) => boolean
   onGoalResult?: (threadId: string, result: Result) => void
   approve?: (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>
+  riskyApprovals?: boolean
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
   chatAction?: (key: string, args: unknown, current: () => boolean) => ReturnType<AgentChatActions['call']>
 }
@@ -591,6 +593,12 @@ export class CodexSession {
           : receipt.kind === 'file' && changes !== undefined && sameFilePatch(receipt.target, receipt.cwd, changes)
         if (matches) return { decision: 'accept' }
       }
+    }
+    if (this.settings.riskyApprovals && commandRequest && !network && !stdin &&
+        (params.environmentId == null || params.environmentId === 'local') &&
+        (params.availableDecisions == null || Array.isArray(params.availableDecisions) && params.availableDecisions.includes('accept')) &&
+        isRoutineServerCommand(target, params.cwd)) {
+      return { decision: 'accept' }
     }
     const decision = await this.withServerRequest(id, execution.threadId, signal => approve({
       kind: network ? 'network' : stdin ? 'stdin' : commandRequest ? 'command' : 'file',

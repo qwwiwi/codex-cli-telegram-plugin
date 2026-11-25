@@ -19,6 +19,7 @@ usage() {
   cat <<'HELP'
 Использование
   ./install.sh [--start] [--agent-name NAME] [--workspace PATH] [--state-dir PATH]
+               [--approval-mode standard|risky]
   ./install.sh --non-interactive --token-file PATH [--owner-id ID | --pair-code CODE] [--start]
   ./install.sh --dry-run
 
@@ -26,6 +27,8 @@ usage() {
 Для автоматизации используйте приватный файл с токеном или TELEGRAM_BOT_TOKEN.
 Если ID владельца известен, передайте --owner-id или TELEGRAM_OWNER_ID.
 При повторном запуске используется сохранённый plugin/.env.
+--approval-mode risky пропускает обычную диагностику и оставляет карточки для действий с риском.
+--approval-mode standard возвращает обычную обработку подтверждений Codex.
 --start включает пользовательскую службу и автозапуск. Нужен вход в Codex через ChatGPT.
 HELP
 }
@@ -35,9 +38,10 @@ dry_run=0
 non_interactive=0
 token_file=''
 pair_code=''
+approval_mode=''
 while (( $# )); do
   case $1 in
-    --owner-id|--token-file|--workspace|--state-dir|--agent-name|--pair-code)
+    --owner-id|--token-file|--workspace|--state-dir|--agent-name|--pair-code|--approval-mode)
       (( $# >= 2 )) && [[ -n $2 && $2 != --* ]] || setup_fail 'После параметра нужно указать значение.'
       case $1 in
         --owner-id) owner=$2 ;;
@@ -46,6 +50,11 @@ while (( $# )); do
         --state-dir) state=$2 ;;
         --agent-name) agent_name=$2 ;;
         --pair-code) pair_code=$2 ;;
+        --approval-mode)
+          case $2 in
+            standard|risky) approval_mode=$2 ;;
+            *) setup_fail 'Для --approval-mode выбери standard или risky.' ;;
+          esac ;;
       esac
       shift 2 ;;
     --start) start=1; shift ;;
@@ -58,6 +67,7 @@ done
 
 if (( dry_run )); then
   printf '%s\n' 'План: проверить зависимости и вход Codex, связать личку, установить зависимости проекта, запустить doctor и подготовить службу.'
+  if [[ -n $approval_mode ]]; then printf 'Режим подтверждений: %s\n' "$approval_mode"; fi
   if (( start )); then printf '%s\n' 'После успешного doctor служба будет включена.'; fi
   exit 0
 fi
@@ -95,6 +105,14 @@ if [[ -e $env_file || -L $env_file ]]; then
   unset setup_token
   setup_private_file "$env_file"
   printf '%s\n' 'Использую существующий plugin/.env.'
+  if [[ -n $approval_mode ]]; then
+    tmp_env=$(mktemp "$plugin_dir/.env.XXXXXXXX")
+    awk '!/^[[:space:]]*(export[[:space:]]+)?KROT_CODEX_(APPROVAL_MODE|APPROVALS)[[:space:]]*=/' \
+      "$env_file" > "$tmp_env"
+    printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "$approval_mode" >> "$tmp_env"
+    mv -fT -- "$tmp_env" "$env_file"
+    tmp_env=''
+  fi
 else
   workspace=$(private_dir "$workspace")
   state=$(private_dir "$state")
@@ -159,6 +177,7 @@ else
     printf 'TELEGRAM_STATE_DIR="%s"\nTELEGRAM_WORKSPACE_ROOT="%s"\n' "$state" "$workspace"
     printf 'KROT_CODEX_AGENT_NAME="%s"\n' "$agent_name"
     printf '%s\n' 'KROT_CODEX_APPROVALS=1'
+    if [[ -n $approval_mode ]]; then printf 'KROT_CODEX_APPROVAL_MODE=%s\n' "$approval_mode"; fi
   } > "$tmp_env"
   unset setup_token
   ln -- "$tmp_env" "$env_file" || setup_fail 'Не удалось сохранить plugin/.env. Проверь, не появился ли файл параллельно.'

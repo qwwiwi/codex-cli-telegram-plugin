@@ -71,6 +71,10 @@ async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
   const env = RuntimeEnvSchema.parse(process.env)
   const config = loadConfig(process.env)
+  const riskyApprovals = env.KROT_CODEX_APPROVAL_MODE === 'risky'
+  if (riskyApprovals && process.env.KROT_CODEX_APPROVALS !== '1') {
+    throw new Error('KROT_CODEX_APPROVAL_MODE=risky requires KROT_CODEX_APPROVALS=1')
+  }
   const agentName = codexAgentName(process.env.KROT_CODEX_AGENT_NAME, config.memory.agent_label)
   const agentTitle = agentName === 'Codex' ? agentName : agentName + ' · Codex'
   const ownerId = config.allowed_user_ids[0]
@@ -223,6 +227,7 @@ async function main(): Promise<void> {
     let recoveringGoal: string | undefined
     const controls = new ControlState(paths.root, config.tmux_mirror.enabled)
     const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => codexEnvironment.test(name)))
+    if (riskyApprovals) codexEnv.KROT_CODEX_APPROVAL_MODE = 'risky'
     const autoSaveLearning = process.env.KROT_CODEX_LEARNING_AUTO_SAVE === '1'
     let learning: LearningMemory | undefined
     if (process.env.KROT_CODEX_LEARNING === '1') {
@@ -385,7 +390,7 @@ async function main(): Promise<void> {
           startNext()
         })
       },
-      ...(approvals ? { approve: (request, signal) => approvals.request(request, signal) } : {}),
+      ...(approvals ? { approve: (request, signal) => approvals.request(request, signal), riskyApprovals } : {}),
       ask: (input, signal) => questions.ask(input, signal),
       chatAction: (key, args, current) => {
         const epoch = stopEpoch
