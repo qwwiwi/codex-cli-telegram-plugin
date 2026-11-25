@@ -34,8 +34,25 @@ for await (const line of createInterface({ input: process.stdin })) {
     case 'model/list':
       respond({ data: [{ model: 'gpt-test', isDefault: true }, { model: 'hidden-test', hidden: true }] })
       break
+    case 'config/read':
+      respond({ config: { mcp_servers: { external: { enabled: true } } } })
+      break
     case 'thread/start':
     case 'thread/resume':
+      if (params.ephemeral) {
+        if (params.sandbox !== 'read-only' || params.approvalPolicy !== 'never' ||
+            params.environments?.length !== 0 || params.dynamicTools?.length !== 0 ||
+            params.config?.mcp_servers?.external?.enabled !== false ||
+            params.config?.['features.shell_tool'] !== false) {
+          emit({ id, error: { code: -32602, message: 'Unsafe review settings' } })
+          break
+        }
+        threadId = crypto.randomUUID()
+        respond({ thread: { id: threadId, ephemeral: true }, approvalPolicy: 'never', sandbox: {
+          type: process.argv[3] === 'wrong-sandbox' ? 'workspaceWrite' : 'readOnly',
+        } })
+        break
+      }
       if (!['never', 'on-request'].includes(params.approvalPolicy) || params.sandbox !== 'workspace-write') {
         emit({ id, error: { code: -32602, message: 'Unexpected sandbox policy' } })
         break
@@ -79,6 +96,14 @@ for await (const line of createInterface({ input: process.stdin })) {
       break
     case 'turn/start': {
       activeTurn = 'turn-' + ++turnNumber
+      if (params.outputSchema) {
+        emit({ method: 'item/completed', params: {
+          threadId, turnId: activeTurn, item: { type: 'agentMessage', text: '{"entries":[]}' },
+        } })
+        emit({ method: 'turn/completed', params: { threadId, turn: { id: activeTurn, status: 'completed' } } })
+        respond({ turn: { id: activeTurn } })
+        break
+      }
       if (params.input[0].text.startsWith('approval:')) {
         respond({ turn: { id: activeTurn } })
         pendingApproval = 'approval-' + turnNumber

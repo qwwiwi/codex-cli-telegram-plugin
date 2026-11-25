@@ -11,5 +11,7 @@ Telegram-мост для OpenAI Codex. Поддерживает личный ч�
 
 [Подробная настройка и команды Telegram](plugin/docs/install.md). Тесты разработчика запускаются командой `bun test` в каталоге `plugin/`.
 
+[Память предпочтений, уроков и навыков](plugin/docs/learning.md) можно включить отдельно после первого запуска.
+
 Код развивается на основе [Krot-tg-plugin](https://github.com/example-owner/claude-reference)
 и [Dashi Channel](https://github.com/qwwiwi/dashi-plugin-claude-code). Лицензия [Apache 2.0](LICENSE).

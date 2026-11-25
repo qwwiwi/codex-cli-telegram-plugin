@@ -3,6 +3,7 @@
 For a first installation on Ubuntu or Debian, follow the [step-by-step guide](quickstart.md).
 Once configured, run `bun run doctor` from `plugin/` as the bridge user before starting polling.
 The [user service example](../../examples/krotov-telegram.service) covers the standard single-user install.
+See [learning from conversations](learning.md) to enable the optional background review and `/memory` commands.
 
 The Telegram bridge runs as a dedicated non-root service user and serves one owner in a private chat. A test bot can run alongside the original Claude service. When switching to Codex with the same Telegram bot token, stop the old poller before starting the new one.
 

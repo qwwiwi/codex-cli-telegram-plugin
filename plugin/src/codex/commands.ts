@@ -12,6 +12,7 @@ const specs = [
   { command: 'lease', description: 'выдать, посмотреть или отозвать мандат' },
   { command: 'cc', description: 'модель, сессии, экспорт и лимиты Codex' },
   { command: 'goal', description: 'поставить, посмотреть или приостановить длинную цель' },
+  { command: 'memory', description: 'управлять предложениями памяти и навыками' },
   { command: 'pin', description: 'закрепить сообщение, на которое ответил' },
   { command: 'unpin', description: 'открепить сообщение, на которое ответил' },
   { command: 'react', description: 'поставить эмодзи на выбранное сообщение' },
@@ -19,9 +20,10 @@ const specs = [
   { command: 'get', description: 'передать example-agentу вложение из цитаты' },
 ] as const
 
-export function codexCommands(config: AppConfig) {
+export function codexCommands(config: AppConfig, learningEnabled = false) {
   return specs.filter(({ command }) =>
-    !(command in config.commands) || config.commands[command as keyof AppConfig['commands']])
+    (command !== 'memory' || learningEnabled) &&
+    (!(command in config.commands) || config.commands[command as keyof AppConfig['commands']]))
 }
 
 export function parseCodexCommand(text: string | undefined, username: string) {

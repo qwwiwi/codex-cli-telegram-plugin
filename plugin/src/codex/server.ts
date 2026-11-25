@@ -1,4 +1,4 @@
-import { realpathSync, statSync } from 'node:fs'
+import { mkdirSync, realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { Bot } from 'grammy'
 import type { Message } from 'grammy/types'
@@ -42,6 +42,8 @@ import { savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-deli
 import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   safeActionTarget, type ChatAction } from './chat-actions.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
+import { LearningMemory } from './learning.js'
+import { reviewLearning } from './learning-review.js'
 import { hasMedia, prepareInbound } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { CodexSession } from './session.js'
@@ -159,9 +161,11 @@ async function main(): Promise<void> {
   const albums = new AlbumBuffer<Message>({ flushMs: config.album.flush_ms })
   let cancelMedia: (() => void) | undefined
   let mirror: CodexMirror | undefined
+  const learningAbort = new AbortController()
   function shutdown(): void {
     if (stopping) return
     stopping = true
+    learningAbort.abort()
     albums.flushAll()
     clearInterval(outboxTimer)
     clearInterval(watchdogTimer)
@@ -183,6 +187,19 @@ async function main(): Promise<void> {
     let recoveringGoal: string | undefined
     const controls = new ControlState(paths.root, config.tmux_mirror.enabled)
     const leases = new CodexLeases(paths, ownerChat, log)
+    const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => codexEnvironment.test(name)))
+    let learning: LearningMemory | undefined
+    if (process.env.KROT_CODEX_LEARNING === '1') {
+      try {
+        const root = join(paths.root, 'learning')
+        mkdirSync(root, { recursive: true, mode: 0o700 })
+        const interval = Number(process.env.KROT_CODEX_LEARNING_INTERVAL ?? 10)
+        if (!Number.isInteger(interval) || interval < 1 || interval > 30) throw new Error('Invalid learning interval')
+        learning = new LearningMemory(root, interval, secrets,
+          prompt => reviewLearning(root, codexEnv, prompt, learningAbort.signal, process.env.KROT_CODEX_LEARNING_MODEL),
+          process.env.KROT_CODEX_LEARNING_AUTO_SAVE === '1')
+      } catch { log.warn('Could not start Codex learning. Check the learning state directory and interval.') }
+    }
     const receipts = new Map<number, { turn: string; messages: Message[] }>()
     const quotedAttachments = new Map<number, Message>()
     let goalActive = Boolean(controls.goalThread)
@@ -204,7 +221,7 @@ async function main(): Promise<void> {
     const codex = session = new CodexSession({
       cwd: workspace,
       stateFile: join(paths.root, 'codex-thread.json'),
-      env: Object.fromEntries(Object.entries(process.env).filter(([name]) => codexEnvironment.test(name))),
+      env: codexEnv,
       ...(process.env.KROT_CODEX_MODEL ? { model: process.env.KROT_CODEX_MODEL } : {}),
       selectedModel: () => controls.model,
       onThread: id => {
@@ -371,7 +388,7 @@ async function main(): Promise<void> {
       outboxTimer.unref()
     }
 
-    const menu = codexCommands(config)
+    const menu = codexCommands(config, !!learning)
     const hud = new ContextHud({
       enabled: resolveHudEnabled(config),
       ownerChatIds: [ownerId],
@@ -394,6 +411,20 @@ async function main(): Promise<void> {
       },
     })
     const send = async (text: string): Promise<void> => { await telegram.sendMessage(ownerChat, text, {}) }
+    let learningRetryAfter = 0
+    function runLearning(force = false): void {
+      if (!learning || stopping || !force && Date.now() < learningRetryAfter) return
+      void learning.review(force).then(count => {
+        if (stopping) return
+        if (count) return send('💾 Обновление памяти · ' + count + '. /memory pending · /memory list')
+        if (force) return send('Новых записей нет или разбор уже выполняется.')
+      }, () => {
+        if (stopping) return
+        learningRetryAfter = Date.now() + 10 * 60_000
+        log.warn('Codex learning review failed; check the local CLI, ChatGPT login and App Server capability.')
+        if (force) return send('Не удалось разобрать диалог. Проверьте вход в локальный Codex CLI и журнал моста.')
+      }).catch(() => log.warn('Could not send learning status'))
+    }
     async function recordMemory(sessionId: string | null, userText: string, agentText: string, durationMs: number): Promise<void> {
       try {
         await memory?.recordTurn({
@@ -710,10 +741,13 @@ async function main(): Promise<void> {
         }
         const completion = mode !== 'resume' || !previousTicket ? leases.completion() : undefined
         try {
-          if (completion) {
-            await codex.injectContext(thread, [goalLeasePrefix, leases.instructions(), completion.instructions, agentChatInstructions,
-              'Если в карточке нужны несколько ответов, напиши в заголовке вопроса «Выбери несколько».'].filter(Boolean).join('\n\n'))
-          }
+          const learned = mode === 'resume' ? '' : learning?.context(args)
+          const goalContext = [
+            ...(completion ? [goalLeasePrefix, leases.instructions(), completion.instructions, agentChatInstructions,
+              'Если в карточке нужны несколько ответов, напиши в заголовке вопроса «Выбери несколько».'] : []),
+            learned,
+          ].filter(Boolean).join('\n\n')
+          if (goalContext) await codex.injectContext(thread, goalContext)
           if (completion) controls.setGoalLease(thread, completion.ticket)
           controls.selectGoal(thread, true)
           setGoalActive(true)
@@ -909,6 +943,15 @@ async function main(): Promise<void> {
       if (name === 'compact') return compact()
       if (name === 'cc') return handleCc(args)
       if (name === 'goal') return handleGoal(args)
+      if (name === 'memory' && learning) {
+        if (args === 'review') {
+          await send('Проверю недавний диалог в фоне.')
+          runLearning(true)
+        } else {
+          await send(learning.command(args))
+        }
+        return
+      }
       if (name === 'lease' && messageId !== undefined) {
         await send(await leases.command(args, messageId))
         void hud.updateNow(ownerChat)
@@ -1271,6 +1314,7 @@ async function main(): Promise<void> {
           }
           let result = await codex.run([
             attachmentInstructions, leases.instructions(), agentChatInstructions, chatContext(messages),
+            learning?.context(ownerText ?? input.text) ?? '',
             [autonomyInstructions, continuation?.instructions, leaseCompletion?.instructions,
               !editTarget && question.instructions].filter(Boolean).join(' '), input.text,
             ...(editTarget ? ['Для редактирования верни только готовый новый текст цитируемого сообщения в нужном формате.'] : []),
@@ -1313,6 +1357,12 @@ async function main(): Promise<void> {
             return
           }
           await finishOrdinaryReply(epoch)
+          if (learning && ownerText && first.message_id > 0 && !interim && !stopping) {
+            try {
+              learning.observe(ownerText, reply.text)
+              runLearning()
+            } catch { log.warn('Could not retain the turn for learning') }
+          }
           if (interim !== undefined) progressResult = 'Продолжаю работу'
           const inputType = messages.length > 1 ? 'album' : first.voice ? 'voice' : first.photo ? 'photo'
             : first.document ? 'document' : hasMedia(first) ? 'media' : 'text'
