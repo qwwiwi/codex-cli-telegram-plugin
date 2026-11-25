@@ -1,5 +1,9 @@
 # Krotov Plugin deployment guide
 
+For a first installation on Ubuntu or Debian, follow the [step-by-step guide](quickstart.md).
+Once configured, run `bun run doctor` from `plugin/` as the bridge user before starting polling.
+The [user service example](../../examples/krotov-telegram.service) covers the standard single-user install.
+
 The Telegram bridge runs as a dedicated non-root service user and serves one owner in a private chat. A test bot can run alongside the original Claude service. When switching to Codex with the same Telegram bot token, stop the old poller before starting the new one.
 
 ## Configure
@@ -69,7 +73,7 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   The bubble and typing indicator stay active while Codex reports a running
   turn or a managed background job or subagent. Detached processes without
   Codex lifecycle events are outside the activity feed.
-- From `plugin/`, run `bun install` and `bun run start:codex`. In a deployment, use the same environment variables with the bundled entry point.
+- From `plugin/`, run `bun install --frozen-lockfile`, `bun run doctor` and `bun run start`. In a deployment using a bundle, use the same environment variables.
 
 ## Telegram controls
 

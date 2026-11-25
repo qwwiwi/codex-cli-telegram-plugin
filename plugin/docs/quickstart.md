@@ -1,0 +1,168 @@
+# Установка Krotov Plugin на VPS с нуля
+
+Подойдёт Ubuntu или Debian с systemd. Нужен обычный пользователь VPS с доступом к `sudo`, аккаунт ChatGPT с доступом к Codex, Telegram и право чтения репозитория. Все шаги установки выполняйте в Bash от одного и того же обычного пользователя.
+
+Если на новом VPS есть только `root`, выполните команды ниже от `root`. При создании пользователя задайте пароль для `sudo`. Настройте для `krotov` вход по SSH через панель хостинга или существующие настройки SSH и переподключитесь под ним. Если обычный пользователь уже есть, переходите к шагу 1.
+
+```bash
+apt update
+apt install -y sudo
+adduser krotov
+usermod -aG sudo krotov
+```
+
+## 1. Установите инструменты и скачайте репозиторий
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl gh git jq nano unzip
+curl -fsSL https://bun.com/install | bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+bun --version
+codex --version
+```
+
+Для текущего приватного репозитория войдите в GitHub под аккаунтом, которому дали доступ. Откройте показанную GitHub CLI ссылку в браузере на своём компьютере и введите одноразовый код.
+
+```bash
+gh auth login --hostname github.com --git-protocol https --web
+gh auth setup-git --hostname github.com
+cd "$HOME"
+git clone https://github.com/example-owner/Krotov-plugin.git
+cd "$HOME/Krotov-plugin/plugin"
+bun install --frozen-lockfile
+```
+
+[Установка Bun](https://bun.com/docs/installation) · [Установка Codex CLI](https://learn.chatgpt.com/docs/codex/cli) · [Вход в GitHub CLI](https://cli.github.com/manual/gh_auth_login)
+
+## 2. Войдите в Codex через ChatGPT
+
+В настройках безопасности ChatGPT включите вход по коду устройства. Для рабочего аккаунта доступность опции может зависеть от администратора. Выполните на VPS первую команду и откройте ссылку из терминала в браузере на своём компьютере. Войдите в свой аккаунт и введите одноразовый код. Затем проверьте статус второй командой.
+
+```bash
+codex login --device-auth
+codex login status
+```
+
+CLI должен сообщить, что выполнен вход через ChatGPT. Если вход по коду недоступен, [в документации Codex](https://learn.chatgpt.com/docs/auth#login-on-headless-devices) описаны варианты для VPS без браузера. Токены входа и файл `~/.codex/auth.json` храните в секрете.
+
+## 3. Создайте бота и найдите числовые ID
+
+1. В Telegram откройте [@BotFather](https://t.me/BotFather), отправьте `/newbot` и задайте имя и уникальное имя пользователя. Сохраните выданный токен.
+2. Откройте **личный чат своего нового бота** и нажмите **Start**. Мост ещё не запущен, поэтому бот пока молчит.
+3. В том же терминале выполните команды ниже. Когда терминал попросит токен, вставьте его и нажмите Enter. Ввод не отображается. После команды `getMe` сверьте выведенный `username` с именем бота, которое выбрали в BotFather.
+
+```bash
+read -rs -p 'Токен нового бота: ' KROTOV_BOT_TOKEN
+printf '\n'
+telegram_api() {
+  printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$KROTOV_BOT_TOKEN" "$1" |
+    curl --silent --show-error --fail --max-time 15 --config -
+}
+telegram_api getMe | jq -e 'select(.ok) | .result | {bot_id: .id, username}'
+```
+
+4. Выполните первую команду ниже, скопируйте напечатанную строку и отправьте её боту в личку. Затем выполните остальные команды. `owner_user_id` и `private_chat_id` должны быть одинаковыми. Если вместо результата пусто, убедитесь, что строка отправлена именно этому боту, и повторите запрос, пока функция и переменная ещё доступны.
+
+```bash
+krotov_probe="krotov-$(cat /proc/sys/kernel/random/uuid)"
+printf '%s\n' "$krotov_probe"
+```
+
+```bash
+telegram_api getUpdates | jq -e --arg probe "$krotov_probe" '
+  first(.result[] | .message | select(.chat.type == "private" and .text == $probe)
+    | {owner_user_id: .from.id, private_chat_id: .chat.id})
+'
+```
+
+Когда записали все три ID, очистите переменные и функцию.
+
+```bash
+unset KROTOV_BOT_TOKEN krotov_probe
+unset -f telegram_api
+```
+
+Эти команды рассчитаны на нового бота. Если переиспользуете старого, сначала остановите его прежний процесс и проверьте, что webhook отключён. Telegram разрешает только один процесс polling на токен. Метод `getUpdates` здесь нужен только для настройки, дальше обновления читает мост.
+
+[Создание бота в Telegram](https://core.telegram.org/bots/features#botfather) · [Telegram Bot API](https://core.telegram.org/bots/api#getting-updates)
+
+## 4. Заполните настройки
+
+Узнайте абсолютный путь к домашней папке. Создайте отдельные рабочую папку и папку состояния. Затем откройте `.env` с правами чтения и записи только для своего пользователя. Команда `test` сохраняет уже существующий `.env`, если вы повторяете этот шаг.
+
+```bash
+printf '%s\n' "$HOME"
+install -d -m 700 "$HOME/.local/state/krotov-plugin" "$HOME/krotov-workspace"
+cd "$HOME/Krotov-plugin/plugin"
+test -e .env || install -m 600 .env.example .env
+chmod 600 .env
+nano .env
+```
+
+Пример для пользователя `alex`. Замените значение токена, все ID и начало обоих путей своими данными. Для путей используйте полный путь из `printf`, например `/home/alex`. Папка состояния хранит данные моста и должна быть за пределами рабочей папки, где Codex работает с файлами.
+
+```dotenv
+TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
+TELEGRAM_EXPECTED_BOT_ID=1234567890
+TELEGRAM_ALLOWED_USER_IDS=987654321
+TELEGRAM_ALLOWED_CHAT_IDS=987654321
+TELEGRAM_STATE_DIR=/home/alex/.local/state/krotov-plugin
+TELEGRAM_WORKSPACE_ROOT=/home/alex/krotov-workspace
+KROT_CODEX_APPROVALS=1
+```
+
+`KROT_CODEX_APPROVALS=1` включает карточки подтверждения в Telegram для действий, до которых Codex запрашивает разрешение. Строки `TELEGRAM_ALLOWED_USER_IDS` и `TELEGRAM_ALLOWED_CHAT_IDS` обязательны в этой инструкции. Обе должны содержать ваш числовой ID, полученный в предыдущем шаге. В nano сохраните файл через **Ctrl+O**, **Enter**, затем **Ctrl+X**.
+
+## 5. Проверьте конфигурацию и получите первый ответ
+
+```bash
+cd "$HOME/Krotov-plugin/plugin"
+bun run doctor
+bun run start
+```
+
+Запускайте вторую команду после успешной проверки. `doctor` проверяет одного владельца, каталоги, доступность Codex App Server, локальный статус входа через ChatGPT, соответствие токена ID бота и отсутствие webhook. При ошибке он печатает подсказку и возвращает код 1. Команда обращается к Telegram за данными бота и статусом webhook. Она не читает обновления и не отправляет сообщения.
+
+Оставьте терминал открытым. В личном чате бота отправьте `/help` и затем «Ответь словом КРОТ». Ответ на обычное сообщение проверяет всю цепочку от Telegram до Codex. Когда получите ответ, остановите ручной запуск через **Ctrl+C** перед настройкой автозапуска.
+
+## 6. Включите автозапуск на VPS
+
+Шаблон пользовательской службы рассчитан на пути из этой инструкции. Если поменяли расположение репозитория или Bun, исправьте `WorkingDirectory`, `ExecStart` и при необходимости `PATH` в скопированном файле. Служба использует того же пользователя и тот же `.env`, что и ручной запуск.
+
+```bash
+install -d "$HOME/.config/systemd/user"
+install -m 644 "$HOME/Krotov-plugin/examples/krotov-telegram.service" \
+  "$HOME/.config/systemd/user/krotov-telegram.service"
+sudo loginctl enable-linger "$(id -un)"
+systemctl --user daemon-reload
+systemctl --user enable --now krotov-telegram.service
+systemctl --user status krotov-telegram.service --no-pager
+loginctl show-user "$(id -un)" -p Linger
+```
+
+В статусе ожидайте `active (running)`, а в последней строке — `Linger=yes`. Это позволяет службе запускаться при загрузке VPS и работать после выхода из SSH. Отправьте ещё одно сообщение боту. Чтобы проверить автозапуск, закройте SSH и отправьте сообщение снова, затем повторите проверку после плановой перезагрузки VPS.
+
+```bash
+# Последние сообщения в журнале
+journalctl --user -u krotov-telegram.service -n 50 --no-pager
+# Перезапуск после изменения .env
+systemctl --user restart krotov-telegram.service
+# Остановка и отключение автозапуска
+systemctl --user disable --now krotov-telegram.service
+```
+
+Если `systemctl --user` не видит шину пользователя, откройте новое SSH-подключение напрямую под пользователем моста. В стандартной Ubuntu или Debian пользовательский systemd запускает `systemd-logind`.
+
+## Если бот не отвечает
+
+| Что видно | Что проверить |
+|---|---|
+| Codex или Bun не найден | Выполните `export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"` в текущем SSH-терминале. Для службы проверьте `PATH` в файле службы. |
+| Telegram вернул `401` | Сверьте токен с BotFather и повторите `bun run doctor`. |
+| Telegram вернул `409` | Проверьте, что с этим токеном не работает второй экземпляр и webhook отключён. |
+| `doctor` проходит, но `/help` молчит | Проверьте ID владельца по шагу 3, убедитесь, что пишете в личку нужному боту, и посмотрите журнал моста. |
+| `/help` работает, обычное сообщение не получает ответа | Проверьте `codex login status` от пользователя службы и сообщения Codex в журнале. |
+
+[Расширенные настройки, команды и проверка вложений](install.md)

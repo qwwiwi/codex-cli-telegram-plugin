@@ -1,0 +1,15 @@
+[Unit]
+Description=Krotov Plugin Telegram bridge for Codex
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Krotov-plugin/plugin
+Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=%h/.bun/bin/bun run start
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+
+[Install]
+WantedBy=default.target
