@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the dedicated example-agent Codex App Server
+After=example-backend.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /run/example/codex-root-health.py
+RuntimeDirectory=krot-codex-health
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
