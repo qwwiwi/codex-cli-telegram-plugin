@@ -219,7 +219,7 @@ export async function startExternalTasks(port: number, token: string, chatId: st
       if (payload.success) {
         if (!payload.data.message.trim()) return reply(res, 400, { error: 'invalid payload' })
         if (payload.data.chatId !== chatId) return reply(res, 403, { error: 'chatId not in allowlist' })
-        if (payload.data.agentId !== undefined && !['dashi-channel', 'example-agent'].includes(payload.data.agentId)) {
+        if (payload.data.agentId !== undefined && !['krotov', 'dashi-channel', 'example-agent'].includes(payload.data.agentId)) {
           return reply(res, 404, { error: 'agent not found' })
         }
         message = payload.data.message

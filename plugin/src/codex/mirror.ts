@@ -23,7 +23,7 @@ export class CodexMirror {
   private nextPaint: ReturnType<typeof setTimeout> | undefined
 
   constructor(private telegram: Pick<TelegramApi, 'sendMessage' | 'editMessageText'>, private chatId: string,
-    private secrets: readonly string[] = []) {}
+    private secrets: readonly string[] = [], private agentName = 'Codex') {}
 
   event(kind: string): void {
     if (Object.hasOwn(stages, kind)) this.update(stages[kind]!)
@@ -65,7 +65,7 @@ export class CodexMirror {
   private async flush(): Promise<void> {
     while (this.last !== this.pending) {
       this.last = this.pending
-      const text = '📡 example-agent · ' + this.last
+      const text = '📡 ' + this.agentName + ' · ' + this.last
       try {
         if (this.messageId === undefined) {
           const result = await this.telegram.sendMessage(this.chatId, text, { disable_notification: true })

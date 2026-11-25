@@ -4,9 +4,12 @@ node_modules/
 *.env
 !.env.example
 secrets/
-state/
-logs/
-memory/
+/state/
+/logs/
+/memory/
+/plugin/state/
+/plugin/logs/
+/plugin/memory/
 dist/
 build/
 coverage/

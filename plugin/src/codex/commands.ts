@@ -16,8 +16,8 @@ const specs = [
   { command: 'pin', description: 'закрепить сообщение, на которое ответил' },
   { command: 'unpin', description: 'открепить сообщение, на которое ответил' },
   { command: 'react', description: 'поставить эмодзи на выбранное сообщение' },
-  { command: 'edit', description: 'заменить текст выбранного ответа example-agentа' },
-  { command: 'get', description: 'передать example-agentу вложение из цитаты' },
+  { command: 'edit', description: 'заменить текст выбранного ответа агента' },
+  { command: 'get', description: 'передать агенту вложение из цитаты' },
 ] as const
 
 export function codexCommands(config: AppConfig, learningEnabled = false) {
@@ -26,9 +26,28 @@ export function codexCommands(config: AppConfig, learningEnabled = false) {
     (!(command in config.commands) || config.commands[command as keyof AppConfig['commands']]))
 }
 
-export function isStatusQuestion(text: string): boolean {
-  const phrase = text.trim().toLowerCase().replace(/ё/g, 'е')
-    .replace(/^аг[ао]ним(?:[,!:]\s*|\s+)/u, '').replace(/[?!.…]+$/u, '').trim()
+export function codexAgentName(override: string | undefined, previousLabel: string | undefined): string {
+  for (const name of [override, previousLabel]) {
+    const clean = name?.trim()
+    if (clean && clean.length <= 64 && !/[\p{Cc}\p{Cf}]/u.test(clean)) return clean
+  }
+  return 'Codex'
+}
+
+export function isStatusQuestion(text: string, agentName = 'Codex'): boolean {
+  const normal = (value: string) => value.trim().toLowerCase().replace(/ё/g, 'е')
+  let phrase = normal(text)
+  const name = normal(agentName)
+  const names = /^(?:example-agent|аг[ао]ним)$/u.test(name) ? ['example-agent', 'example-agent', 'Example Maintainer'] : [name]
+  for (const label of names) {
+    if (!label || !phrase.startsWith(label)) continue
+    const suffix = phrase.slice(label.length)
+    if (/^[,!:\s]/u.test(suffix)) {
+      phrase = suffix.replace(/^[,!:\s]+/u, '')
+      break
+    }
+  }
+  phrase = phrase.replace(/[?!.…]+$/u, '').trim()
   return /^(?:статус|как там|как продвигается|как идет работа|(?:ты )?(?:еще )?работаешь|на каком (?:ты )?этапе|что сейчас делаешь)$/u.test(phrase)
 }
 

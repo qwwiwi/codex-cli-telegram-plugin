@@ -32,7 +32,7 @@ import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
 import { CardCleanup } from './card-cleanup.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
-import { codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
+import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import { automaticContinuation, followUpInstructions, hideContinuationMarker, takeContinuation } from './continuation.js'
 import { ControlState } from './control-state.js'
 import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, formatConversation,
@@ -71,6 +71,8 @@ async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
   const env = RuntimeEnvSchema.parse(process.env)
   const config = loadConfig(process.env)
+  const agentName = codexAgentName(process.env.KROT_CODEX_AGENT_NAME, config.memory.agent_label)
+  const agentTitle = agentName === 'Codex' ? agentName : agentName + ' · Codex'
   const ownerId = config.allowed_user_ids[0]
   if (config.allowed_user_ids.length !== 1 || config.allowed_chat_ids.length !== 1
       || ownerId === undefined || String(config.allowed_chat_ids[0]) !== String(ownerId)) {
@@ -120,7 +122,7 @@ async function main(): Promise<void> {
     workspacePath: config.memory.workspace_path,
     logsPath: config.memory.logs_path ?? join(dirname(config.memory.workspace_path), 'logs'),
     sourceTag: config.memory.source_tag,
-    agentLabel: config.memory.agent_label ?? 'example-agent',
+    agentLabel: agentName,
     maxHotBytes: config.memory.max_hot_bytes,
     trimKeepLines: config.memory.trim_keep_lines,
     bufferTtlMs: config.memory.buffer_ttl_ms,
@@ -207,7 +209,7 @@ async function main(): Promise<void> {
     const ownerChat = String(ownerId)
     const watcher = new InboundWatcher({
       config: { ...config, watcher: { ...config.watcher,
-        busy_text: config.watcher.busy_text || 'example-agent занят. Жди или /stop.' } },
+        busy_text: config.watcher.busy_text || agentName + ' сейчас занят. Жди или /stop.' } },
       log,
       telegramApi: telegram,
       progressReporter: {
@@ -262,7 +264,7 @@ async function main(): Promise<void> {
       },
       onProgress: kind => {
         if (controls.mirror) {
-          mirror ??= new CodexMirror(telegram, ownerChat, secrets)
+          mirror ??= new CodexMirror(telegram, ownerChat, secrets, agentName)
           mirror.event(kind)
         }
       },
@@ -271,7 +273,7 @@ async function main(): Promise<void> {
         if (!thread || event.params.threadId !== thread) return
         if (controls.mirror && event.method === 'item/commandExecution/outputDelta' &&
             typeof event.params.delta === 'string' && typeof event.params.itemId === 'string') {
-          mirror ??= new CodexMirror(telegram, ownerChat, secrets)
+          mirror ??= new CodexMirror(telegram, ownerChat, secrets, agentName)
           mirror.output(event.params.itemId, event.params.delta)
         }
         if (event.method === 'thread/goal/updated' && controls.goalThread === thread) {
@@ -463,7 +465,7 @@ async function main(): Promise<void> {
         await memory?.recordTurn({
           sessionId, userText: redactSecrets(userText, secrets), agentText: redactSecrets(agentText, secrets), durationMs,
         })
-      } catch { log.warn('Could not write example-agent memory') }
+      } catch { log.warn('Could not write agent memory') }
     }
 
     async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number): Promise<void> {
@@ -642,7 +644,7 @@ async function main(): Promise<void> {
         watchdogRunning = true
         recoveryAt = Date.now()
         void codex.stop().then(stopped => {
-          if (stopped) return send('example-agent остановил задачу после долгого отсутствия активности.').catch(() => undefined)
+          if (stopped) return send('Задача остановлена после долгого отсутствия активности.').catch(() => undefined)
           return undefined
         }).catch(() => undefined).finally(() => { watchdogRunning = false })
       }, Math.max(1000, config.status.heartbeat?.liveness_probe_ms ?? 30_000))
@@ -681,7 +683,7 @@ async function main(): Promise<void> {
       const ticket = completed ? controls.goalLease(thread) : undefined
       const reply = extractAttachments(ticket
         ? await leases.completion(ticket).complete(text) : hideLeaseCompletions(text))
-      const headline = completed ? '🎯 Цель завершена.' : 'example-agent остановился на цели' +
+      const headline = completed ? '🎯 Цель завершена.' : 'Работа над целью остановилась' +
         (goal?.status ? ' (' + String(goal.status) + ').' : '.')
       const body = [headline, leases.finalReply(reply.text, resolveAskGuardMode(config, log))].filter(Boolean).join('\n\n')
       if (!completed) await sendFinalText(body, reply.files.length > 0)
@@ -808,7 +810,7 @@ async function main(): Promise<void> {
           stopEpoch++
           await goalStarting?.catch(() => undefined)
           if (controls.goalThread !== codex.currentThread || !controls.goalThread) {
-            await send('В этом диалоге нет цели example-agentа.')
+            await send('В этом диалоге нет цели агента.')
             return
           }
           await codex.setGoal(controls.goalThread, 'paused')
@@ -910,7 +912,7 @@ async function main(): Promise<void> {
             await send('Открыл диалог Codex с контекстом из архива Claude. Можешь продолжить разговор.')
           } else {
             const text = await readClaudeArchive(archive, value, secrets)
-            await sendConversation(telegram, ownerChat, text, 'example-agent-claude-' + value + '.md')
+            await sendConversation(telegram, ownerChat, text, 'claude-archive-' + value + '.md')
           }
           return
         }
@@ -965,7 +967,7 @@ async function main(): Promise<void> {
             return
           }
           const history = await codex.recentTurns()
-          await sendConversation(telegram, ownerChat, formatConversation(history.turns, history.partial, secrets))
+          await sendConversation(telegram, ownerChat, formatConversation(history.turns, history.partial, secrets, agentName))
           return
         }
         if (action === 'cost' && !value) {
@@ -1040,12 +1042,12 @@ async function main(): Promise<void> {
       try {
         const background = work.hasBackground
         const stopped = await cancelCurrentTurn()
-        const text = background && proxy ? 'Останавливаю фоновые задачи example-agentа. Его процесс Codex перезапустится.' :
+        const text = background && proxy ? 'Останавливаю фоновые задачи. Процесс Codex перезапустится.' :
           stopped ? 'Останавливаю текущую задачу.' : 'Сейчас нет активной задачи Codex.'
         const notice = send(text)
         if (background && proxy) {
           await Promise.race([notice.catch(() => undefined), new Promise<void>(resolve => setTimeout(resolve, 750))])
-          if (!await codex.stopBackground()) await send('Не удалось остановить фоновые задачи example-agentа.')
+          if (!await codex.stopBackground()) await send('Не удалось остановить фоновые задачи.')
         } else await notice
       } catch {
         await send('Не удалось остановить задачу Codex.')
@@ -1088,7 +1090,7 @@ async function main(): Promise<void> {
         return
       }
       if (name === 'help') {
-        await send(['example-agent · Codex', ...menu.map(spec => '/' + spec.command + ' — ' + spec.description),
+        await send([agentTitle, ...menu.map(spec => '/' + spec.command + ' — ' + spec.description),
           'Можно отправлять текст, голосовые, фото и документы. Чтобы получить файл, попроси прислать его вложением.'].join('\n'))
         return
       }
@@ -1097,7 +1099,7 @@ async function main(): Promise<void> {
         const busy = !!task || codex.isRunning || goalActive || !!recoveringGoal || deliveringGoal
         const step = busy ? plans.find(item => item.status === 'in_progress') : undefined
         await send([
-          'example-agent · Codex',
+          agentTitle,
           'Сессия ' + (busy ? 'занята' : hasThread ? 'готова к продолжению' : 'ещё не начата'),
           ...(step ? ['Текущий этап: ' + step.content] : []),
           ...(model ? ['Модель ' + model] : []),
@@ -1112,7 +1114,7 @@ async function main(): Promise<void> {
         const buttons = [
           ['status', '📋 Статус'], ['stop', '⏹ Стоп'], ['compact', '🗜 Сжать'], ['help', '❔ Справка'],
         ].filter(([key]) => menu.some(spec => spec.command === key))
-        await telegram.sendMessage(ownerChat, 'Управление example-agentом', {
+        await telegram.sendMessage(ownerChat, 'Управление агентом · ' + agentName, {
           reply_markup: { inline_keyboard: [buttons.map(([key, text]) => ({ text: text!, callback_data: 'codex:control:' + key }))] },
         })
         return
@@ -1349,7 +1351,7 @@ async function main(): Promise<void> {
       }
       if (text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
           (task || codex.isRunning || goalActive || recoveringGoal || deliveringGoal) &&
-          menu.some(spec => spec.command === 'status') && isStatusQuestion(text)) {
+          menu.some(spec => spec.command === 'status') && isStatusQuestion(text, agentName)) {
         await handleCommand('status', '')
         return
       }
@@ -1466,7 +1468,7 @@ async function main(): Promise<void> {
       task = (async () => {
         let progressResult = 'Работа завершена'
         if (controls.mirror) {
-          mirror = new CodexMirror(telegram, ownerChat, secrets)
+          mirror = new CodexMirror(telegram, ownerChat, secrets, agentName)
           mirror.event('turn')
         }
         try {
@@ -1660,7 +1662,7 @@ async function main(): Promise<void> {
         if (stopping) return 'stopping'
         const outcome = inbox.receive({
           message_id: id, date: Math.floor(Date.now() / 1000),
-          text: 'Задание от авторизованной локальной службы для example-agentа.\n\n' + message,
+          text: 'Задание от авторизованной локальной службы.\n\n' + message,
           chat: { id: ownerId, type: 'private', first_name: 'Telegram' },
           from: { id: ownerId, is_bot: false, first_name: 'Telegram' },
         })

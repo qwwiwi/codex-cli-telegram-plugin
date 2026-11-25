@@ -12,8 +12,8 @@ import { hideQuestionMarker } from './questions.js'
 import { goalLeasePrefix, hideLeaseCompletions } from './lease.js'
 import { handoffContextPrefix } from './handoff-context.js'
 
-export function formatConversation(turns: unknown[], partial: boolean, secrets: readonly string[]): string {
-  const sections = ['# Диалог example-agentа', ...(partial ? ['Экспорт содержит последние 100 ходов.'] : [])]
+export function formatConversation(turns: unknown[], partial: boolean, secrets: readonly string[], agentName = 'Codex'): string {
+  const sections = ['# Диалог · ' + agentName, ...(partial ? ['Экспорт содержит последние 100 ходов.'] : [])]
   for (const raw of turns) {
     const { items } = object(raw)
     if (!Array.isArray(items)) continue
@@ -39,7 +39,7 @@ export function formatConversation(turns: unknown[], partial: boolean, secrets: 
       } else if (item.type === 'agentMessage' && item.delivery !== 'async' && item.phase !== 'commentary' && typeof item.text === 'string') {
         const reply = extractAttachments(hideLeaseCompletions(hideQuestionMarker(hideContinuationMarker(item.text))))
         const text = [reply.text, ...reply.files.map(() => '[Отправлено вложение]')].filter(Boolean).join('\n')
-        if (text) sections.push('## example-agent\n\n' + text)
+        if (text) sections.push('## ' + agentName + '\n\n' + text)
       }
     }
   }
@@ -50,7 +50,7 @@ export async function sendConversation(
   telegram: Pick<TelegramApi, 'sendDocument'>,
   chatId: string,
   text: string,
-  name = 'example-agent-dialog.md',
+  name = 'codex-dialog.md',
 ): Promise<void> {
   if (Buffer.byteLength(text) > 10 * 1024 * 1024) throw new Error('Export size limit exceeded')
   const directory = await mkdtemp(join(tmpdir(), 'krot-codex-transcript-'))
@@ -88,10 +88,10 @@ async function archiveRecords(root: string, date: string): Promise<Array<Record<
 }
 
 function formatClaudeRecords(title: string, records: Array<Record<string, unknown>>, secrets: readonly string[]): string {
-  const sections = ['# example-agent · Claude Code · ' + title]
+  const sections = ['# Архив Claude Code · ' + title]
   for (const { user, agent } of records) {
     if (typeof user === 'string' && user.trim()) sections.push('## Ты\n\n' + user.trim())
-    if (typeof agent === 'string' && agent.trim()) sections.push('## example-agent\n\n' + agent.trim())
+    if (typeof agent === 'string' && agent.trim()) sections.push('## Агент\n\n' + agent.trim())
   }
   return redactSecrets(sections.join('\n\n') + '\n', secrets)
 }

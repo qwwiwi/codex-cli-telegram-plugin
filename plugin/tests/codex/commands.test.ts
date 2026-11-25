@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { AppConfigSchema } from '../../src/config.js'
-import { codexCommands, isStatusQuestion, parseCodexCommand } from '../../src/codex/commands.js'
+import { codexAgentName, codexCommands, isStatusQuestion, parseCodexCommand } from '../../src/codex/commands.js'
 
 test('hides disabled commands and resolves supported legacy aliases', () => {
   const config = AppConfigSchema.parse({ commands: { stop: false, new: false } })
@@ -19,10 +19,16 @@ test('hides disabled commands and resolves supported legacy aliases', () => {
 })
 
 test('only standalone status questions can bypass the active turn', () => {
-  for (const text of ['example-agent, как там?', 'Ты ещё работаешь?', 'На каком ты этапе?', 'Что сейчас делаешь?']) {
+  for (const text of ['Ты ещё работаешь?', 'На каком ты этапе?', 'Что сейчас делаешь?']) {
     expect(isStatusQuestion(text)).toBe(true)
   }
   for (const text of ['Как там сайт?', 'Как там? Добавь проверку.', 'Проверь, работает ли бот', 'Статус репозитория']) {
     expect(isStatusQuestion(text)).toBe(false)
   }
+  expect(isStatusQuestion('example-agent, как там?', 'example-agent')).toBe(true)
+  expect(isStatusQuestion('Полярная звезда, как там?', 'Полярная звезда')).toBe(true)
+  expect(isStatusQuestion('example-agent, как там?', 'Полярная звезда')).toBe(false)
+  expect(codexAgentName('  Полярная звезда  ', 'example-agent')).toBe('Полярная звезда')
+  expect(codexAgentName('bad\nname', 'example-agent')).toBe('example-agent')
+  expect(codexAgentName(undefined, undefined)).toBe('Codex')
 })

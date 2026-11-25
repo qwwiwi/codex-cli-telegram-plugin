@@ -62,7 +62,7 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 - Set `outbox.enabled` to retry undelivered text after a Telegram flood ban.
   The bridge logs ambiguous delivery failures and avoids replaying them.
 - Install the example `krot-codex-health` systemd service and timer for the
-  supervised Linux backend. It restarts only the dedicated example-agent App Server
+  supervised Linux backend. It restarts only the dedicated Codex App Server
   after two failed local probes. The bridge separately attempts to interrupt a
   silent turn after `status.ttl_ms`, while allowing managed worker processes
   and pending approvals to continue.
@@ -81,7 +81,7 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 
 - `/help` lists the enabled commands. `/status` shows session activity,
   permissions and the model and context usage once received from Codex.
-  During work, a standalone status question like «example-agent, как там?»
+  During work, a standalone status question like «Как там?»
   also receives the current status immediately, without steering the task.
 - `/stop` interrupts the current turn. `/new` and `/reset force` start a
   new conversation on the next message and leave previous history on disk.
