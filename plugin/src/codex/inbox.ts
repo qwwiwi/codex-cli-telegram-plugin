@@ -4,15 +4,17 @@ import type { Message } from 'grammy/types'
 import { atomicWriteInRoot } from '../autonomy/store.js'
 import type { ContinuationContext } from './continuation.js'
 import type { LeaseTicket } from './lease.js'
+import type { PartStatus } from './reply-delivery.js'
 
 const filename = 'codex-inbox.json'
 const limit = 16
 export type InboxReply = { text: string; files: string[]; replyTo?: number }
 type Work = { continuation?: ContinuationContext; lease?: LeaseTicket }
 type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string } |
-  { stage: 'ready'; reply: InboxReply; continueGoal?: true }
+  { stage: 'ready'; reply: InboxReply; continueGoal?: true; delivery?: Record<string, PartStatus> }
 type Active = { messages: Message[]; outcome: Outcome; work?: Work }
-type Pending = { ready: Message[][]; albums: Record<string, Message[]>; accepted: number[]; active?: Active; followUp?: Message[] }
+type Pending = { ready: Message[][]; albums: Record<string, Message[]>; accepted: number[]; active?: Active;
+  followUp?: Message[]; followUpIndex?: number }
 
 export class CodexInbox {
   private state: Pending = { ready: [], albums: {}, accepted: [] }
@@ -56,14 +58,17 @@ export class CodexInbox {
     if (!this.isOwner(message)) throw new Error('Codex inbox owner mismatch')
     if (this.state.accepted.includes(message.message_id)) return 'duplicate'
     if (this.state.followUp || this.state.ready.length + Object.keys(this.state.albums).length >= limit) return 'full'
-    this.save({ ...this.state, accepted: [...this.state.accepted.slice(-299), message.message_id], followUp: [message] })
+    this.save({ ...this.state, accepted: [...this.state.accepted.slice(-299), message.message_id],
+      followUp: [message], followUpIndex: this.state.ready.length })
     return 'accepted'
   }
 
   finishFollowUp(id: number, enqueue = false): void {
-    const { followUp, ...pending } = this.state
+    const { followUp, followUpIndex, ...pending } = this.state
     if (followUp?.[0]?.message_id === id) {
-      this.save(enqueue ? { ...pending, ready: [...pending.ready, followUp] } : pending)
+      const ready = pending.ready.slice()
+      if (enqueue) ready.splice(followUpIndex ?? ready.length, 0, followUp)
+      this.save({ ...pending, ready })
     }
   }
 
@@ -72,7 +77,7 @@ export class CodexInbox {
     if (this.state.accepted.includes(message.message_id)) return 'duplicate'
     const group = message.media_group_id
     if (group && !/^[a-zA-Z0-9_-]{1,64}$/.test(group)) throw new Error('Invalid Telegram media group')
-    const count = this.state.ready.length + Object.keys(this.state.albums).length
+    const count = this.state.ready.length + Object.keys(this.state.albums).length + Number(!!this.state.followUp)
     if (count >= limit && (!group || !Object.hasOwn(this.state.albums, group))) return 'full'
     const accepted = [...this.state.accepted.slice(-299), message.message_id]
     if (group) {
@@ -100,13 +105,13 @@ export class CodexInbox {
     const albums = { ...this.state.albums }
     delete albums[id]
     const ordered = [...group].sort((a, b) => a.message_id - b.message_id)
-    this.save(followUp ? { ...this.state, albums, followUp: ordered }
+    this.save(followUp ? { ...this.state, albums, followUp: ordered, followUpIndex: this.state.ready.length }
       : { ...this.state, albums, ready: [...this.state.ready, ordered] })
     return ordered
   }
 
   take(): Message[] | undefined {
-    if (this.state.active) return undefined
+    if (this.state.active || this.state.followUp) return undefined
     const [group, ...ready] = this.state.ready
     if (group) this.save({ ...this.state, ready, active: { messages: group, outcome: { stage: 'claimed' } } })
     return group
@@ -131,6 +136,23 @@ export class CodexInbox {
     this.updateActive(id, { stage: 'ready', reply, ...(pending ? { continueGoal: true } : {}) })
   }
 
+  replyPart(id: number, key: string): PartStatus | undefined {
+    const active = this.state.active
+    return active?.messages[0]?.message_id === id && active.outcome.stage === 'ready'
+      ? active.outcome.delivery?.[key] : undefined
+  }
+
+  setReplyPart(id: number, key: string, value: PartStatus | undefined): void {
+    const active = this.state.active
+    if (active?.messages[0]?.message_id !== id || active.outcome.stage !== 'ready') {
+      throw new Error('Pending reply changed during delivery')
+    }
+    const delivery = { ...active.outcome.delivery }
+    if (value) delivery[key] = value
+    else delete delivery[key]
+    this.updateActive(id, { ...active.outcome, delivery })
+  }
+
   finish(id: number): void {
     const { active, ...pending } = this.state
     if (active?.messages[0]?.message_id === id) this.save(pending)
@@ -141,7 +163,8 @@ export class CodexInbox {
     if (!active?.work?.continuation) return
     const { continuation: _, ...work } = active.work
     const outcome = active.outcome.stage === 'ready'
-      ? { stage: 'ready' as const, reply: active.outcome.reply } : active.outcome
+      ? { stage: 'ready' as const, reply: active.outcome.reply,
+        ...(active.outcome.delivery ? { delivery: active.outcome.delivery } : {}) } : active.outcome
     this.save({ ...this.state, active: { ...active, work, outcome } })
   }
 

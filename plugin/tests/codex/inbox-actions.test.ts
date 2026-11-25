@@ -105,6 +105,20 @@ test('preserves the claimed request, the assigned turn and the undelivered resul
   } finally { rmSync(root, { force: true, recursive: true }) }
 })
 
+test('reserves the follow-up queue slot and retains its order after fallback or stop', () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-follow-up-order-'))
+  try {
+    let inbox = new CodexInbox(root, owner.id)
+    inbox.beginFollowUp(message(5))
+    for (let id = 6; id < 21; id++) expect(inbox.receive(message(id))).toBe('accepted')
+    expect(inbox.receive(message(21))).toBe('full')
+    inbox = new CodexInbox(root, owner.id)
+    inbox.finishFollowUp(5, true)
+    expect(inbox.size).toBe(16)
+    expect(inbox.take()?.[0]?.message_id).toBe(5)
+  } finally { rmSync(root, { force: true, recursive: true }) }
+})
+
 test('scopes pin, reaction and edit to the private quoted message and protects system cards', async () => {
   const calls: unknown[] = []
   const api = {

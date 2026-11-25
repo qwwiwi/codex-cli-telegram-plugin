@@ -26,14 +26,15 @@ export function formatConversation(turns: unknown[], partial: boolean, secrets: 
           return part.text
             .replace(attachmentInstructions + '\n\n', '')
             .replace(/^Актуальные мандаты владельца Telegram[^\n]*\n\n/u, '')
-            .replace(/^Для большой задачи составь план[^\n]*\n\n/u, '')
+            .replace(/^Для большой задачи составь план[^\n]*(?:\r?\n(?!\r?\n)[^\n]*)*\r?\n\r?\n/mu, '')
             .replace(followUpInstructions + '\n\n', '')
             .replace(/^Действия в личке Telegram доступны во время работы\.[^\n]*\n\n/mu, '')
             .replace(/^Память прошлых задач \(JSON\)\.[^\n]*\n\[[^\n]*\]\n\n/mu, '')
-            .split('\n').filter(line => !line.startsWith(chatContextPrefix)).join('\n')
+            .split('\n').filter(line => !line.startsWith(chatContextPrefix) &&
+              !/^\s*KROT_(?:CONTINUE|QUESTION|LEASE)_[a-f0-9-]{36}(?:\s|$)/u.test(line)).join('\n')
         }).join('\n').trim()
         if (text) sections.push('## Ты\n\n' + text)
-      } else if (item.type === 'agentMessage' && item.phase !== 'commentary' && typeof item.text === 'string') {
+      } else if (item.type === 'agentMessage' && item.delivery !== 'async' && item.phase !== 'commentary' && typeof item.text === 'string') {
         const reply = extractAttachments(hideLeaseCompletions(hideQuestionMarker(hideContinuationMarker(item.text))))
         const text = [reply.text, ...reply.files.map(() => '[Отправлено вложение]')].filter(Boolean).join('\n')
         if (text) sections.push('## example-agent\n\n' + text)

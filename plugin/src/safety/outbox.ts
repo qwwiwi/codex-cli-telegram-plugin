@@ -40,6 +40,7 @@ import { join } from 'node:path'
 import { parse429 } from './rate-limited-telegram-api.js'
 import type { SendMessageOpts } from '../channel/tools.js'
 import type { Logger } from '../log.js'
+import type { OpenQuestionDetection } from './open-question.js'
 
 export interface OutboxItem {
   /** Unique id (uuid) — diagnostics + dedupe of persisted entries. */
@@ -51,6 +52,7 @@ export interface OutboxItem {
   notBefore: number
   /** Send attempts so far (429 reschedules and non-flood failures both bump). */
   attempts: number
+  question?: OpenQuestionDetection
 }
 
 // The re-send primitive — the SAME rate-limited `sendMessage` the reply tool
@@ -66,6 +68,7 @@ export interface OutboxOptions {
   /** Plugin state dir; the outbox writes `<fileName>` here. */
   stateDir: string
   sendFn: OutboxSendFn
+  onDelivered?: (item: Readonly<OutboxItem>, messageId: number) => void
   log: Logger
   /** Test seam: replace Date.now() for enqueue's notBefore computation. */
   now?: () => number
@@ -84,6 +87,7 @@ const DEFAULT_FILE_NAME = 'outbox.json'
 export class Outbox {
   private readonly stateDir: string
   private readonly sendFn: OutboxSendFn
+  private readonly onDelivered: OutboxOptions['onDelivered']
   private readonly log: Logger
   private readonly now: () => number
   private readonly maxItems: number
@@ -94,6 +98,7 @@ export class Outbox {
   constructor(opts: OutboxOptions) {
     this.stateDir = opts.stateDir
     this.sendFn = opts.sendFn
+    this.onDelivered = opts.onDelivered
     this.log = opts.log
     this.now = opts.now ?? ((): number => Date.now())
     this.maxItems = opts.maxItems ?? DEFAULT_MAX_ITEMS
@@ -105,7 +110,7 @@ export class Outbox {
   // Append an undelivered reply. `retryAfterSec` is the ban's cooldown (from
   // the 429) — the item won't be re-sent before now()+retryAfterSec. Persists
   // synchronously so a crash right after enqueue can't lose the reply.
-  enqueue(chatId: string, text: string, opts: SendMessageOpts, retryAfterSec: number): void {
+  enqueue(chatId: string, text: string, opts: SendMessageOpts, retryAfterSec: number, question?: OpenQuestionDetection): void {
     const wait = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec : 0
     this.items.push({
       id: randomUUID(),
@@ -114,6 +119,7 @@ export class Outbox {
       opts,
       notBefore: this.now() + wait * 1000,
       attempts: 0,
+      ...(question ? { question } : {}),
     })
     // Bounded: never grow without limit. Drop the OLDEST (front) so the most
     // recent replies survive — and NEVER silently (warn on every drop).
@@ -151,9 +157,10 @@ export class Outbox {
           // FIFO: a not-due head holds the whole chat this round.
           if (item.notBefore > now) break
           try {
-            await this.sendFn(item.chatId, item.text, item.opts)
+            const result = await this.sendFn(item.chatId, item.text, item.opts)
             toRemove.add(item)
             changed = true
+            try { this.onDelivered?.(item, result.message_id) } catch { this.log.warn('Could not record delivered outbox message') }
             // Delivered — drain the next same-chat item this round.
             continue
           } catch (err) {
@@ -252,6 +259,8 @@ export class Outbox {
             opts: (e.opts ?? {}) as SendMessageOpts,
             notBefore: e.notBefore,
             attempts: typeof e.attempts === 'number' ? e.attempts : 0,
+            ...(e.question && typeof e.question.code === 'string' && typeof e.question.snippet === 'string'
+              ? { question: e.question } : {}),
           })
         }
       }

@@ -1,6 +1,27 @@
 import { expect, test } from 'bun:test'
 import { startExternalTasks } from '../../src/codex/external.js'
 import { CodexMirror } from '../../src/codex/mirror.js'
+import { Outbox } from '../../src/safety/outbox.js'
+import { createLogger } from '../../src/log.js'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+test('an outbox question keeps its metadata and receives the eventual Telegram ID', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'krot-outbox-receipt-'))
+  try {
+    const sent: unknown[] = []
+    const settings = { stateDir, log: createLogger('test'), now: () => 0,
+      sendFn: async () => ({ message_id: 57 }) }
+    new Outbox(settings).enqueue('123', 'Жду твоего ответа', {}, 20, { code: 'OQ_TEST', snippet: 'Жду твоего ответа' })
+    const outbox = new Outbox({ ...settings, onDelivered: (item, id) => sent.push([item.question, id]) })
+    await outbox.flushDue(19_999)
+    expect(sent).toEqual([])
+    await outbox.flushDue(20_000)
+    expect(sent).toEqual([[{ code: 'OQ_TEST', snippet: 'Жду твоего ответа' }, 57]])
+    expect(outbox.size()).toBe(0)
+  } finally { rmSync(stateDir, { recursive: true, force: true }) }
+})
 
 test('external task endpoint requires its bearer and owner, and uses the caller key for deduplication', async () => {
   const jobs = new Map<number, string>()

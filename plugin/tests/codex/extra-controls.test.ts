@@ -80,13 +80,18 @@ test('exports conversational text with secrets redacted and internal tools exclu
       '[{"kind":"user","text":"private preference"}]\n\nПроверка' }] },
     { type: 'userMessage', content: [{ type: 'text',
       text: 'Служебный результат действия Telegram. Не показывай его владельцу.\n{"message_ids":[94530]}' }] },
+    { type: 'userMessage', content: [{ type: 'text', text: 'Для большой задачи составь план.\n' +
+      'Служебный второй абзац с маркером KROT_CONTINUE_f0308658-1234-1234-1234-adeddcba584b\n\nВторой вопрос владельца' }] },
+    { type: 'agentMessage', delivery: 'async', text: 'Служебный асинхронный вопрос' },
     { type: 'commandExecution', aggregatedOutput: 'tool output' },
     { type: 'agentMessage', phase: 'commentary', text: 'internal update' },
     { type: 'agentMessage', phase: 'final_answer', text: 'Ответ secret-smoke\n@@SEND_FILE: /workspace/out.txt' },
   ] }], true, ['secret-smoke'])
   expect(report).toContain('Проверка')
+  expect(report).toContain('Второй вопрос владельца')
   expect(report).toContain('[Отправлено вложение]')
   expect(report).not.toMatch(/tool output|internal update|secret-smoke|\/workspace\/out|\[private\]|private preference|94530/)
+  expect(report).not.toMatch(/KROT_CONTINUE|Служебный второй|Служебный асинхронный/)
 })
 
 test('a completed turn consumes only a mandate offered to that turn', async () => {

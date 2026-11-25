@@ -10,7 +10,7 @@ import { isTelegramHtmlParseError, markdownToTelegramHtml } from '../format/html
 import { contentFitsRichLimits } from '../format/rich.js'
 import { createLogger } from '../log.js'
 import { MemoryWriter } from '../memory/writer.js'
-import { Outbox } from '../safety/outbox.js'
+import { Outbox, type OutboxOptions } from '../safety/outbox.js'
 import { detectOpenQuestion } from '../safety/open-question.js'
 import { createOpenQuestionTick } from '../safety/open-question-sweep.js'
 import { createRateLimitedTelegramApi, parse429 } from '../safety/rate-limited-telegram-api.js'
@@ -39,6 +39,7 @@ import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, format
 import { CodexInbox, type InboxReply } from './inbox.js'
 import { startExternalTasks } from './external.js'
 import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-delivery.js'
+import { deliverReplyPart, type PartStatus } from './reply-delivery.js'
 import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   safeActionTarget, type ChatAction } from './chat-actions.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
@@ -102,8 +103,10 @@ async function main(): Promise<void> {
   const telegram = createReliableTelegramApi(safeTelegram, log, {
     deadLetter: record => writeDeadLetter(paths, 'outbound', { ...record, error: redactSecrets(record.error, secrets) }),
   })
+  let onDeferredDelivery: OutboxOptions['onDelivered']
   const outbox = resolveOutboxEnabled(config)
-    ? new Outbox({ stateDir: paths.root, sendFn: (id, text, opts) => safeTelegram.sendMessage(id, text, opts), log })
+    ? new Outbox({ stateDir: paths.root, sendFn: (id, text, opts) => safeTelegram.sendMessage(id, text, opts),
+      onDelivered: (item, messageId) => onDeferredDelivery?.(item, messageId), log })
     : undefined
   let flushing: Promise<void> | undefined
   let outboxTimer: ReturnType<typeof setInterval> | undefined
@@ -187,6 +190,7 @@ async function main(): Promise<void> {
   try {
     const ownerChat = String(ownerId)
     let recoveringInbox = !!inbox.active || !!inbox.uncertainFollowUp || inbox.size > 0 || Object.keys(inbox.recoveredAlbums).length > 0
+    let deliveryRetryAt = 0
     let recoveringGoal: string | undefined
     const controls = new ControlState(paths.root, config.tmux_mirror.enabled)
     const leases = new CodexLeases(paths, ownerChat, log)
@@ -442,7 +446,7 @@ async function main(): Promise<void> {
       } catch { log.warn('Could not write example-agent memory') }
     }
 
-    async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number): Promise<void> {
+    async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number): Promise<void> {
       if (!text) return
       const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
       const question = questionConfig.enabled ? detectOpenQuestion(redactSecrets(text, secrets)) : undefined
@@ -453,6 +457,41 @@ async function main(): Promise<void> {
           await leases.recordQuestion(messageId, question.snippet).catch(() => log.warn('Could not save an open question'))
         }
         else questionStore.clear(ownerChat)
+      }
+      if (messageId !== undefined) {
+        const richEligible = config.richMessages.enabled && !containsFiles &&
+          !config.richMessages.perChatOptOut.includes(ownerChat) && contentFitsRichLimits(text) &&
+          !carriesExpandableBlockquote(text)
+        const richState = inbox.replyPart(messageId, 'rich')
+        if (richEligible || richState) {
+          const result = await deliverReplyPart(richState, state => inbox.setReplyPart(messageId, 'rich', state),
+            () => withoutDeletedQuote(id => telegram.sendRichMessage(ownerChat, text,
+              id === undefined ? {} : { reply_to_message_id: id }), replyTo),
+            value => !('message_id' in value))
+          if (result.value && 'message_id' in result.value) {
+            agentChat.remember(result.value.message_id, true, true, true)
+            await recordQuestion(result.value.message_id)
+          }
+          if (result.state !== 'fallback') return
+        } else inbox.setReplyPart(messageId, 'rich', 'fallback')
+        for (const [index, part] of splitMessage(markdownToTelegramHtml(text)).entries()) {
+          const key = 'text:' + index
+          const result = await deliverReplyPart(inbox.replyPart(messageId, key),
+            state => inbox.setReplyPart(messageId, key, state),
+            () => withoutDeletedQuote(async id => {
+              const options = id === undefined ? {} : { reply_to_message_id: id }
+              try { return await telegram.sendMessage(ownerChat, part, { ...options, parse_mode: 'HTML' }) }
+              catch (error) {
+                if (!isTelegramHtmlParseError(error)) throw error
+                return telegram.sendMessage(ownerChat, part, options)
+              }
+            }, index === 0 ? replyTo : undefined))
+          if (result.value) {
+            agentChat.remember(result.value.message_id, true, true)
+            if (index === 0) await recordQuestion(result.value.message_id)
+          }
+        }
+        return
       }
       let rich
       let retryAfter: number | undefined
@@ -474,7 +513,7 @@ async function main(): Promise<void> {
       for (const [index, part] of splitMessage(markdownToTelegramHtml(text)).entries()) {
         const options = { parse_mode: 'HTML' as const, ...(index === 0 ? quote : {}) }
         if (retryAfter !== undefined && outbox) {
-          outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter)
+          outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter, index === 0 ? question : undefined)
           continue
         }
         try {
@@ -485,7 +524,7 @@ async function main(): Promise<void> {
           const flood = parse429(error)
           if (flood && outbox) {
             retryAfter = flood.retryAfter
-            outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter)
+            outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter, index === 0 ? question : undefined)
           } else {
             if (!isTelegramHtmlParseError(error)) throw error
             const sent = await telegram.sendMessage(ownerChat, part, index === 0 ? quote : {})
@@ -521,6 +560,15 @@ async function main(): Promise<void> {
         })
       },
     })
+    onDeferredDelivery = (item, id) => {
+      if (item.chatId !== ownerChat) return
+      agentChat.remember(id, true, true)
+      if (questionConfig.enabled && item.question) {
+        const { code, snippet } = item.question
+        questionStore.set({ chatId: ownerChat, messageId: id, askedAtMs: Date.now(), code, snippet, remindersSent: 0 })
+        void leases.recordQuestion(id, snippet).catch(() => log.warn('Could not save an open question'))
+      }
+    }
     function chatContext(messages: readonly Message[]): string {
       const ids: string[] = []
       for (const message of messages) {
@@ -729,6 +777,7 @@ async function main(): Promise<void> {
           }
           await codex.setGoal(controls.goalThread, 'paused')
           setGoalActive(false)
+          approvals?.cancelAll()
           questions.cancel()
           await codex.stop()
           if (mode === 'cancel') {
@@ -895,8 +944,8 @@ async function main(): Promise<void> {
         if (custom && messageId) {
           await acceptInput({
             message_id: -messageId, date: Math.floor(Date.now() / 1000), text: custom,
-            chat: { id: ownerId, type: 'private', first_name: 'Telegram' },
-            from: { id: ownerId, is_bot: false, first_name: 'Telegram' },
+            chat: { id: Number(ownerChat), type: 'private', first_name: 'Telegram' },
+            from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
           })
           return
         }
@@ -904,7 +953,7 @@ async function main(): Promise<void> {
           '/cc resume [номер или ID]', '/cc export', '/cc cost', '/cc clear'].join('\n'))
       } catch {
         await send('Codex не смог выполнить /cc ' + action + '.')
-      }
+      } finally { startNext() }
     }
 
     async function compact(): Promise<void> {
@@ -1147,9 +1196,10 @@ async function main(): Promise<void> {
           }
         } catch { log.info('Could not answer a Telegram side question independently') }
         if (!stopping && inbox.uncertainFollowUp?.message_id === id) {
-          const enqueue = !consumed && epoch === stopEpoch
+          const enqueue = !consumed
           inbox.finishFollowUp(id, enqueue)
           if (enqueue) resumeInbox()
+          else startNext()
         }
       })().catch(() => log.warn('Could not finish a Telegram side question'))
       return true
@@ -1174,9 +1224,12 @@ async function main(): Promise<void> {
       if (!accepted) receipts.delete(id)
       if (!accepted && completedRequest && epoch === stopEpoch && messages.length === 1 &&
           launchSideReply(messages[0]!, epoch)) return
-      inbox.finishFollowUp(id, !accepted && epoch === stopEpoch)
-      if (accepted) log.info('Codex active turn received a Telegram follow-up', { album: messages.length > 1 })
-      else resumeInbox()
+      inbox.finishFollowUp(id, !accepted)
+      if (accepted) {
+        if (receipts.delete(id)) markProcessed(messages)
+        log.info('Codex active turn received a Telegram follow-up', { album: messages.length > 1 })
+        startNext()
+      } else resumeInbox()
     }
 
     async function acceptInput(message: Message): Promise<void> {
@@ -1309,28 +1362,25 @@ async function main(): Promise<void> {
     }
 
     async function deliverReply(reply: InboxReply, messageId: number): Promise<void> {
-      try {
-        await withoutDeletedQuote(id => sendFinalText(reply.text, reply.files.length > 0, id), reply.replyTo)
-      } catch (error) {
-        const outcome = classifySendError(error, 30_000).kind
-        if (outcome !== 'ambiguous' && outcome !== 'permanent') throw error
-        // Retrying an ambiguous Telegram response can post the result twice.
-        writeDeadLetter(paths, 'outbound', { type: 'codex-result', messageId, outcome,
-          reply: { ...reply, text: redactSecrets(reply.text, secrets) } })
-        if (inbox.active?.outcome.stage !== 'ready' || !inbox.active.outcome.continueGoal) inbox.finish(messageId)
-        throw error
-      }
-      inbox.complete(messageId, { ...reply, text: '' })
-      let failed = 0
+      await sendFinalText(reply.text, reply.files.length > 0, reply.replyTo, messageId)
       for (const [index, file] of reply.files.entries()) {
-        try {
-          await withoutDeletedQuote(id => sendAttachment(telegram, ownerChat, workspace, file, id), reply.replyTo)
-        } catch { failed++ }
-        inbox.complete(messageId, { ...reply, text: '', files: reply.files.slice(index + 1) })
+        const key = 'file:' + index
+        await deliverReplyPart(inbox.replyPart(messageId, key), state => inbox.setReplyPart(messageId, key, state),
+          () => withoutDeletedQuote(id => sendAttachment(telegram, ownerChat, workspace, file, id), reply.replyTo))
       }
-      if (failed) {
-        log.warn('Codex attachment delivery failed', { count: failed })
-        await send('Не удалось отправить вложения: ' + failed + '. Файлы должны находиться в рабочей папке и весить не больше 50 МБ.')
+      const outcome = inbox.active?.outcome
+      const parts = outcome?.stage === 'ready' ? Object.values(outcome.delivery ?? {}) : []
+      const count = (state: PartStatus) => parts.filter(part => part === state).length
+      const failed = count('failed')
+      const uncertain = count('uncertain')
+      if (failed || uncertain) {
+        writeDeadLetter(paths, 'outbound', { type: 'codex-result', messageId, failed, uncertain,
+          reply: { ...reply, text: redactSecrets(reply.text, secrets), files: reply.files.map(file => redactSecrets(file, secrets)) } })
+        await send([
+          failed && 'Не удалось доставить частей ответа: ' + failed + '.',
+          uncertain && 'Не удалось подтвердить доставку частей ответа: ' + uncertain + '.',
+          'Текст доступен через /cc export.',
+        ].filter(Boolean).join('\n'))
       }
     }
 
@@ -1341,9 +1391,11 @@ async function main(): Promise<void> {
       const id = active.messages[0]!.message_id
       try {
         await deliverReply(reply, id)
+        deliveryRetryAt = 0
       } catch (error) {
-        if (!continueGoal) throw error
-        log.warn('Could not deliver the interim message before automatic continuation')
+        const limited = parse429(error)
+        if (limited) deliveryRetryAt = Date.now() + limited.retryAfter * 1000
+        throw error
       }
       if (stopping) return
       if (continueGoal && active.work?.continuation) {
@@ -1457,7 +1509,7 @@ async function main(): Promise<void> {
           log.info('Codex reply delivered', { input_type: inputType })
         } catch {
           progressResult = 'Работа завершилась с ошибкой'
-          if (!stopping) await send('Не удалось завершить задачу Codex.')
+          if (!stopping && inbox.active?.outcome.stage !== 'ready') await send('Не удалось завершить задачу Codex.')
         } finally {
           if (!goalActive) approvals?.cancelAll()
           cancelMedia = undefined
@@ -1469,7 +1521,7 @@ async function main(): Promise<void> {
         task = undefined
         if (inbox.active && !stopping) {
           recoveringInbox = true
-          recoveryTimer = setTimeout(() => { void resumeRecoveredInbox() }, 3000)
+          recoveryTimer = setTimeout(() => { void resumeRecoveredInbox() }, inboxRetryDelay())
         } else startNext()
       })
     }
@@ -1491,8 +1543,15 @@ async function main(): Promise<void> {
         log.warn('Could not restore the Codex goal status')
       }
     } else setGoalActive(false)
+    function inboxRetryDelay(): number {
+      return Math.min(2_147_483_647, Math.max(3000, deliveryRetryAt - Date.now()))
+    }
     async function resumeRecoveredInbox(): Promise<void> {
       if (stopping) return
+      if (deliveryRetryAt > Date.now()) {
+        recoveryTimer = setTimeout(() => { void resumeRecoveredInbox() }, inboxRetryDelay())
+        return
+      }
       const epoch = stopEpoch
       try {
         inbox.retryClaim()
@@ -1537,7 +1596,7 @@ async function main(): Promise<void> {
       } catch {
         log.warn('Could not yet verify the previous Codex turn before resuming the inbox')
       }
-      if (!stopping) recoveryTimer = setTimeout(() => { void resumeRecoveredInbox() }, 3000)
+      if (!stopping) recoveryTimer = setTimeout(() => { void resumeRecoveredInbox() }, inboxRetryDelay())
     }
     if (env.TELEGRAM_WEBHOOK_TOKEN && env.TELEGRAM_WEBHOOK_PORT !== undefined) {
       externalTasks = await startExternalTasks(env.TELEGRAM_WEBHOOK_PORT, env.TELEGRAM_WEBHOOK_TOKEN, ownerChat, (message, id) => {
