@@ -32,6 +32,7 @@ import { gateTelegramMessage } from '../telegram/gate.js'
 import { TelegramPoller, tokenLock } from '../telegram/poller.js'
 import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
+import { removeOwnPinService } from './pin-service.js'
 import { CardCleanup } from './card-cleanup.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
 import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
@@ -1424,6 +1425,12 @@ async function main(): Promise<void> {
       })
     }
 
+    // Registered before the generic handler, which ignores bot senders and would swallow it.
+    bot.on('message:pinned_message', async (ctx, next) => {
+      if (!removeOwnPinService(ctx.message, {
+        botId: bot.botInfo.id, remove: () => ctx.deleteMessage(), warn: (message, context) => log.warn(message, context),
+      })) await next()
+    })
     bot.on('message', async ctx => {
       if (stopping || ctx.chat.type !== 'private' || ctx.from.is_bot || ctx.from.id !== ownerId) return
       const decision = gateTelegramMessage({
