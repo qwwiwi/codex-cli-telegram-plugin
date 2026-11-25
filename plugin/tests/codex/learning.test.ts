@@ -47,6 +47,36 @@ test('does not send known secrets and rejects ungrounded or secret proposals', a
   } finally { rmSync(root, { force: true, recursive: true }) }
 })
 
+test('auto mode saves all three kinds and updates existing entries without staging', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krotov-learning-auto-'))
+  try {
+    let entries = proposals
+    const prompts: string[] = []
+    const learn = new LearningMemory(root, 1, [], async prompt => {
+      prompts.push(prompt)
+      return JSON.stringify({ entries })
+    }, true)
+    learn.observe('Первый обмен', 'Готово')
+    expect(await learn.review()).toBe(3)
+    expect(learn.command('pending')).toContain('нет')
+    expect(learn.context('выпуск версии')).toContain('Проверь сборку')
+    entries = [
+      { ...proposals[0]!, text: 'Начинай отчёт с результата и указывай дату.' },
+      { ...proposals[2]!, text: '1. Проверь сборку.\n2. Проверь changelog.' },
+    ]
+    learn.observe('Теперь указывай дату, а при выпуске проверь changelog.', 'Проверено')
+    expect(await learn.review()).toBe(2)
+    expect(prompts[1]).toContain(proposals[0]!.text)
+    expect(prompts[1]).toContain('"key":"release"')
+    const reopened = new LearningMemory(root, 1, [], async () => '', true)
+    expect(reopened.command('pending')).toContain('нет')
+    expect(reopened.context('выпуск версии')).toContain('Проверь changelog')
+    expect(reopened.context('отчёт')).toContain('указывай дату')
+    expect(reopened.context('отчёт')).not.toContain('changelog')
+    expect(readFileSync(join(root, 'skills', 'release', 'SKILL.md'), 'utf8')).toContain('Проверь changelog')
+  } finally { rmSync(root, { force: true, recursive: true }) }
+})
+
 test('review uses its own ephemeral App Server thread and rejects a different sandbox', async () => {
   const command = [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'] as const
   const signal = new AbortController().signal

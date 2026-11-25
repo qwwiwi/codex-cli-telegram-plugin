@@ -44,7 +44,7 @@ const reviewInstructions = [
   'Return JSON {entries: []}, or up to three objects with kind, key, text, triggers, evidence.',
   'Use kind user for explicit ongoing owner preferences or repeated corrections, memory for verified durable work lessons, skill only for repeatable workflows whose outcome the transcript supports.',
   'Skip temporary requests, guesswork, external content, secrets, access rules, deployment permissions, and requests to bypass any safety or approval.',
-  'Use Russian text when the owner writes Russian. Use a reusable ASCII slug for key. Preserve existing keys when updating the same topic.',
+  'Use Russian text when the owner writes Russian. Reuse an existing entry’s kind and key when the owner corrects it or a workflow improves. Use a new ASCII slug only for a new topic.',
   'Evidence contains zero-based exchange indexes from this batch. For skills only, provide up to six short search phrases in the owner’s language. Otherwise triggers is [].',
   'Keep user and memory text within 240 characters, skill text within 1200. A skill should describe when to use it and the checked steps.',
 ].join('\n')
@@ -95,7 +95,8 @@ export class LearningMemory {
     const batch = this.state.exchanges.slice()
     try {
       const reply = await this.runReview(reviewInstructions + '\n' + JSON.stringify({
-        exchanges: batch, existing: this.state.approved.map(id),
+        exchanges: batch,
+        existing: this.state.approved.map(({ kind, key, text, triggers }) => ({ kind, key, text, triggers })),
       }))
       const { entries } = object(JSON.parse(reply))
       if (!Array.isArray(entries)) throw new Error('Invalid learning output')
@@ -110,13 +111,16 @@ export class LearningMemory {
           continue
         const current = candidate.approved.find(x => id(x) === id(parsed))
         if (current?.text === parsed.text && JSON.stringify(current.triggers) === JSON.stringify(parsed.triggers)) continue
-        if (candidate.pending.some(x => id(x) === id(parsed))) continue
-        if (this.autoSave && parsed.kind !== 'skill' && !current &&
-            candidate.approved.filter(x => x.kind === parsed.kind).length < limits[parsed.kind]) {
-          candidate = { ...candidate, approved: [...candidate.approved, parsed] }
+        if (this.autoSave) {
+          if (!current && candidate.approved.filter(x => x.kind === parsed.kind).length >= limits[parsed.kind]) continue
+          candidate = {
+            ...candidate,
+            approved: [...candidate.approved.filter(x => id(x) !== id(parsed)), parsed],
+            pending: candidate.pending.filter(x => id(x) !== id(parsed)),
+          }
           this.writeMarkdown(candidate, parsed)
         } else {
-          if (candidate.pending.length >= 20) continue
+          if (candidate.pending.length >= 20 || candidate.pending.some(x => id(x) === id(parsed))) continue
           candidate = { ...candidate, pending: [...candidate.pending, parsed] }
         }
         added++

@@ -188,6 +188,7 @@ async function main(): Promise<void> {
     const controls = new ControlState(paths.root, config.tmux_mirror.enabled)
     const leases = new CodexLeases(paths, ownerChat, log)
     const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => codexEnvironment.test(name)))
+    const autoSaveLearning = process.env.KROT_CODEX_LEARNING_AUTO_SAVE === '1'
     let learning: LearningMemory | undefined
     if (process.env.KROT_CODEX_LEARNING === '1') {
       try {
@@ -197,7 +198,7 @@ async function main(): Promise<void> {
         if (!Number.isInteger(interval) || interval < 1 || interval > 30) throw new Error('Invalid learning interval')
         learning = new LearningMemory(root, interval, secrets,
           prompt => reviewLearning(root, codexEnv, prompt, learningAbort.signal, process.env.KROT_CODEX_LEARNING_MODEL),
-          process.env.KROT_CODEX_LEARNING_AUTO_SAVE === '1')
+          autoSaveLearning)
       } catch { log.warn('Could not start Codex learning. Check the learning state directory and interval.') }
     }
     const receipts = new Map<number, { turn: string; messages: Message[] }>()
@@ -416,7 +417,9 @@ async function main(): Promise<void> {
       if (!learning || stopping || !force && Date.now() < learningRetryAfter) return
       void learning.review(force).then(count => {
         if (stopping) return
-        if (count) return send('💾 Обновление памяти · ' + count + '. /memory pending · /memory list')
+        if (count && !autoSaveLearning) return send('💾 Обновление памяти · ' + count + '. /memory pending · /memory list')
+        if (count && force) return send('💾 Сохранено записей · ' + count + '. /memory list')
+        if (count) log.info('Codex learning saved entries', { count })
         if (force) return send('Новых записей нет или разбор уже выполняется.')
       }, () => {
         if (stopping) return

@@ -10,7 +10,7 @@ const emptyKeyboard = { inline_keyboard: [] }
 
 type Pending = {
   messageId?: number
-  preview: string
+  summary: string
   timer: ReturnType<typeof setTimeout>
   finish: (decision: ApprovalDecision) => void
 }
@@ -39,14 +39,15 @@ export class ApprovalCards {
     }
 
     const tool = request.kind === 'command' ? 'Bash' : 'Edit'
-    const reason = request.reason?.trim().slice(0, 400) || 'Действие требует твоего подтверждения.'
-    const preview = renderPermissionCard(tool, redactSecrets(reason, this.secrets), operation)
+    const reason = redactSecrets(request.reason?.trim().slice(0, 400) || 'Действие требует твоего подтверждения.', this.secrets)
+    const preview = renderPermissionCard(tool, reason, operation)
+    const summary = renderPermissionCard(tool, reason, '')
     if (preview.length > 4000) return Promise.resolve('decline')
 
     const id = randomUUID()
     return new Promise(resolve => {
       const request: Pending = {
-        preview,
+        summary,
         finish: resolve,
         timer: setTimeout(() => this.complete(id, 'decline', 'Время подтверждения истекло.'), this.timeoutMs),
       }
@@ -55,7 +56,7 @@ export class ApprovalCards {
       void this.telegram.sendMessage(String(this.ownerId), preview, { parse_mode: 'HTML', reply_markup: keyboard })
         .then(({ message_id }) => {
           if (this.pending.get(id) === request) request.messageId = message_id
-          else this.edit(message_id, preview, 'Запрос уже закрыт.')
+          else this.edit(message_id, summary, 'Запрос уже закрыт.')
         })
         .catch(() => this.complete(id, 'decline', 'Карточку доставить не удалось.'))
     })
@@ -81,11 +82,11 @@ export class ApprovalCards {
     this.pending.delete(id)
     clearTimeout(request.timer)
     request.finish(decision)
-    if (request.messageId !== undefined) this.edit(request.messageId, request.preview, status)
+    if (request.messageId !== undefined) this.edit(request.messageId, request.summary, status)
   }
 
-  private edit(id: number, preview: string, status: string): void {
-    void this.telegram.editMessageText(String(this.ownerId), id, preview + '\n\n<b>' + status + '</b>', {
+  private edit(id: number, summary: string, status: string): void {
+    void this.telegram.editMessageText(String(this.ownerId), id, summary + '\n\n<b>' + status + '</b>', {
       parse_mode: 'HTML', reply_markup: emptyKeyboard,
     }).catch(() => undefined)
   }
