@@ -22,8 +22,8 @@ type Settings = {
   onActivity?: (event: CodexEvent, currentThread: string | null) => void
   mayRunGoal?: (threadId: string) => boolean
   onGoalResult?: (threadId: string, result: Result) => void
-  approve?: (request: ApprovalRequest) => Promise<ApprovalDecision>
-  ask?: (questions: unknown) => Promise<Record<string, { answers: string[] }>>
+  approve?: (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>
+  ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
 }
 
 type Result = { status: 'completed' | 'interrupted' | 'failed'; text: string }
@@ -44,6 +44,7 @@ type Turn = {
 }
 
 export class CodexSession {
+  private readonly pendingServerRequests = new Map<number | string, { threadId: string; abort: AbortController }>()
   private readonly rpc: CodexRpc
   private threadId: string | null = null
   private needsResume = false
@@ -146,7 +147,7 @@ export class CodexSession {
 
   async goal(): Promise<Record<string, unknown> | null> {
     if (!this.threadId) return null
-    const threadId = await this.attachGoalThread()
+    const threadId = this.needsResume ? await this.attachGoalThread() : this.threadId
     const response = await this.rpc.request('thread/goal/get', { threadId })
     return response.goal ? object(response.goal) : null
   }
@@ -353,6 +354,13 @@ export class CodexSession {
   }
 
   private receive(event: CodexEvent): void {
+    if (event.method === 'serverRequest/resolved') {
+      const { requestId, threadId } = event.params
+      if (typeof requestId === 'number' || typeof requestId === 'string') {
+        const request = this.pendingServerRequests.get(requestId)
+        if (request && request.threadId === threadId) request.abort.abort()
+      }
+    }
     this.settings.onActivity?.(event, this.threadId)
     const { method, params } = event
     if (typeof params.threadId === 'string' && method !== 'thread/status/changed' &&
@@ -423,11 +431,14 @@ export class CodexSession {
     }
   }
 
-  private async requestApproval({ method, params }: CodexServerRequest) {
+  private async requestApproval({ id, method, params }: CodexServerRequest) {
     if (method === 'item/tool/requestUserInput') {
       const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active
       if (!current || current.stop || current.threadId !== params.threadId || current.id !== params.turnId) return { answers: {} }
-      return { answers: await this.settings.ask?.(params.questions) ?? {} }
+      const ask = this.settings.ask
+      return { answers: ask
+        ? await this.withServerRequest(id, current.threadId, signal => ask(params.questions, signal))
+        : {} }
     }
     const commandRequest = method === 'item/commandExecution/requestApproval'
     if (!commandRequest && method !== 'item/fileChange/requestApproval') return undefined
@@ -446,12 +457,18 @@ export class CodexSession {
     const target = commandRequest ? params.command
       : typeof params.itemId === 'string' ? current.fileChanges.get(params.itemId)?.join('\n') : undefined
     if (typeof target !== 'string' || !target.trim()) return { decision: 'decline' }
-    const decision = await approve({
+    const decision = await this.withServerRequest(id, current.threadId, signal => approve({
       kind: commandRequest ? 'command' : 'file',
       target,
       ...(typeof params.cwd === 'string' ? { cwd: params.cwd } : {}),
       ...(typeof params.reason === 'string' ? { reason: params.reason } : {}),
-    }).catch(() => 'decline' as const)
+    }, signal)).catch(() => 'decline' as const)
     return { decision: (this.active === current || this.goalTurn === current) && !current.stop ? decision : 'cancel' }
+  }
+
+  private async withServerRequest<T>(id: number | string, threadId: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const abort = new AbortController()
+    this.pendingServerRequests.set(id, { threadId, abort })
+    try { return await run(abort.signal) } finally { this.pendingServerRequests.delete(id) }
   }
 }

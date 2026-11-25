@@ -47,17 +47,18 @@ export class QuestionCards {
 
   get isPending(): boolean { return this.current !== undefined }
 
-  async ask(raw: unknown): Promise<Answer> {
+  async ask(raw: unknown, signal?: AbortSignal): Promise<Answer> {
     const answers: Answer = Object.create(null)
     if (!Array.isArray(raw)) return answers
     for (const question of raw.slice(0, 4).map(object)) {
+      if (signal?.aborted) break
       if (typeof question.id !== 'string' || typeof question.question !== 'string' || question.isSecret) continue
       const options = Array.isArray(question.options) ? question.options.slice(0, 6).map(object).flatMap(option =>
         typeof option.label === 'string' ? [{ label: option.label,
           ...(typeof option.description === 'string' ? { description: option.description } : {}),
         }] : []) : []
       const answer = await this.show(question.question, options, question.isOther === true || options.length === 0,
-        question.multiSelect === true && options.length > 1)
+        question.multiSelect === true && options.length > 1, signal)
       if (answer === undefined) break
       answers[question.id] = { answers: answer }
     }
@@ -93,7 +94,7 @@ export class QuestionCards {
 
   cancel(): void { this.current?.answer() }
 
-  private show(question: string, choices: Choice[], other: boolean, multi: boolean): Promise<string[] | undefined> {
+  private show(question: string, choices: Choice[], other: boolean, multi: boolean, signal?: AbortSignal): Promise<string[] | undefined> {
     if (this.current) return Promise.resolve(undefined)
     const id = randomUUID()
     const safe = (text: string) => redactSecrets(text, this.secrets)
@@ -121,6 +122,7 @@ export class QuestionCards {
     }
     return new Promise(resolve => {
       let updates = Promise.resolve()
+      const cancel = () => pending.answer()
       const pending: Pending = { id, options, other, ...(selected ? { selected } : {}), paint: () => {
         updates = updates.then(async () => {
           if (this.current === pending && pending.messageId !== undefined) {
@@ -131,11 +133,13 @@ export class QuestionCards {
         if (this.current !== pending) return
         this.current = undefined
         clearTimeout(timer)
+        signal?.removeEventListener('abort', cancel)
         if (pending.messageId !== undefined) void updates.then(() => close(pending.messageId!))
         resolve(value)
       } }
       const timer = setTimeout(() => pending.answer(), this.options.timeoutMs)
       this.current = pending
+      signal?.addEventListener('abort', cancel, { once: true })
       void this.api.sendMessage(this.chat, body, { reply_markup: keyboard() }).then(({ message_id }) => {
         if (this.current === pending) pending.messageId = message_id
         else close(message_id)

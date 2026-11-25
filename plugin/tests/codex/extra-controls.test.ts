@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createLogger } from '../../src/log.js'
@@ -11,6 +11,7 @@ import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, format
   readClaudeArchive } from '../../src/codex/conversation-export.js'
 import { CodexLeases } from '../../src/codex/lease.js'
 import { QuestionCards } from '../../src/codex/questions.js'
+import { readHandoffContext } from '../../src/codex/handoff-context.js'
 
 test('persists mirror, model and a bounded conversation history', () => {
   const root = mkdtempSync(join(tmpdir(), 'krot-controls-'))
@@ -92,6 +93,23 @@ test('exports conversational text with secrets redacted and internal tools exclu
   expect(report).toContain('[Отправлено вложение]')
   expect(report).not.toMatch(/tool output|internal update|secret-smoke|\/workspace\/out|\[private\]|private preference|94530/)
   expect(report).not.toMatch(/KROT_CONTINUE|Служебный второй|Служебный асинхронный/)
+})
+
+test('bounds and redacts handoff context and excludes it from the exported conversation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-handoff-context-'))
+  try {
+    const hot = join(root, 'core', 'hot')
+    mkdirSync(hot, { recursive: true })
+    writeFileSync(join(hot, 'handoff.md'), 'Old entry\n' + 'x'.repeat(6200) + '\nRecent decision: secret-handoff-key\n')
+    const context = await readHandoffContext(root, ['secret-handoff-key'])
+    expect(context).toContain('Recent decision: [REDACTED]')
+    expect(context).not.toContain('Old entry')
+    const report = formatConversation([{ items: [{ type: 'userMessage', content: [
+      { type: 'text', text: context + '\n\nНовый вопрос' },
+    ] }] }], false, [])
+    expect(report).toContain('Новый вопрос')
+    expect(report).not.toContain('Recent decision')
+  } finally { rmSync(root, { force: true, recursive: true }) }
 })
 
 test('a completed turn consumes only a mandate offered to that turn', async () => {

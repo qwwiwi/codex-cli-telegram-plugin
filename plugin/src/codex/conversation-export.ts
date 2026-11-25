@@ -10,6 +10,7 @@ import { followUpInstructions, hideContinuationMarker } from './continuation.js'
 import { object } from './rpc.js'
 import { hideQuestionMarker } from './questions.js'
 import { goalLeasePrefix, hideLeaseCompletions } from './lease.js'
+import { handoffContextPrefix } from './handoff-context.js'
 
 export function formatConversation(turns: unknown[], partial: boolean, secrets: readonly string[]): string {
   const sections = ['# Диалог example-agentа', ...(partial ? ['Экспорт содержит последние 100 ходов.'] : [])]
@@ -30,6 +31,7 @@ export function formatConversation(turns: unknown[], partial: boolean, secrets: 
             .replace(followUpInstructions + '\n\n', '')
             .replace(/^Действия в личке Telegram доступны во время работы\.[^\n]*\n\n/mu, '')
             .replace(/^Память прошлых задач \(JSON\)\.[^\n]*\n\[[^\n]*\]\n\n/mu, '')
+            .replace(new RegExp('^' + handoffContextPrefix + '[^\\n]*\\n"[^\\n]*"\\n\\n', 'mu'), '')
             .split('\n').filter(line => !line.startsWith(chatContextPrefix) &&
               !/^\s*KROT_(?:CONTINUE|QUESTION|LEASE)_[a-f0-9-]{36}(?:\s|$)/u.test(line)).join('\n')
         }).join('\n').trim()

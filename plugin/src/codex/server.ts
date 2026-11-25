@@ -31,7 +31,7 @@ import { TelegramPoller, tokenLock } from '../telegram/poller.js'
 import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
-import { codexCommands, isStatusQuestion, parseCodexCommand } from './commands.js'
+import { codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import { automaticContinuation, followUpInstructions, hideContinuationMarker, takeContinuation } from './continuation.js'
 import { ControlState } from './control-state.js'
 import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, formatConversation,
@@ -40,6 +40,7 @@ import { CodexInbox, type InboxReply } from './inbox.js'
 import { startExternalTasks } from './external.js'
 import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-delivery.js'
 import { deliverReplyPart, type PartStatus } from './reply-delivery.js'
+import { readHandoffContext } from './handoff-context.js'
 import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   safeActionTarget, type ChatAction } from './chat-actions.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
@@ -244,10 +245,6 @@ async function main(): Promise<void> {
       onActivity: (event, thread) => {
         work.receive(event, thread)
         if (!thread || event.params.threadId !== thread) return
-        if (event.method === 'turn/completed') {
-          const id = object(event.params.turn).id
-          for (const [key, receipt] of receipts) if (receipt.turn === id) receipts.delete(key)
-        }
         if (controls.mirror && event.method === 'item/commandExecution/outputDelta' &&
             typeof event.params.delta === 'string' && typeof event.params.itemId === 'string') {
           mirror ??= new CodexMirror(telegram, ownerChat, secrets)
@@ -370,8 +367,8 @@ async function main(): Promise<void> {
           startNext()
         })
       },
-      ...(approvals ? { approve: request => approvals.request(request) } : {}),
-      ask: input => questions.ask(input),
+      ...(approvals ? { approve: (request, signal) => approvals.request(request, signal) } : {}),
+      ask: (input, signal) => questions.ask(input, signal),
       ...(proxy ? { command: ['/usr/bin/sudo', '-n', '--', proxy] } : {}),
     }, () => {
       if (!stopping) process.exitCode = 1
@@ -545,6 +542,22 @@ async function main(): Promise<void> {
       replyPolicy: text => leases.replyPolicy(redactSecrets(text, secrets), resolveAskGuardMode(config, log)),
       root: paths.root,
       sendFile: (path, target) => sendAttachment(telegram, ownerChat, workspace, path, target),
+      sendReply: (text, target) => withoutDeletedQuote(async id => {
+        const quote = id === undefined ? {} : { reply_to_message_id: id }
+        if (config.richMessages.enabled && !config.richMessages.perChatOptOut.includes(ownerChat) &&
+            contentFitsRichLimits(text) && !carriesExpandableBlockquote(text)) {
+          const result = await telegram.sendRichMessage(ownerChat, text, quote)
+          if ('message_id' in result) return { messageId: result.message_id, rich: true as const }
+        }
+        const html = markdownToTelegramHtml(text)
+        const { message_id: messageId } = splitMessage(html).length === 1
+          ? await telegram.sendMessage(ownerChat, html, { ...quote, parse_mode: 'HTML' }).catch(error => {
+            if (!isTelegramHtmlParseError(error)) throw error
+            return telegram.sendMessage(ownerChat, text, quote)
+          })
+          : await telegram.sendMessage(ownerChat, text, quote)
+        return { messageId }
+      }, target),
       autonomy: async (action, id, resolution) => {
         const messageId = action === 'resolve_question'
           ? loadAutonomyState(paths, ownerChat, log).questions.find(question => question.id === id)?.messageId : undefined
@@ -939,21 +952,24 @@ async function main(): Promise<void> {
             : 'Codex пока не вернул данные о лимитах.')
           return
         }
-        const commandRoot = process.env.KROT_CODEX_COMMANDS_DIR
-        const custom = messageId && commandRoot ? legacyCommand(commandRoot, action, value) : undefined
-        if (custom && messageId) {
-          await acceptInput({
-            message_id: -messageId, date: Math.floor(Date.now() / 1000), text: custom,
-            chat: { id: Number(ownerChat), type: 'private', first_name: 'Telegram' },
-            from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
-          })
-          return
-        }
+        if (messageId && await enqueueCustomCommand(action, value, messageId)) return
         await send(['Команды Codex', '/cc compact', '/cc context', '/cc status', '/cc model [имя]',
           '/cc resume [номер или ID]', '/cc export', '/cc cost', '/cc clear'].join('\n'))
       } catch {
         await send('Codex не смог выполнить /cc ' + action + '.')
       } finally { startNext() }
+    }
+
+    async function enqueueCustomCommand(name: string, args: string, messageId: number): Promise<boolean> {
+      const directory = process.env.KROT_CODEX_COMMANDS_DIR
+      const custom = directory ? legacyCommand(directory, name, args) : undefined
+      if (!custom) return false
+      await acceptInput({
+        message_id: -messageId, date: Math.floor(Date.now() / 1000), text: custom,
+        chat: { id: Number(ownerChat), type: 'private', first_name: 'Telegram' },
+        from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
+      })
+      return true
     }
 
     async function compact(): Promise<void> {
@@ -1291,7 +1307,10 @@ async function main(): Promise<void> {
       const command = ctx.message.forward_origin ? undefined : parseCodexCommand(text, bot.botInfo.username ?? '')
       if (command) {
         if (isChatAction(command.name)) await applyChatAction(command.name, ctx.message, command.args)
-        else await handleCommand(command.name, command.args, ctx.message.message_id)
+        else if (isBuiltInCommand(command.name) ||
+            !await enqueueCustomCommand(command.name, command.args, ctx.message.message_id)) {
+          await handleCommand(command.name, command.args, ctx.message.message_id)
+        }
         markProcessed([ctx.message])
         return
       }
@@ -1452,8 +1471,11 @@ async function main(): Promise<void> {
           const saveTurn = (turnId: string) => {
             try { inbox.assignTurn(first.message_id, turnId) } catch { log.warn('Could not persist the Codex turn ID') }
           }
+          const handoff = memory && config.memory.workspace_path && !codex.status.hasThread
+            ? await readHandoffContext(config.memory.workspace_path, secrets).catch(() => '') : ''
           let result = await codex.run([
             attachmentInstructions, leases.instructions(), agentChatInstructions, chatContext(messages),
+            handoff,
             learning?.context(ownerText ?? input.text) ?? '',
             [autonomyInstructions, continuation?.instructions, leaseCompletion?.instructions,
               !editTarget && question.instructions].filter(Boolean).join(' '), input.text,

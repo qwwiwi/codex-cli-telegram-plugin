@@ -32,8 +32,12 @@ export function isStatusQuestion(text: string): boolean {
   return /^(?:статус|как там|как продвигается|как идет работа|(?:ты )?(?:еще )?работаешь|на каком (?:ты )?этапе|что сейчас делаешь)$/u.test(phrase)
 }
 
+export function isBuiltInCommand(name: string): boolean {
+  return specs.some(spec => spec.command === name)
+}
+
 export function parseCodexCommand(text: string | undefined, username: string) {
-  const match = /^\/([a-z]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/i.exec(text ?? '')
+  const match = /^\/([a-z][a-z0-9_-]*(?::[a-z0-9_-]+)*)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/i.exec(text ?? '')
   if (!match || (match[2] && match[2].toLowerCase() !== username.toLowerCase())) return undefined
   const name = match[1]!.toLowerCase()
   const args = match[3]?.trim() ?? ''

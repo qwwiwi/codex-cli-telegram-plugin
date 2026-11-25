@@ -15,6 +15,21 @@ function fixture() {
   return { cards, messages, edits }
 }
 
+test('a resolved server request closes only its own Telegram card', async () => {
+  const { cards, edits } = fixture()
+  const first = new AbortController()
+  const second = new AbortController()
+  const canceled = cards.request({ kind: 'command', target: 'printf first' }, first.signal)
+  const pending = cards.request({ kind: 'command', target: 'printf second' }, second.signal)
+  await Promise.resolve()
+  first.abort()
+  expect(await canceled).toBe('cancel')
+  expect(cards.isPending).toBe(true)
+  expect(edits[0]?.text).toContain('Запрос закрыт')
+  second.abort()
+  expect(await pending).toBe('cancel')
+})
+
 test('one visible Telegram approval is bound to the owner, chat and message', async () => {
   const { cards, messages, edits } = fixture()
   const result = cards.request({ kind: 'command', target: 'printf test', cwd: '/workspace' })

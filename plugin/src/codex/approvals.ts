@@ -29,7 +29,8 @@ export class ApprovalCards {
     private readonly timeoutMs: number = 120_000,
   ) {}
 
-  request(request: ApprovalRequest): Promise<ApprovalDecision> {
+  request(request: ApprovalRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
+    if (signal?.aborted) return Promise.resolve('cancel')
     const operation = request.cwd ? request.cwd + '\n' + request.target : request.target
     // A redacted or shortened operation is not enough for informed approval.
     if (this.pending.size >= MAX_PENDING_APPROVALS || operation.length > 3000
@@ -46,12 +47,17 @@ export class ApprovalCards {
 
     const id = randomUUID()
     return new Promise(resolve => {
+      const cancel = () => this.complete(id, 'cancel', 'Запрос закрыт.')
       const request: Pending = {
         summary,
-        finish: resolve,
+        finish: decision => {
+          signal?.removeEventListener('abort', cancel)
+          resolve(decision)
+        },
         timer: setTimeout(() => this.complete(id, 'decline', 'Время подтверждения истекло.'), this.timeoutMs),
       }
       this.pending.set(id, request)
+      signal?.addEventListener('abort', cancel, { once: true })
       const keyboard = permissionDecisionKeyboard('krot:approve:' + id + ':a', 'krot:approve:' + id + ':d')
       void this.telegram.sendMessage(String(this.ownerId), preview, { parse_mode: 'HTML', reply_markup: keyboard })
         .then(({ message_id }) => {

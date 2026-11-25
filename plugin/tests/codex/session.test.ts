@@ -82,6 +82,7 @@ test('steers the active turn and receives a reply while the turn is still runnin
   while (!await session.steer('How is it going?', 2)) await Bun.sleep(5)
   expect(await reply).toBe('Follow-up: How is it going?')
   expect(session.isRunning).toBe(true)
+  expect(await session.goal()).toBeNull()
   await session.stop()
   expect((await running).status).toBe('interrupted')
 })

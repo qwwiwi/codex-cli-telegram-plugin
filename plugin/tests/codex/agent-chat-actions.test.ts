@@ -96,3 +96,20 @@ test('reports the actual Telegram IDs and does not repeat a reply if feedback fa
   expect(sends).toBe(1)
   expect(receipts).toEqual([{ request_id: 'r1', action: 'reply', ok: true, message_ids: [24, 25] }])
 })
+
+test('remembers an agent reply sent through the rich renderer for subsequent edits', async () => {
+  const edited: unknown[] = []
+  const actions = new AgentChatActions({
+    async sendMessage() { throw new Error('Expected shared rich sender') },
+    async editMessageText() { throw new Error('Expected rich edit') },
+    async pinChatMessage() {},
+    async unpinChatMessage() {},
+    async setMessageReaction() {},
+  }, '123', {
+    async sendReply() { return { messageId: 55, rich: true } },
+    async editRich(id, text) { edited.push([id, text]) },
+  })
+  expect(await actions.receive('reply-1', '@@TELEGRAM_ACTION {"action":"reply","text":"**Итог**"}', () => true)).toBe(true)
+  expect(await actions.receive('edit-1', '@@TELEGRAM_ACTION {"action":"edit","target":"last_reply","text":"Новый итог"}', () => true)).toBe(true)
+  expect(edited).toEqual([[55, 'Новый итог']])
+})

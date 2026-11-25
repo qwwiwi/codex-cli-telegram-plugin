@@ -84,6 +84,7 @@ type Target = { editable: boolean; reacted: boolean; rich?: true }
 type ActionReceipt = { request_id: string; action: unknown; ok: boolean; message_ids: number[]; hint?: string }
 type AgentChatOptions = {
   root?: string
+  sendReply?: (text: string, target?: number) => Promise<{ messageId: number; rich?: true }>
   sendFile?: (path: string, target?: number) => Promise<number | void>
   editRich?: (id: number, text: string) => Promise<void>
   autonomy?: (action: string, id: string, resolution?: string) => Promise<boolean>
@@ -172,9 +173,11 @@ export class AgentChatActions {
           const policy = this.options.replyPolicy?.(text)
           hint = policy?.hint
           if (policy?.blocked) return false
-          const sent = await this.api.sendMessage(this.ownerChat, text, id === undefined ? {} : { reply_to_message_id: id })
-          messageIds.push(sent.message_id)
-          this.remember(sent.message_id, true, true)
+          const rendered = this.options.sendReply ? await this.options.sendReply(text, id) : undefined
+          const sentId = rendered?.messageId ??
+            (await this.api.sendMessage(this.ownerChat, text, id === undefined ? {} : { reply_to_message_id: id })).message_id
+          messageIds.push(sentId)
+          this.remember(sentId, true, true, rendered?.rich)
         }
         if (sendFile) for (const path of paths) {
           if (!current()) return false

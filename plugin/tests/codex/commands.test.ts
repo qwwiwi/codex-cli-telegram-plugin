@@ -12,6 +12,8 @@ test('hides disabled commands and resolves supported legacy aliases', () => {
   })
   expect(parseCodexCommand('/cc clear', 'examplebot')).toEqual({ name: 'reset', args: '' })
   expect(parseCodexCommand('/stop@anotherbot', 'examplebot')).toBeUndefined()
+  expect(parseCodexCommand('/team:daily-report@ExampleBot с аргументом', 'examplebot'))
+    .toEqual({ name: 'team:daily-report', args: 'с аргументом' })
 })
 
 test('only standalone status questions can bypass the active turn', () => {
