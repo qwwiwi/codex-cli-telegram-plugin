@@ -80,7 +80,7 @@ const autonomyInstructions = 'Для большой задачи составь 
   'Подтверждения и границы среды остаются обязательными.'
 
 // Keep Telegram credentials and unrelated service environment out of Codex.
-const codexEnvironment = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TMPDIR|TEMP|TMP|CODEX_HOME|USERPROFILE|LOCALAPPDATA|APPDATA|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)$/i
+const codexEnvironment = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TMPDIR|TEMP|TMP|CODEX_HOME|USERPROFILE|LOCALAPPDATA|APPDATA|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|GH_CONFIG_DIR)$/i
 
 async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
