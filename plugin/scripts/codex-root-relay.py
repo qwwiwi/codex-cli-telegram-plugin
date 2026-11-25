@@ -50,7 +50,7 @@ def valid_answers(result):
     )
 
 
-def allowed_request(message, opened):
+def allowed_request(message, opened, approval_threads=()):
     method = message.get("method")
     params = message.get("params", {})
     if method not in ALLOWED or not isinstance(params, dict) or not params.keys() <= ALLOWED[method]:
@@ -74,7 +74,8 @@ def allowed_request(message, opened):
         return params == {"limit": 100, "includeHidden": False}
     if method == "thread/read":
         thread = params.get("threadId")
-        return isinstance(thread, str) and thread in opened and params.get("includeTurns") is False
+        return (isinstance(thread, str) and (thread in opened or thread in approval_threads)
+                and params.get("includeTurns") is False)
     if method in {"thread/goal/get", "thread/goal/set", "thread/goal/clear"}:
         thread = params.get("threadId")
         if not isinstance(thread, str) or thread not in opened:
@@ -183,13 +184,18 @@ async def relay():
                         write({"id": message["id"], "result": {"scheduled": True}})
                     continue
                 if "method" in message:
-                    accepted = allowed_request(message, opened)
+                    approval_threads = {
+                        thread for method, thread in pending.values() if method in APPROVALS
+                    }
+                    accepted = allowed_request(message, opened, approval_threads)
                     if accepted and "id" in message and message["method"] in (
                         "thread/start", "thread/resume", "thread/fork", "thread/turns/list"
                     ):
                         requests[message["id"]] = message["method"]
+                    if accepted and message["method"] == "thread/read" and message["params"]["threadId"] not in opened:
+                        requests[message["id"]] = "child-metadata"
                 elif message.get("id") in pending:
-                    method = pending.pop(message["id"])
+                    method, _ = pending.pop(message["id"])
                     decision = (message.get("result") or {}).get("decision")
                     accepted = (
                         "error" in message
@@ -208,12 +214,19 @@ async def relay():
             async for value in server:
                 message = json.loads(value)
                 if "method" in message and "id" in message:
-                    pending[message["id"]] = message["method"]
+                    thread = (message.get("params") or {}).get("threadId")
+                    pending[message["id"]] = (message["method"], thread if isinstance(thread, str) else None)
                 elif message.get("id") in requests:
                     method = requests.pop(message["id"])
                     result = message.get("result")
                     if isinstance(result, dict):
-                        if method == "thread/turns/list":
+                        if method == "child-metadata":
+                            thread = result.get("thread") or {}
+                            message["result"] = {"thread": {
+                                key: thread.get(key)
+                                for key in ("id", "cwd", "source", "parentThreadId", "sessionId")
+                            }}
+                        elif method == "thread/turns/list":
                             for turn in result.get("data", []):
                                 turn["items"] = [
                                     item for item in turn.get("items", [])

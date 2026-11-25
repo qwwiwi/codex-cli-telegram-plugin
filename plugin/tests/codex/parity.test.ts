@@ -34,6 +34,9 @@ test('external task endpoint requires its bearer and owner, and uses the caller 
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('Expected TCP address')
     expect(address.address).toBe('127.0.0.1')
+    for (const route of ['/health', '/healthz']) {
+      expect(await (await fetch('http://127.0.0.1:' + address.port + route)).json()).toEqual({ status: 'ok' })
+    }
     const submit = (chatId: number, token = 'synthetic-test-secret') => fetch(
       'http://127.0.0.1:' + address.port + '/hooks/agent', {
         method: 'POST', headers: { authorization: 'Bearer ' + token, 'idempotency-key': 's-job' },

@@ -1639,7 +1639,8 @@ async function main(): Promise<void> {
         if (outcome === 'accepted') startNext()
         return outcome
       }, approvals && policyToken && /^[a-z0-9_-]{32,128}$/i.test(policyToken) && policyToken !== env.TELEGRAM_WEBHOOK_TOKEN
-        ? { token: policyToken, request: request => stopping ? Promise.resolve('decline') : approvals.request(request) }
+        ? { token: policyToken, request: request => stopping ? Promise.resolve('decline')
+          : session ? session.requestPolicyApproval(request) : approvals.request(request) }
         : undefined)
     }
     if (recoveringInbox) void resumeRecoveredInbox()

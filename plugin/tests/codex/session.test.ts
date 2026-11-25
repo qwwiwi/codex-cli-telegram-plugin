@@ -3,19 +3,20 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CodexSession, type ApprovalRequest } from '../../src/codex/session.js'
+import { startExternalTasks } from '../../src/codex/external.js'
 import { automaticContinuation, hideContinuationMarker } from '../../src/codex/continuation.js'
 
 const dirs: string[] = []
 const sessions: CodexSession[] = []
 
 function fixture(auth: string = 'chatgpt', approve?: (request: ApprovalRequest) => Promise<'accept' | 'decline' | 'cancel'>,
-  onActivity?: ConstructorParameters<typeof CodexSession>[0]['onActivity']) {
+  onActivity?: ConstructorParameters<typeof CodexSession>[0]['onActivity'], env = process.env) {
   const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-test-'))
   dirs.push(cwd)
   const stateFile = join(cwd, 'thread.json')
   const create = () => {
     const session = new CodexSession({
-      cwd: import.meta.dir, stateFile, env: process.env,
+      cwd: import.meta.dir, stateFile, env,
       command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), auth],
       ...(approve ? { approve } : {}),
       ...(onActivity ? { onActivity } : {}),
@@ -175,4 +176,41 @@ test('relays one active command approval and rejects mismatched or incomplete re
   expect((await session.run('approval:incomplete')).text).toBe('decline')
   expect(seen).toHaveLength(1)
   expect(seen[0]).toMatchObject({ kind: 'command', target: 'printf test', cwd: '/workspace' })
+})
+
+test('relays a verified subagent approval and rejects a different child turn', async () => {
+  const seen: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async approval => {
+    seen.push(approval)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  expect((await session.run('approval:child')).text).toBe('accept')
+  expect((await session.run('approval:child-wrong-turn')).text).toBe('decline')
+  expect(seen).toHaveLength(1)
+  expect(seen[0]).toMatchObject({ kind: 'command', target: 'printf test' })
+})
+
+test('reuses one YAML decision for the same Codex command and asks again for a different command', async () => {
+  const seen: ApprovalRequest[] = []
+  let session: CodexSession
+  const server = await startExternalTasks(0, 'test-agent', '123', () => 'accepted', {
+    token: 'test-policy', request: request => session.requestPolicyApproval(request),
+  })
+  try {
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('No fixture port')
+    session = fixture('chatgpt', async approval => {
+      seen.push(approval)
+      return 'accept'
+    }, undefined, { ...process.env, KROT_TEST_POLICY_URL: `http://127.0.0.1:${address.port}/hooks/permission/request` }).create()
+    await session.initialize()
+    expect((await session.run('approval:policy')).text).toBe('accept')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.reason).toContain('вне песочницы')
+    expect((await session.run('approval:policy-mismatch')).text).toBe('accept')
+    expect(seen.map(request => request.target)).toEqual([
+      'printf test', 'printf test', "/usr/bin/bash -lc 'printf other'",
+    ])
+  } finally { server.close() }
 })

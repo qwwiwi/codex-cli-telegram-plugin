@@ -5,6 +5,7 @@ let threadId = ''
 let turnNumber = 0
 let activeTurn = ''
 let pendingApproval = ''
+let childTurn = ''
 const goalState: { current: { objective: string; status: string; origin: string } | null } = { current: null }
 
 for await (const line of createInterface({ input: process.stdin })) {
@@ -64,6 +65,12 @@ for await (const line of createInterface({ input: process.stdin })) {
       if (params.threadId !== threadId) break
       respond({ data: [{ items: [{ type: 'agentMessage', text: 'Example' }] }], nextCursor: null })
       break
+    case 'thread/read':
+      respond({ thread: {
+        id: params.threadId, cwd: process.cwd(), sessionId: threadId, parentThreadId: threadId,
+        source: { subAgent: { thread_spawn: { parent_thread_id: threadId, depth: 1 } } },
+      } })
+      break
     case 'thread/goal/get':
       respond({ goal: goalState.current })
       break
@@ -105,12 +112,30 @@ for await (const line of createInterface({ input: process.stdin })) {
         break
       }
       if (params.input[0].text.startsWith('approval:')) {
+        const scenario = params.input[0].text
         respond({ turn: { id: activeTurn } })
+        emit({ method: 'turn/started', params: { threadId, turn: { id: activeTurn } } })
+        childTurn = activeTurn + '-child'
+        if (scenario.startsWith('approval:child')) {
+          emit({ method: 'turn/started', params: { threadId: 'child', turn: { id: childTurn } } })
+        }
+        if (scenario.startsWith('approval:policy')) {
+          const policy = { threadId, turnId: activeTurn, itemId: 'item' }
+          const reply = await fetch(process.env.KROT_TEST_POLICY_URL!, {
+            method: 'POST', headers: { authorization: 'Bearer test-policy', 'content-type': 'application/json' },
+            body: JSON.stringify({ kind: 'command', target: 'printf test', cwd: '/workspace', operation: policy }),
+          })
+          if (!reply.ok) throw new Error('Policy fixture failed')
+        }
         pendingApproval = 'approval-' + turnNumber
         emit({ id: pendingApproval, method: 'item/commandExecution/requestApproval', params: {
-          threadId: params.input[0].text === 'approval:foreign' ? 'foreign' : threadId,
-          turnId: activeTurn, itemId: 'item', command: 'printf test', cwd: '/workspace',
-          ...(params.input[0].text === 'approval:incomplete' ? { command: undefined } : {}),
+          threadId: scenario === 'approval:foreign' ? 'foreign' : scenario.startsWith('approval:child') ? 'child' : threadId,
+          turnId: scenario === 'approval:child' ? childTurn : activeTurn,
+          itemId: 'item',
+          command: scenario === 'approval:policy' ? "/usr/bin/bash -lc 'printf test'"
+            : scenario === 'approval:policy-mismatch' ? "/usr/bin/bash -lc 'printf other'" : 'printf test',
+          cwd: '/workspace',
+          ...(scenario === 'approval:incomplete' ? { command: undefined } : {}),
         } })
         break
       } else if (params.input[0].text !== 'wait') {

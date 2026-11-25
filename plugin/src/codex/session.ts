@@ -9,6 +9,9 @@ export type ApprovalRequest = {
   cwd?: string
   reason?: string
 }
+export type PolicyApprovalRequest = ApprovalRequest & {
+  operation?: { threadId: string; turnId: string; itemId: string }
+}
 
 type Settings = {
   cwd: string
@@ -33,14 +36,35 @@ type SessionStatus = {
   usage: { usedTokens: number; windowTokens: number } | undefined
 }
 
-type Turn = {
-  threadId: string
+type Execution = {
   id?: string
+  threadId: string
+  fileChanges: Map<string, string[]>
+}
+
+type Turn = Execution & {
   stop: boolean
   lastText: string
   finalText?: string
-  fileChanges: Map<string, string[]>
+  children: Map<string, Execution>
+  approvedPolicy: Map<string, { target: string; cwd: string; until: number }>
   finish: (result: Result) => void
+}
+
+function recordFileChange(execution: Execution, item: Record<string, unknown>): void {
+  if (item.type !== 'fileChange' || typeof item.id !== 'string' || !Array.isArray(item.changes)) return
+  const changes = item.changes.flatMap(entry => {
+    const change = object(entry)
+    return typeof change.path === 'string' && typeof change.diff === 'string'
+      ? [change.path + '\n' + change.diff] : []
+  })
+  if (changes.length === item.changes.length) execution.fileChanges.set(item.id, changes)
+}
+
+function sameShellCommand(native: string, hook: string): boolean {
+  // Match Codex's observed Bash argv presentation without evaluating shell syntax.
+  const quoted = "'" + hook.replaceAll("'", "'\\''") + "'"
+  return native === hook || native === '/usr/bin/bash -lc ' + quoted || native === '/bin/bash -lc ' + quoted
 }
 
 export class CodexSession {
@@ -289,7 +313,9 @@ export class CodexSession {
       if (this.stopRequested) return { status: 'interrupted', text: '' }
       let finish!: Turn['finish']
       const completed = new Promise<Result>(resolve => { finish = resolve })
-      const turn: Turn = { threadId, stop: false, lastText: '', fileChanges: new Map(), finish }
+      const turn: Turn = {
+        threadId, stop: false, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
+      }
       this.active = turn
       await start(threadId, turn)
       return await completed
@@ -384,7 +410,8 @@ export class CodexSession {
       const threadId = params.threadId
       if (this.goalTurn?.id !== observedId) {
         this.goalTurn = {
-          threadId, id: observedId, lastText: '', stop: false, fileChanges: new Map(),
+          threadId, id: observedId, lastText: '', stop: false,
+          fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(),
           finish: result => {
             if (this.goalTurn?.id === observedId) this.goalTurn = undefined
             this.settings.onGoalResult?.(threadId, result)
@@ -393,6 +420,17 @@ export class CodexSession {
       }
     }
     const active = this.goalTurn?.id === observedId ? this.goalTurn : this.active
+    if (typeof params.threadId === 'string' && params.threadId !== this.threadId && typeof observedId === 'string') {
+      for (const owner of this.runningTurns()) {
+        const child = owner.children.get(params.threadId)
+        if (method === 'turn/started' && !child && owner.children.size < 128) {
+          owner.children.set(params.threadId, { id: observedId, threadId: params.threadId, fileChanges: new Map() })
+        } else if (child?.id === observedId) {
+          if (method === 'item/started') recordFileChange(child, object(params.item))
+          if (method === 'turn/completed') owner.children.delete(params.threadId)
+        }
+      }
+    }
     if (!active || params.threadId !== active.threadId) return
     if (method === 'turn/started') {
       const id = object(params.turn).id
@@ -402,14 +440,7 @@ export class CodexSession {
       if (active.id && params.turnId !== active.id) return
       const item = object(params.item)
       if (typeof item.type === 'string') this.settings.onProgress?.(item.type)
-      if (item.type === 'fileChange' && typeof item.id === 'string' && Array.isArray(item.changes)) {
-        const changes = item.changes.flatMap(entry => {
-          const change = object(entry)
-          return typeof change.path === 'string' && typeof change.diff === 'string'
-            ? [change.path + '\n' + change.diff] : []
-        })
-        if (changes.length === item.changes.length) active.fileChanges.set(item.id, changes)
-      }
+      recordFileChange(active, item)
     } else if (method === 'item/completed') {
       if (active.id && params.turnId !== active.id) return
       const item = object(params.item)
@@ -431,6 +462,53 @@ export class CodexSession {
     }
   }
 
+  private runningTurns(): Turn[] {
+    return [this.active, this.goalTurn].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
+  }
+
+  async requestPolicyApproval({ operation, ...request }: PolicyApprovalRequest): Promise<ApprovalDecision> {
+    const approve = this.settings.approve
+    if (!approve) return 'decline'
+    if (request.kind !== 'command' || !operation || !request.cwd) return approve(request)
+    const matches = this.runningTurns().filter(turn => turn.threadId === operation.threadId)
+      .flatMap(owner => [owner, ...owner.children.values()].filter(execution => execution.id === operation.turnId)
+        .map(execution => ({ owner, execution })))
+    if (matches.length !== 1) return approve(request)
+    const [{ owner, execution }] = matches
+    const decision = await approve({
+      ...request,
+      reason: ['Если эта же команда потребует нативное разрешение, её можно один раз выполнить вне песочницы.', request.reason]
+        .filter(Boolean).join('\n\n'),
+    })
+    if (!this.runningTurns().includes(owner) ||
+        (owner !== execution && owner.children.get(execution.threadId) !== execution)) return 'cancel'
+    if (decision === 'accept' && owner.approvedPolicy.size < 128) {
+      owner.approvedPolicy.set(JSON.stringify([execution.threadId, operation.turnId, operation.itemId]), {
+        target: request.target, cwd: request.cwd, until: Date.now() + 30_000,
+      })
+    }
+    return decision
+  }
+
+  private async approvalExecution(threadId: string, turnId: string): Promise<{ owner: Turn; execution: Execution } | undefined> {
+    const candidates = this.runningTurns()
+    const own = candidates.find(turn => turn.threadId === threadId && turn.id === turnId)
+    if (own) return { owner: own, execution: own }
+    const observing = candidates.filter(turn => turn.children.get(threadId)?.id === turnId)
+    if (!observing.length) return
+    const read = await this.rpc.request('thread/read', { threadId, includeTurns: false }).catch(() => undefined)
+    const thread = object(read?.thread)
+    const spawn = object(object(object(thread.source).subAgent).thread_spawn)
+    const parents = observing.filter(turn => thread.sessionId === turn.threadId &&
+      this.runningTurns().includes(turn) && turn.children.get(threadId)?.id === turnId)
+    if (parents.length !== 1 || thread.id !== threadId || thread.cwd !== this.settings.cwd ||
+        typeof thread.parentThreadId !== 'string' || spawn.parent_thread_id !== thread.parentThreadId ||
+        typeof spawn.depth !== 'number' || !Number.isSafeInteger(spawn.depth) || spawn.depth < 1 ||
+        (spawn.depth === 1 && thread.parentThreadId !== parents[0].threadId)) return
+    const [owner] = parents
+    return { owner, execution: owner.children.get(threadId)! }
+  }
+
   private async requestApproval({ id, method, params }: CodexServerRequest) {
     if (method === 'item/tool/requestUserInput') {
       const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active
@@ -443,27 +521,37 @@ export class CodexSession {
     const commandRequest = method === 'item/commandExecution/requestApproval'
     if (!commandRequest && method !== 'item/fileChange/requestApproval') return undefined
 
-    const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active
     const approve = this.settings.approve
-    if (!approve || !current || current.stop || typeof params.turnId !== 'string'
-        || params.threadId !== current.threadId || (current.id && params.turnId !== current.id)) {
+    if (!approve || typeof params.turnId !== 'string' || typeof params.threadId !== 'string' || typeof params.itemId !== 'string') {
       return { decision: 'decline' }
     }
 
-    if (commandRequest && (params.networkApprovalContext || (params.kind && params.kind !== 'command'))) {
+    if (commandRequest && (params.networkApprovalContext || params.approvalId != null || (params.kind && params.kind !== 'command'))) {
       return { decision: 'decline' }
     }
     if (!commandRequest && params.grantRoot) return { decision: 'decline' }
+    const scope = await this.approvalExecution(params.threadId, params.turnId)
+    if (!scope) return { decision: 'decline' }
+    const { owner, execution } = scope
     const target = commandRequest ? params.command
-      : typeof params.itemId === 'string' ? current.fileChanges.get(params.itemId)?.join('\n') : undefined
+      : execution.fileChanges.get(params.itemId)?.join('\n')
     if (typeof target !== 'string' || !target.trim()) return { decision: 'decline' }
-    const decision = await this.withServerRequest(id, current.threadId, signal => approve({
+    if (commandRequest && (params.environmentId == null || params.environmentId === 'local')) {
+      const key = JSON.stringify([params.threadId, params.turnId, params.itemId])
+      const receipt = owner.approvedPolicy.get(key)
+      owner.approvedPolicy.delete(key)
+      if (receipt && receipt.until >= Date.now() && receipt.cwd === params.cwd && sameShellCommand(target, receipt.target)) {
+        return { decision: 'accept' }
+      }
+    }
+    const decision = await this.withServerRequest(id, execution.threadId, signal => approve({
       kind: commandRequest ? 'command' : 'file',
       target,
       ...(typeof params.cwd === 'string' ? { cwd: params.cwd } : {}),
       ...(typeof params.reason === 'string' ? { reason: params.reason } : {}),
     }, signal)).catch(() => 'decline' as const)
-    return { decision: (this.active === current || this.goalTurn === current) && !current.stop ? decision : 'cancel' }
+    return { decision: this.runningTurns().includes(owner) &&
+      (owner === execution || owner.children.get(execution.threadId) === execution) ? decision : 'cancel' }
   }
 
   private async withServerRequest<T>(id: number | string, threadId: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
