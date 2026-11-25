@@ -5,6 +5,7 @@ import { object } from './rpc.js'
 import type { LeaseTicket } from './lease.js'
 
 const filename = 'codex-controls.json'
+type FileDelivery = 'sending' | 'sent' | 'failed' | 'uncertain'
 
 export class ControlState {
   mirror: boolean
@@ -14,6 +15,7 @@ export class ControlState {
   goalTextDelivery: 'sending' | 'sent' | undefined
   private threads: string[]
   private goalLeases: Record<string, LeaseTicket>
+  private goalFiles: Record<string, FileDelivery>
 
   constructor(private root: string, defaultMirror: boolean) {
     let data: ReturnType<typeof object> = {}
@@ -28,6 +30,9 @@ export class ControlState {
     this.goalDeliveryPending = typeof data.goalDeliveryPending === 'boolean' ? data.goalDeliveryPending : undefined
     this.goalTextDelivery = data.goalTextDelivery === 'sending' || data.goalTextDelivery === 'sent'
       ? data.goalTextDelivery : undefined
+    this.goalFiles = Object.fromEntries(Object.entries(object(data.goalFiles)).flatMap(([key, value]) =>
+      /^[a-f0-9]{64}$/.test(key) && (value === 'sending' || value === 'sent' || value === 'failed' || value === 'uncertain')
+        ? [[key, value]] : []))
     this.goalLeases = Object.fromEntries(Object.entries(object(data.goalLeases)).flatMap(([key, raw]) => {
       const { nonce, ids } = object(raw)
       return /^[a-z0-9-]{1,100}$/i.test(key) && typeof nonce === 'string' && /^[a-f0-9-]{36}$/u.test(nonce) &&
@@ -70,13 +75,16 @@ export class ControlState {
     const previous = this.goalThread
     const previousDelivery = this.goalDeliveryPending
     const previousTextDelivery = this.goalTextDelivery
+    const previousFiles = this.goalFiles
     this.goalThread = thread
     this.goalDeliveryPending = !!thread && deliveryPending
     this.goalTextDelivery = undefined
+    this.goalFiles = {}
     try { this.save(this.mirror, this.model, this.threads) } catch (error) {
       this.goalThread = previous
       this.goalDeliveryPending = previousDelivery
       this.goalTextDelivery = previousTextDelivery
+      this.goalFiles = previousFiles
       throw error
     }
   }
@@ -91,6 +99,22 @@ export class ControlState {
     }
   }
 
+  goalFileDelivery(key: string): FileDelivery | undefined {
+    return this.goalFiles[key]
+  }
+
+  setGoalFileDelivery(thread: string, key: string, value?: FileDelivery): void {
+    if (thread !== this.goalThread) throw new Error('Goal conversation changed during attachment delivery')
+    const previous = this.goalFiles
+    this.goalFiles = { ...previous }
+    if (value) this.goalFiles[key] = value
+    else delete this.goalFiles[key]
+    try { this.save(this.mirror, this.model, this.threads) } catch (error) {
+      this.goalFiles = previous
+      throw error
+    }
+  }
+
   remember(id: string): void {
     if (this.threads[0] !== id) this.save(this.mirror, this.model, [id, ...this.threads.filter(x => x !== id)].slice(0, 10))
   }
@@ -99,7 +123,7 @@ export class ControlState {
     atomicWriteInRoot({ root: this.root }, filename,
       JSON.stringify({
         mirror, model, threads, goalThread: this.goalThread, goalLeases: this.goalLeases,
-        goalDeliveryPending: this.goalDeliveryPending, goalTextDelivery: this.goalTextDelivery,
+        goalDeliveryPending: this.goalDeliveryPending, goalTextDelivery: this.goalTextDelivery, goalFiles: this.goalFiles,
       }) + '\n')
     this.mirror = mirror
     this.model = model

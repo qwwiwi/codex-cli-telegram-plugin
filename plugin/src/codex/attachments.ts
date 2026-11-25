@@ -35,7 +35,7 @@ export async function sendAttachment(
   workspace: string,
   path: string,
   replyTo?: number,
-): Promise<void> {
+): Promise<number> {
   const canonical = assertSendableFileInRoots({ filePath: path, roots: [workspace] })
   const file = await open(canonical, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
@@ -55,9 +55,9 @@ export async function sendAttachment(
         throw new Error('Attachment size changed during upload')
       }
       if (isPhotoExtension(canonical) && stat.size <= 10 * 1024 * 1024) {
-        await telegram.sendPhoto(chatId, stagedPath, options)
+        return (await telegram.sendPhoto(chatId, stagedPath, options)).message_id
       } else {
-        await telegram.sendDocument(chatId, stagedPath, options)
+        return (await telegram.sendDocument(chatId, stagedPath, options)).message_id
       }
     } finally {
       await rm(staging, { recursive: true, force: true })

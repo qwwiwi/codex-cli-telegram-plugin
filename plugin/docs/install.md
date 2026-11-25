@@ -80,6 +80,8 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 
 - `/help` lists the enabled commands. `/status` shows session activity,
   permissions and the model and context usage once received from Codex.
+  During work, a standalone status question like «example-agent, как там?»
+  also receives the current status immediately, without steering the task.
 - `/stop` interrupts the current turn. `/new` and `/reset force` start a
   new conversation on the next message and leave previous history on disk.
   Incoming requests and album fragments wait on disk (up to 16 batches).
@@ -105,6 +107,11 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   turns and does not change sandbox rules or approval requirements. Codex
   can mark a mandate offered to its turn as used after finishing its task.
   The owner can also mark it manually with `/lease consume <ID>`.
+  The `ask_guard.mode` setting checks permission-ask phrasing in the agent's
+  Telegram reply actions when a mandate is active. The default `advisory`
+  sends the reply and gives Codex feedback. `block` returns the feedback
+  without sending the reply. `off` disables the check. Tool approvals and
+  question cards follow their existing rules.
 - `/cc model [name]` lists and selects models available to the account.
   Use `/cc model default` for `KROT_CODEX_MODEL` or the catalog default.
   The selected model applies to subsequent turns without losing the conversation.
@@ -123,6 +130,9 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   `/goal status`, `/goal pause`, `/goal resume`, and `/goal cancel`
   inspect or control it. `/stop` pauses an active goal. Completed plan
   steps appear as Telegram milestones and the current plan in the status pin.
+  Delivery of the completed goal is recorded per attachment. A restart
+  skips confirmed sends. An attachment whose prior delivery is uncertain
+  is reported without replaying it.
   If the runtime omits its plan tool, public progress commentary beginning
   with `Веха:` can publish the same milestone.
   Native subagents can work on independent steps when the backend offers
@@ -131,6 +141,9 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   `/edit <text>` replaces an ordinary bot text reply. Natural requests such
   as «закрепи» or «отредактируй, сделай короче» also work when quoted.
   `/get [instruction]` reads a quoted attachment from the owner's chat.
+  An agent Telegram action can specify a `request_id`. While the turn can
+  accept input, the bridge returns the result and Telegram message IDs to
+  that turn as structured feedback.
 
 ## Verify
 

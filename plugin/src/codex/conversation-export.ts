@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { TelegramApi } from '../channel/tools.js'
 import { redactSecrets } from '../safety/redact.js'
 import { attachmentInstructions, extractAttachments } from './attachments.js'
-import { agentChatInstructions, chatContextPrefix } from './chat-actions.js'
+import { chatContextPrefix } from './chat-actions.js'
 import { followUpInstructions, hideContinuationMarker } from './continuation.js'
 import { object } from './rpc.js'
 import { hideQuestionMarker } from './questions.js'
@@ -21,13 +21,15 @@ export function formatConversation(turns: unknown[], partial: boolean, secrets: 
       if (item.type === 'userMessage' && Array.isArray(item.content)) {
         const text = item.content.map(object).map(part => {
           if (part.type !== 'text' || typeof part.text !== 'string') return '[Вложение]'
-          if (part.text.startsWith(goalLeasePrefix)) return ''
+          if (part.text.startsWith(goalLeasePrefix) || part.text.startsWith('Служебный результат действия Telegram.\n') ||
+              part.text.startsWith('Служебный результат действия Telegram. Не показывай его владельцу.\n')) return ''
           return part.text
             .replace(attachmentInstructions + '\n\n', '')
             .replace(/^Актуальные мандаты владельца Telegram[^\n]*\n\n/u, '')
             .replace(/^Для большой задачи составь план[^\n]*\n\n/u, '')
             .replace(followUpInstructions + '\n\n', '')
-            .replace(agentChatInstructions + '\n\n', '')
+            .replace(/^Действия в личке Telegram доступны во время работы\.[^\n]*\n\n/mu, '')
+            .replace(/^Память прошлых задач \(JSON\)\.[^\n]*\n\[[^\n]*\]\n\n/mu, '')
             .split('\n').filter(line => !line.startsWith(chatContextPrefix)).join('\n')
         }).join('\n').trim()
         if (text) sections.push('## Ты\n\n' + text)

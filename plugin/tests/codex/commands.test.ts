@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { AppConfigSchema } from '../../src/config.js'
-import { codexCommands, parseCodexCommand } from '../../src/codex/commands.js'
+import { codexCommands, isStatusQuestion, parseCodexCommand } from '../../src/codex/commands.js'
 
 test('hides disabled commands and resolves supported legacy aliases', () => {
   const config = AppConfigSchema.parse({ commands: { stop: false, new: false } })
@@ -12,4 +12,13 @@ test('hides disabled commands and resolves supported legacy aliases', () => {
   })
   expect(parseCodexCommand('/cc clear', 'examplebot')).toEqual({ name: 'reset', args: '' })
   expect(parseCodexCommand('/stop@anotherbot', 'examplebot')).toBeUndefined()
+})
+
+test('only standalone status questions can bypass the active turn', () => {
+  for (const text of ['example-agent, как там?', 'Ты ещё работаешь?', 'На каком ты этапе?', 'Что сейчас делаешь?']) {
+    expect(isStatusQuestion(text)).toBe(true)
+  }
+  for (const text of ['Как там сайт?', 'Как там? Добавь проверку.', 'Проверь, работает ли бот', 'Статус репозитория']) {
+    expect(isStatusQuestion(text)).toBe(false)
+  }
 })

@@ -78,3 +78,21 @@ test('only downloads attachments referenced by a known message in the owner chat
   expect(await actions.receive('unknown', '@@TELEGRAM_ACTION {"action":"download","target":53}', () => true, download)).toBe(false)
   expect(downloads).toEqual([12])
 })
+
+test('reports the actual Telegram IDs and does not repeat a reply if feedback fails', async () => {
+  const receipts: unknown[] = []
+  let sends = 0
+  const actions = new AgentChatActions({
+    async sendMessage() { sends++; return { message_id: 24 } },
+    async editMessageText() {},
+    async pinChatMessage() {},
+    async unpinChatMessage() {},
+    async setMessageReaction() {},
+  }, '123', { async sendFile() { return 25 } })
+  const feedback = async (result: unknown) => { receipts.push(result); throw new Error('Turn closed') }
+  const message = '@@TELEGRAM_ACTION {"action":"reply","text":"Готово","files":["result.txt"],"request_id":"r1"}'
+  expect(await actions.receive('reply-1', message, () => true, undefined, feedback)).toBe(true)
+  expect(await actions.receive('reply-1', message, () => true, undefined, feedback)).toBe(false)
+  expect(sends).toBe(1)
+  expect(receipts).toEqual([{ request_id: 'r1', action: 'reply', ok: true, message_ids: [24, 25] }])
+})

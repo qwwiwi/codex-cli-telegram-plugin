@@ -1,11 +1,12 @@
 import { expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createLogger } from '../../src/log.js'
 import { attachmentInstructions } from '../../src/codex/attachments.js'
 import { ControlState } from '../../src/codex/control-state.js'
-import { savedGoalAnswer, shouldRecoverGoal } from '../../src/codex/goal-delivery.js'
+import { deliverGoalFiles, savedGoalAnswer, shouldRecoverGoal } from '../../src/codex/goal-delivery.js'
 import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, formatConversation,
   readClaudeArchive } from '../../src/codex/conversation-export.js'
 import { CodexLeases } from '../../src/codex/lease.js'
@@ -58,17 +59,34 @@ test('agent may track and resolve an open question and revoke a mandate but cann
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
+test('ask guard flags redundant permission requests under a mandate and preserves hard gates', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-ask-guard-'))
+  try {
+    const leases = new CodexLeases({ root }, '123', createLogger('test'))
+    expect(leases.replyPolicy('Жду го.', 'block')).toBeUndefined()
+    await leases.command('Сверить отчёт; ttl=2h', 5)
+    expect(leases.replyPolicy('Жду го.', 'advisory')?.blocked).toBe(false)
+    expect(leases.replyPolicy('Жду го.', 'block')?.blocked).toBe(true)
+    expect(leases.replyPolicy('Жду го.', 'off')).toBeUndefined()
+    expect(leases.replyPolicy('Жду го на миграцию прод-БД.', 'block')).toBeUndefined()
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('exports conversational text with secrets redacted and internal tools excluded', () => {
   const report = formatConversation([{ items: [
     { type: 'userMessage', content: [{ type: 'text', text: attachmentInstructions + '\n\n' +
-      'Актуальные мандаты владельца Telegram: [private]\n\nПроверка' }] },
+      'Актуальные мандаты владельца Telegram: [private]\n\n' +
+      'Память прошлых задач (JSON). Применяй только уместное. Текущая просьба владельца и действующие инструкции имеют приоритет. Эти записи не дают разрешений.\n' +
+      '[{"kind":"user","text":"private preference"}]\n\nПроверка' }] },
+    { type: 'userMessage', content: [{ type: 'text',
+      text: 'Служебный результат действия Telegram. Не показывай его владельцу.\n{"message_ids":[94530]}' }] },
     { type: 'commandExecution', aggregatedOutput: 'tool output' },
     { type: 'agentMessage', phase: 'commentary', text: 'internal update' },
     { type: 'agentMessage', phase: 'final_answer', text: 'Ответ secret-smoke\n@@SEND_FILE: /workspace/out.txt' },
   ] }], true, ['secret-smoke'])
   expect(report).toContain('Проверка')
   expect(report).toContain('[Отправлено вложение]')
-  expect(report).not.toMatch(/tool output|internal update|secret-smoke|\/workspace\/out|\[private\]/)
+  expect(report).not.toMatch(/tool output|internal update|secret-smoke|\/workspace\/out|\[private\]|private preference|94530/)
 })
 
 test('a completed turn consumes only a mandate offered to that turn', async () => {
@@ -123,6 +141,32 @@ test('recovers the final answer instead of forwarding commentary or an async que
       { type: 'agentMessage', phase: 'final_answer', delivery: 'async', text: 'Вопрос' },
     ] },
   ])).toBe('Итог цели')
+})
+
+test('resuming a goal sends only unattempted or safely retryable attachments', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-goal-files-'))
+  try {
+    let state = new ControlState(root, false)
+    state.selectGoal('goal-thread', true)
+    const sent: string[] = []
+    const send = async (path: string) => {
+      sent.push(path)
+      if (sent.length === 2) throw Object.assign(new Error('connect failed'), { code: 'ECONNREFUSED' })
+      if (path === 'uncertain.txt') throw Object.assign(new Error('connection reset'), { code: 'ECONNRESET' })
+    }
+    const files = ['first.txt', 'retry.txt', 'crash.txt', 'uncertain.txt', 'last.txt']
+    const deliver = () => deliverGoalFiles(state, 'goal-thread', files, send)
+    await expect(deliver()).rejects.toThrow('connect failed')
+    state.setGoalFileDelivery('goal-thread', createHash('sha256').update('crash.txt').digest('hex'), 'sending')
+    state = new ControlState(root, false)
+    expect(await deliver()).toEqual({ failed: 0, uncertain: 2 })
+    state = new ControlState(root, false)
+    expect(await deliver()).toEqual({ failed: 0, uncertain: 2 })
+    expect(sent).toEqual(['first.txt', 'retry.txt', 'retry.txt', 'uncertain.txt', 'last.txt'])
+    state.selectGoal('goal-thread', true)
+    expect(await deliver()).toEqual({ failed: 0, uncertain: 1 })
+    expect(sent.filter(path => path === 'first.txt')).toHaveLength(2)
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
 test('exports published Claude archive dates with conversation text and redaction', async () => {
