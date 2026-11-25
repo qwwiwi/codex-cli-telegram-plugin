@@ -26,6 +26,14 @@ confirm_overrides:
   expect(policyHookOutput(false)).toHaveProperty('hookSpecificOutput.permissionDecision', 'deny')
 })
 
+test('uses the operator-selected policy scope and declines invalid YAML safely', () => {
+  const input = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'printf audit' } }
+  const policy = 'version: 1\ndefault_tier: allow\nscopes:\n  strict:\n    deny:\n      bash_patterns: ["printf audit"]\n'
+  expect(assessPolicy(policy, input).tier).toBe('allow')
+  expect(assessPolicy(policy, input, 'strict').tier).toBe('deny')
+  expect(assessPolicy('scopes: [', input).tier).toBe('deny')
+})
+
 test('only eligible standalone questions can get a tool-free side reply', async () => {
   expect(sideQuestion('Отдельный вопрос: что такое JSON?')).toBe('что такое JSON?')
   expect(sideQuestion('Что такое JSON?')).toBe('Что такое JSON?')

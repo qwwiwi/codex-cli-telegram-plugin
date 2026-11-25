@@ -70,6 +70,8 @@ test('ask guard flags redundant permission requests under a mandate and preserve
     expect(leases.replyPolicy('Жду го.', 'block')?.blocked).toBe(true)
     expect(leases.replyPolicy('Жду го.', 'off')).toBeUndefined()
     expect(leases.replyPolicy('Жду го на миграцию прод-БД.', 'block')).toBeUndefined()
+    expect(leases.finalReply('Отчёт собран.\n\nЖду го.', 'block')).toBe('Отчёт собран.')
+    expect(leases.finalReply('Жду го на миграцию прод-БД.', 'block')).toBe('Жду го на миграцию прод-БД.')
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 

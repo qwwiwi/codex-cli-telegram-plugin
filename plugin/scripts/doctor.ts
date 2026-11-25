@@ -1,40 +1,59 @@
 import { accessSync, constants, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, sep } from 'node:path'
 import { loadConfig, RuntimeEnvSchema } from '../src/config.js'
+import { CodexRpc, object } from '../src/codex/rpc.js'
 
 type Check = { status: 'ok' | 'warning' | 'error'; message: string }
 type TelegramMethod = 'getMe' | 'getWebhookInfo'
 type Probes = {
-  checkCodex: (env: NodeJS.ProcessEnv) => Check
+  checkCodex: (env: NodeJS.ProcessEnv, workspace?: string) => Check | Promise<Check>
   telegram: (method: TelegramMethod, token: string) => Promise<Record<string, unknown> | null>
 }
 
-function directory(path: string | undefined): string | undefined {
+function directory(path: string | undefined, writable = true): string | undefined {
   if (!path || !isAbsolute(path)) return
   try {
     if (!statSync(path).isDirectory()) return
-    accessSync(path, constants.R_OK | constants.W_OK | constants.X_OK)
+    accessSync(path, constants.R_OK | constants.X_OK | (writable ? constants.W_OK : 0))
     return realpathSync(path)
   } catch {
     return
   }
 }
 
-function checkCodex(env: NodeJS.ProcessEnv): Check {
+function codexEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([name]) =>
+    /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TMPDIR|TEMP|TMP|CODEX_HOME|USERPROFILE|LOCALAPPDATA|APPDATA|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)$/i.test(name),
+  ))
+}
+
+export async function probeProxy(workspace: string, env: NodeJS.ProcessEnv, command: readonly [string, ...string[]]): Promise<Check> {
+  const rpc = new CodexRpc(workspace, codexEnv(env), () => undefined, () => undefined, command)
+  const timer = setTimeout(() => rpc.close(), 8000)
+  try {
+    await rpc.initialize()
+    const login = await rpc.request('account/read', { refreshToken: false })
+    return object(login.account).type === 'chatgpt'
+      ? { status: 'ok', message: 'Прокси подключается к App Server. На сервере выполнен вход через ChatGPT.' }
+      : { status: 'error', message: 'Прокси подключается, но в App Server нужен вход через ChatGPT.' }
+  } catch {
+    return { status: 'error', message: 'Прокси не подключился к App Server. Проверьте sudo -n и статус службы.' }
+  } finally { clearTimeout(timer); rpc.close() }
+}
+
+async function checkCodex(env: NodeJS.ProcessEnv, workspace?: string): Promise<Check> {
   if (env.KROT_CODEX_PROXY) {
-    if (env.KROT_CODEX_APPROVALS !== '1' || !isAbsolute(env.KROT_CODEX_PROXY)
-        || !Bun.which(env.KROT_CODEX_PROXY)) {
+    if (env.KROT_CODEX_APPROVALS !== '1' || !isAbsolute(env.KROT_CODEX_PROXY) ||
+        !Bun.which(env.KROT_CODEX_PROXY)) {
       return { status: 'error', message: 'KROT_CODEX_PROXY требует абсолютный путь к исполняемому файлу и KROT_CODEX_APPROVALS=1.' }
     }
-    return { status: 'warning', message: 'Исполняемый файл прокси найден. Вход в Codex и доступ к сокету проверьте на стороне прокси.' }
+    if (!workspace) return { status: 'error', message: 'Нужна доступная рабочая папка для проверки прокси.' }
+    return probeProxy(workspace, env, ['/usr/bin/sudo', '-n', '--', env.KROT_CODEX_PROXY])
   }
-
   const codex = Bun.which('codex')
   if (!codex) return { status: 'error', message: 'Codex CLI не найден в PATH. Установите его и проверьте codex --version.' }
   // The CLI needs its normal login environment, but never the bot credentials.
-  const cliEnv = Object.fromEntries(Object.entries(env).filter(([name]) =>
-    /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TMPDIR|TEMP|TMP|CODEX_HOME|USERPROFILE|LOCALAPPDATA|APPDATA|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)$/i.test(name),
-  ))
+  const cliEnv = codexEnv(env)
   try {
     const options = { env: cliEnv, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 10_000 } as const
     if (Bun.spawnSync([codex, 'app-server', '--help'], options).exitCode !== 0) {
@@ -93,9 +112,9 @@ export async function runDoctor(
     'Указан один владелец, ID личного чата совпадает.',
     'Укажите один и тот же числовой ID владельца в TELEGRAM_ALLOWED_USER_IDS и TELEGRAM_ALLOWED_CHAT_IDS.')
 
-  const workspace = directory(config?.workspace_root)
+  const workspace = directory(config?.workspace_root, !env.KROT_CODEX_PROXY)
   const state = directory(env.TELEGRAM_STATE_DIR)
-  report(Boolean(workspace), 'Рабочая папка доступна на запись.',
+  report(Boolean(workspace), env.KROT_CODEX_PROXY ? 'Рабочая папка доступна мосту на чтение.' : 'Рабочая папка доступна на запись.',
     'Создайте рабочую папку по абсолютному пути TELEGRAM_WORKSPACE_ROOT и проверьте права.')
   report(Boolean(state), 'Папка состояния доступна на запись.',
     'Создайте приватную папку по абсолютному пути TELEGRAM_STATE_DIR и проверьте права.')
@@ -105,7 +124,7 @@ export async function runDoctor(
       'Папка состояния находится за пределами рабочей папки.',
       'TELEGRAM_STATE_DIR должен находиться за пределами TELEGRAM_WORKSPACE_ROOT.')
   }
-  checks.push(probes.checkCodex(env))
+  checks.push(await probes.checkCodex(env, workspace))
 
   const token = env.TELEGRAM_BOT_TOKEN
   if (!token || !/^\d+:[\w-]+$/.test(token)) {

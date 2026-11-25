@@ -44,9 +44,11 @@ export function parseCodexCommand(text: string | undefined, username: string) {
   if (name === 'cc') {
     switch (args.toLowerCase()) {
       case 'compact': return { name: 'compact', args: '' }
+      case 'new': return { name: 'new', args: '' }
       case 'status':
       case 'context': return { name: 'status', args: '' }
       case 'clear': return { name: 'reset', args: '' }
+      case 'clear force': return { name: 'reset', args: 'force' }
     }
   }
   return { name, args }

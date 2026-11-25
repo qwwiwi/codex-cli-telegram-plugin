@@ -1,6 +1,31 @@
 import { expect, test } from 'bun:test'
 import type { SendMessageOpts } from '../../src/channel/tools.js'
 import { ApprovalCards } from '../../src/codex/approvals.js'
+import { CardCleanup } from '../../src/codex/card-cleanup.js'
+import { createLogger } from '../../src/log.js'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+test('a new bridge closes persisted buttons once without replaying the old request', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-card-cleanup-'))
+  try {
+    const log = createLogger('test')
+    const first = new CardCleanup(root, '123', log)
+    first.remember(70, 'approval')
+    first.remember(71, 'question')
+    first.forget(70)
+    const edits: unknown[] = []
+    const api = { async editMessageText(_chat: string, id: number, text: string, options: unknown) {
+      edits.push([id, text, options])
+    } }
+    await new CardCleanup(root, '123', log).recover(api)
+    await new CardCleanup(root, '123', log).recover(api)
+    expect(edits).toHaveLength(1)
+    expect(edits[0]).toEqual([71, '❔ Вопрос закрыт после перезапуска моста. При необходимости отправь уточнение ещё раз.',
+      { reply_markup: { inline_keyboard: [] } }])
+  } finally { rmSync(root, { force: true, recursive: true }) }
+})
 
 function fixture() {
   const messages: { text: string; options: SendMessageOpts }[] = []

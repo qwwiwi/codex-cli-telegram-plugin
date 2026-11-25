@@ -46,6 +46,17 @@ export class CodexLeases {
     }
   }
 
+  finalReply(text: string, mode: AskGuardMode): string {
+    if (!text || mode === 'off') return text
+    const policy = this.replyPolicy(text, mode)
+    if (!policy) return text
+    this.log.info('Ask guard matched a final reply', { mode })
+    if (!policy.blocked) return text
+    const paragraphs = text.split(/\r?\n\s*\r?\n/u)
+    const kept = paragraphs.filter(paragraph => !analyzeAsk(paragraph, { hasActiveLease: true }).length)
+    return kept.join('\n\n').trim() || 'В ответе был повторный запрос согласования по действующему мандату. Активные мандаты доступны через /lease.'
+  }
+
   async recordQuestion(messageId: number, summary: string): Promise<void> {
     await updateAutonomyState(this.paths, this.chatId, state => {
       if (state.questions.some(question => question.messageId === messageId)) return { state, result: 'duplicate' }

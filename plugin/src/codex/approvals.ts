@@ -3,6 +3,7 @@ import type { TelegramApi } from '../channel/tools.js'
 import { redactSecrets } from '../safety/redact.js'
 import { permissionDecisionKeyboard, renderPermissionCard } from '../telegram/permission-gate-ui.js'
 import type { ApprovalDecision, ApprovalRequest } from './session.js'
+import type { CardCleanup } from './card-cleanup.js'
 
 export const APPROVAL_CALLBACK = /^krot:approve:([a-f0-9-]{36}):([ad])$/
 const MAX_PENDING_APPROVALS = 4
@@ -27,6 +28,7 @@ export class ApprovalCards {
     private readonly telegram: Pick<TelegramApi, 'sendMessage' | 'editMessageText'>,
     private readonly secrets: ReadonlyArray<string>,
     private readonly timeoutMs: number = 120_000,
+    private readonly cleanup?: CardCleanup,
   ) {}
 
   request(request: ApprovalRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
@@ -61,6 +63,7 @@ export class ApprovalCards {
       const keyboard = permissionDecisionKeyboard('krot:approve:' + id + ':a', 'krot:approve:' + id + ':d')
       void this.telegram.sendMessage(String(this.ownerId), preview, { parse_mode: 'HTML', reply_markup: keyboard })
         .then(({ message_id }) => {
+          this.cleanup?.remember(message_id, 'approval')
           if (this.pending.get(id) === request) request.messageId = message_id
           else this.edit(message_id, summary, 'Запрос уже закрыт.')
         })
@@ -94,6 +97,6 @@ export class ApprovalCards {
   private edit(id: number, summary: string, status: string): void {
     void this.telegram.editMessageText(String(this.ownerId), id, summary + '\n\n<b>' + status + '</b>', {
       parse_mode: 'HTML', reply_markup: emptyKeyboard,
-    }).catch(() => undefined)
+    }).then(() => this.cleanup?.forget(id)).catch(() => undefined)
   }
 }

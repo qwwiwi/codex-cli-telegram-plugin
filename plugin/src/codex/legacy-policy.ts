@@ -1,14 +1,17 @@
 import { load } from 'js-yaml'
-import { classifyToolCall, PermissionPolicySchema, type PermissionVerdict } from '../security/permission-policy.js'
+import { classifyToolCall, PermissionPolicySchema, type PermissionPolicy, type PermissionVerdict } from '../security/permission-policy.js'
 import { object } from './rpc.js'
 
-export function assessPolicy(yaml: string, value: unknown): PermissionVerdict {
+export function assessPolicy(yaml: string, value: unknown, scope = 'main'): PermissionVerdict {
   const { tool_name: tool, tool_input: input, hook_event_name: event } = object(value)
   const deny = { tier: 'deny', reason: 'Не удалось проверить действие по правилам YAML.', matchedRule: 'hook:invalid' } as const
-  const parsed = PermissionPolicySchema.safeParse(load(yaml))
+  let document: unknown
+  try { document = load(yaml) } catch { return deny }
+  const parsed = PermissionPolicySchema.safeParse(document)
   if (!parsed.success || event !== 'PreToolUse' || typeof tool !== 'string') return deny
+  if (scope !== 'main' && !Object.hasOwn(parsed.data.scopes ?? {}, scope)) return deny
   const classify = (toolName: string, toolInput: unknown) =>
-    classifyToolCall({ toolName, toolInput, policy: parsed.data, scope: 'main' })
+    classifyToolCall({ toolName, toolInput, policy: parsed.data as PermissionPolicy, scope })
   const base = classify(tool, input)
   if (tool !== 'apply_patch' || base.tier === 'deny') return base
   const { command } = object(input)

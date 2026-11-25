@@ -30,6 +30,7 @@ import { gateTelegramMessage } from '../telegram/gate.js'
 import { TelegramPoller, tokenLock } from '../telegram/poller.js'
 import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
+import { CardCleanup } from './card-cleanup.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
 import { codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import { automaticContinuation, followUpInstructions, hideContinuationMarker, takeContinuation } from './continuation.js'
@@ -140,12 +141,13 @@ async function main(): Promise<void> {
   })
   const work = new CodexWorkStatus(status, String(ownerId), config.status, secrets)
   status.setLivenessProbe(() => work.busy)
+  const cards = new CardCleanup(paths.root, String(ownerId), log)
   const approvals = process.env.KROT_CODEX_APPROVALS === '1'
-    ? new ApprovalCards(ownerId, telegram, secrets, config.permission_gate.timeout_ms)
+    ? new ApprovalCards(ownerId, telegram, secrets, config.permission_gate.timeout_ms, cards)
     : undefined
   const questions = new QuestionCards(String(ownerId), telegram, secrets, {
     timeoutMs: config.ask_user_question.timeout_ms, previewChars: config.ask_user_question.max_preview_chars,
-  })
+  }, cards)
   const questionStore = new OpenQuestionStore(paths.openQuestions, log)
   const questionConfig = config.open_question_reminder
   const questionTick = createOpenQuestionTick({
@@ -380,6 +382,7 @@ async function main(): Promise<void> {
     if (String(bot.botInfo.id) !== String(env.TELEGRAM_EXPECTED_BOT_ID)) {
       throw new Error('Configured Telegram token does not match the expected bot')
     }
+    void cards.recover(telegram)
     await sweepOrphanBubbles({
       filePath: paths.statusOrphans,
       telegramApi: statusApi,
@@ -660,7 +663,7 @@ async function main(): Promise<void> {
         ? await leases.completion(ticket).complete(text) : hideLeaseCompletions(text))
       const headline = completed ? '🎯 Цель завершена.' : 'example-agent остановился на цели' +
         (goal?.status ? ' (' + String(goal.status) + ').' : '.')
-      const body = [headline, reply.text].filter(Boolean).join('\n\n')
+      const body = [headline, leases.finalReply(reply.text, resolveAskGuardMode(config, log))].filter(Boolean).join('\n\n')
       if (!completed) await sendFinalText(body, reply.files.length > 0)
       else if (controls.goalTextDelivery !== 'sent') {
         if (controls.goalTextDelivery !== 'sending') {
@@ -1508,7 +1511,10 @@ async function main(): Promise<void> {
           const completed = interim === undefined && leaseCompletion
             ? await leaseCompletion.complete(result.text) : hideLeaseCompletions(interim ?? result.text)
           const targetId = first.reply_to_message?.message_id
-          const reply = { ...extractAttachments(hideQuestionMarker(completed)), ...(targetId === undefined ? {} : { replyTo: targetId }) }
+          const extracted = extractAttachments(hideQuestionMarker(completed))
+          const reply = { ...extracted, text: editTarget ? extracted.text :
+            leases.finalReply(extracted.text, resolveAskGuardMode(config, log)),
+          ...(targetId === undefined ? {} : { replyTo: targetId }) }
           if (!editTarget) inbox.complete(first.message_id, { ...reply, text: redactSecrets(reply.text, secrets) }, interim !== undefined)
           await recordMemory(codex.currentThread, input.text, reply.text, Date.now() - began)
           if (reply.text && editTarget) {
@@ -1599,7 +1605,8 @@ async function main(): Promise<void> {
                 ? takeContinuation(answer, active.work.continuation) : undefined
               const completed = interim === undefined && active.work?.lease
                 ? await leases.completion(active.work.lease).complete(answer) : hideLeaseCompletions(interim ?? answer)
-              const reply = { ...extractAttachments(hideQuestionMarker(hideContinuationMarker(completed))),
+              const extracted = extractAttachments(hideQuestionMarker(hideContinuationMarker(completed)))
+              const reply = { ...extracted, text: leases.finalReply(extracted.text, resolveAskGuardMode(config, log)),
                 ...(targetId === undefined ? {} : { replyTo: targetId }) }
               inbox.complete(active.messages[0]!.message_id, { ...reply, text: redactSecrets(reply.text, secrets) }, interim !== undefined)
               await finishOrdinaryReply(epoch, true)

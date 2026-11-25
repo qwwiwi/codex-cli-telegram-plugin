@@ -2,9 +2,15 @@ import { expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runDoctor } from '../scripts/doctor.js'
+import { probeProxy, runDoctor } from '../scripts/doctor.js'
 
 const token = '100001:fake-token-with-enough-characters'
+
+test('doctor verifies ChatGPT login through the configured App Server connection', async () => {
+  const command = [process.execPath, join(import.meta.dir, 'codex', 'fake-app-server.ts')] as const
+  expect((await probeProxy(import.meta.dir, process.env, [...command, 'chatgpt'])).status).toBe('ok')
+  expect((await probeProxy(import.meta.dir, process.env, [...command, 'apiKey'])).status).toBe('error')
+})
 
 async function checkInstallation(options: { botId?: number; webhook?: string; omitOwner?: boolean; networkError?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'krotov-doctor-'))

@@ -11,6 +11,8 @@ test('hides disabled commands and resolves supported legacy aliases', () => {
     name: 'status', args: '',
   })
   expect(parseCodexCommand('/cc clear', 'examplebot')).toEqual({ name: 'reset', args: '' })
+  expect(parseCodexCommand('/cc clear force', 'examplebot')).toEqual({ name: 'reset', args: 'force' })
+  expect(parseCodexCommand('/cc new', 'examplebot')).toEqual({ name: 'new', args: '' })
   expect(parseCodexCommand('/stop@anotherbot', 'examplebot')).toBeUndefined()
   expect(parseCodexCommand('/team:daily-report@ExampleBot с аргументом', 'examplebot'))
     .toEqual({ name: 'team:daily-report', args: 'с аргументом' })

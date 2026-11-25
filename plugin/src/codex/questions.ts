@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { TelegramApi } from '../channel/tools.js'
 import { redactSecrets } from '../safety/redact.js'
 import { object } from './rpc.js'
+import type { CardCleanup } from './card-cleanup.js'
 
 export const QUESTION_CALLBACK = /^krot:q:([a-f0-9-]{36}):([0-9]|x|d)$/
 const questionMarker = /(?:^|\r?\n)(KROT_QUESTION_[a-f0-9-]{36}) (\{[^\r\n]*\})\s*$/u
@@ -43,6 +44,7 @@ export class QuestionCards {
     private readonly api: Pick<TelegramApi, 'sendMessage' | 'editMessageText'>,
     private readonly secrets: ReadonlyArray<string>,
     private readonly options = { timeoutMs: 120_000, previewChars: 1000 },
+    private readonly cleanup?: CardCleanup,
   ) {}
 
   get isPending(): boolean { return this.current !== undefined }
@@ -118,7 +120,7 @@ export class QuestionCards {
     const close = (messageId: number) => {
       void this.api.editMessageText(this.chat, messageId, body + '\n\nВопрос закрыт.', {
         reply_markup: { inline_keyboard: [] },
-      }).catch(() => undefined)
+      }).then(() => this.cleanup?.forget(messageId)).catch(() => undefined)
     }
     return new Promise(resolve => {
       let updates = Promise.resolve()
@@ -141,6 +143,7 @@ export class QuestionCards {
       this.current = pending
       signal?.addEventListener('abort', cancel, { once: true })
       void this.api.sendMessage(this.chat, body, { reply_markup: keyboard() }).then(({ message_id }) => {
+        this.cleanup?.remember(message_id, 'question')
         if (this.current === pending) pending.messageId = message_id
         else close(message_id)
       }).catch(() => pending.answer())
