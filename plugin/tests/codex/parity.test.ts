@@ -69,6 +69,33 @@ test('mirror retains bounded terminal output and redacts a secret split across d
   expect(messages.join('\n')).not.toContain('hidden-test-key')
 })
 
+test('accepts a legacy listener task for the configured owner and deduplicates retries by task ID', async () => {
+  const jobs = new Map<number, string>()
+  const server = await startExternalTasks(0, 'test-agent', '123', (message, id) => {
+    if (jobs.has(id)) return 'duplicate'
+    jobs.set(id, message)
+    return 'accepted'
+  })
+  try {
+    const address = server.address()
+    if (!address || typeof address === 'string') throw Error('Missing local address')
+    const submit = (value: object, secret = 'test-agent') => fetch(
+      'http://127.0.0.1:' + address.port + '/hooks/agent', {
+        method: 'POST', headers: { authorization: 'Bearer ' + secret, 'content-type': 'application/json' },
+        body: JSON.stringify(value),
+      },
+    )
+    const task = { _task_id: 47, from_agent: 'example-agent', title: 'Отчёт', body: 'Проверь очередь.', context: 'Тест.' }
+    expect((await submit(task, 'wrong')).status).toBe(401)
+    expect((await submit({ ...task, chatId: 456 })).status).toBe(400)
+    expect((await submit({ ...task, _task_id: 'no-id' })).status).toBe(400)
+    expect(await (await submit(task)).json()).toEqual({ status: 'accepted', task_id: '47' })
+    expect(await (await submit({ ...task, body: 'Повтор.' })).json()).toEqual({ status: 'accepted', task_id: '47' })
+    expect(jobs.size).toBe(1)
+    expect([...jobs.values()][0]).toContain('Проверь очередь.')
+  } finally { server.close() }
+})
+
 test('policy confirmations use a separate loopback credential and never enqueue a task', async () => {
   const seen: unknown[] = []
   const server = await startExternalTasks(0, 'tasks-only', '123', () => { throw Error('Unexpected queued task') }, {

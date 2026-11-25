@@ -166,6 +166,14 @@ owner chat. A 200 response means the request was persisted, and its result is
 delivered in Telegram. An optional `Idempotency-Key` prevents duplicate
 execution while the bridge retains that request ID in its deduplication window.
 
+The standalone Claude listener's task envelope also works on the same route
+with the configured bearer token. For example, send
+`{"task_id":47,"from_agent":"example-agent","title":"Report","body":"Check the queue"}`.
+`_task_id` and `from` are accepted aliases. A successful response includes
+`task_id`. Retries use that ID for deduplication, and tasks are delivered to
+the configured owner. The request must include a real task ID and task content.
+`GET /healthz` returns the same liveness response as `GET /health`.
+
 The bridge supports one active turn, with up to ten incoming items per album.
 It keeps a thread ID in `codex-thread.json` and uses Codex's workspace sandbox.
 The Telegram offset identifies accepted updates. An interrupted or crashed
