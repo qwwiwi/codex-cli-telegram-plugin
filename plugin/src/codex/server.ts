@@ -211,7 +211,6 @@ async function main(): Promise<void> {
           autoSaveLearning)
       } catch { log.warn('Could not start Codex learning. Check the learning state directory and interval.') }
     }
-    const receipts = new Map<number, { turn: string; messages: Message[] }>()
     const quotedAttachments = new Map<number, Message>()
     let goalActive = Boolean(controls.goalThread)
     let resetting = false
@@ -287,14 +286,6 @@ async function main(): Promise<void> {
         }
         if (hudReady && event.method === 'item/completed') {
           const item = object(event.params.item)
-          if (item.type === 'userMessage' && typeof item.clientId === 'string') {
-            const key = Number(item.clientId)
-            const receipt = receipts.get(key)
-            if (receipt && receipt.turn === event.params.turnId) {
-              receipts.delete(key)
-              markProcessed(receipt.messages)
-            }
-          }
           if (controls.mirror && item.type === 'commandExecution' && typeof item.id === 'string') {
             mirror?.output(item.id, '', typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput : '')
           }
@@ -1159,11 +1150,9 @@ async function main(): Promise<void> {
       if (command) await handleCommand(command.name, command.args)
     })
 
-    function markProcessed(messages: readonly Message[]): void {
-      for (const message of messages) {
-        if (!stopping && message.message_id > 0 && !agentChat.hasReacted(message.message_id)) {
-          void telegram.setMessageReaction(ownerChat, message.message_id, '👀').catch(() => undefined)
-        }
+    function acknowledge(message: Message): void {
+      if (!stopping && message.message_id > 0 && !agentChat.hasReacted(message.message_id)) {
+        void telegram.setMessageReaction(ownerChat, message.message_id, '👀').catch(() => undefined)
       }
     }
 
@@ -1208,7 +1197,6 @@ async function main(): Promise<void> {
             try {
               await sendFinalText(reply, false, id)
               consumed = true
-              markProcessed([message])
             } catch (error) {
               consumed = classifySendError(error, 30_000).kind === 'ambiguous'
             }
@@ -1233,19 +1221,16 @@ async function main(): Promise<void> {
         const input = await prepareMessages(messages)
         if (stopping || inbox.uncertainFollowUp?.message_id !== id) return
         if (input.kind === 'input' && epoch === stopEpoch) {
-          receipts.set(id, { turn: turnId, messages })
           accepted = await codex.steer([followUpInstructions, agentChatInstructions, chatContext(messages), input.text]
             .filter(Boolean).join('\n\n'), id, input.images, turnId)
           completedRequest = true
         }
       } catch { log.info('Could not steer the current turn; preserving Telegram follow-up') }
       if (stopping) return
-      if (!accepted) receipts.delete(id)
       if (!accepted && completedRequest && epoch === stopEpoch && messages.length === 1 &&
           launchSideReply(messages[0]!, epoch)) return
       inbox.finishFollowUp(id, !accepted)
       if (accepted) {
-        if (receipts.delete(id)) markProcessed(messages)
         log.info('Codex active turn received a Telegram follow-up', { album: messages.length > 1 })
         startNext()
       } else resumeInbox()
@@ -1304,6 +1289,7 @@ async function main(): Promise<void> {
         isBot: false,
       }, config)
       if (decision.kind !== 'allow') return
+      acknowledge(ctx.message)
 
       const text = ctx.message.text?.trim()
       if (text && !ctx.message.forward_origin) questionStore.clear(ownerChat)
@@ -1314,25 +1300,21 @@ async function main(): Promise<void> {
             !await enqueueCustomCommand(command.name, command.args, ctx.message.message_id)) {
           await handleCommand(command.name, command.args, ctx.message.message_id)
         }
-        markProcessed([ctx.message])
         return
       }
       if (text && !ctx.message.forward_origin && questions.reply(ctx.message.reply_to_message?.message_id, text)) {
-        markProcessed([ctx.message])
         return
       }
       if (text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
           (task || codex.isRunning || goalActive || recoveringGoal || deliveringGoal) &&
           menu.some(spec => spec.command === 'status') && isStatusQuestion(text)) {
         await handleCommand('status', '')
-        markProcessed([ctx.message])
         return
       }
       const action = text && ctx.message.reply_to_message && !ctx.message.forward_origin
         ? requestedChatAction(text) : undefined
       if (action && action !== 'edit') {
         await applyChatAction(action, ctx.message, text ?? '')
-        markProcessed([ctx.message])
         return
       }
       const turnId = codex.steerableTurn
@@ -1485,7 +1467,6 @@ async function main(): Promise<void> {
             ...(editTarget ? ['Для редактирования верни только готовый новый текст цитируемого сообщения в нужном формате.'] : []),
           ].join('\n\n'), input.images, saveTurn)
           await agentChat.flush()
-          if (result.status === 'completed') markProcessed(messages)
           for (let count = 0; count < 4 && !stopping && epoch === stopEpoch && result.status === 'completed'; count++) {
             const requested = !editTarget && question.take(result.text)
             if (!requested) break
@@ -1599,7 +1580,7 @@ async function main(): Promise<void> {
             const turn = id ? (await codex.recentTurns()).turns.map(object).find(item => item.id === id) : undefined
             const answer = savedTurnAnswer(turn)
             if (typeof answer === 'string') {
-              markProcessed(active.messages)
+              for (const message of active.messages) acknowledge(message)
               const targetId = active.messages[0]?.reply_to_message?.message_id
               const interim = active.work?.continuation && epoch === stopEpoch
                 ? takeContinuation(answer, active.work.continuation) : undefined
