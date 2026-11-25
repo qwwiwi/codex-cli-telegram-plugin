@@ -44,3 +44,26 @@ test('mirror retains bounded terminal output and redacts a secret split across d
   expect(messages.at(-1)).toContain('last line')
   expect(messages.join('\n')).not.toContain('hidden-test-key')
 })
+
+test('policy confirmations use a separate loopback credential and never enqueue a task', async () => {
+  const seen: unknown[] = []
+  const server = await startExternalTasks(0, 'tasks-only', '123', () => { throw Error('Unexpected queued task') }, {
+    token: 'policy-only',
+    request: async approval => { seen.push(approval); return 'accept' },
+  })
+  try {
+    const address = server.address()
+    if (!address || typeof address === 'string') throw Error('Missing local address')
+    const target = { kind: 'command', target: 'printf test', cwd: '/workspace', reason: 'yaml' }
+    const send = (token: string, value: unknown, path = '/hooks/permission/request') =>
+      fetch('http://127.0.0.1:' + address.port + path, { method: 'POST',
+        headers: { authorization: 'Bearer ' + token }, body: JSON.stringify(value) })
+    expect((await send('tasks-only', target)).status).toBe(401)
+    expect((await send('policy-only', { ...target, kind: 'unknown' })).status).toBe(400)
+    expect(await (await send('policy-only', target)).json()).toEqual({ decision: 'accept' })
+    expect((await send('policy-only', { message: 'task', chatId: 123 }, '/hooks/agent')).status).toBe(401)
+    expect(seen).toEqual([target])
+  } finally {
+    await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections?.() })
+  }
+})

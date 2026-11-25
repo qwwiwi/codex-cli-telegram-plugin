@@ -1,0 +1,31 @@
+import { load } from 'js-yaml'
+import { classifyToolCall, PermissionPolicySchema, type PermissionVerdict } from '../security/permission-policy.js'
+import { object } from './rpc.js'
+
+export function assessPolicy(yaml: string, value: unknown): PermissionVerdict {
+  const { tool_name: tool, tool_input: input, hook_event_name: event } = object(value)
+  const deny = { tier: 'deny', reason: 'Не удалось проверить действие по правилам YAML.', matchedRule: 'hook:invalid' } as const
+  const parsed = PermissionPolicySchema.safeParse(load(yaml))
+  if (!parsed.success || event !== 'PreToolUse' || typeof tool !== 'string') return deny
+  const classify = (toolName: string, toolInput: unknown) =>
+    classifyToolCall({ toolName, toolInput, policy: parsed.data, scope: 'main' })
+  const base = classify(tool, input)
+  if (tool !== 'apply_patch' || base.tier === 'deny') return base
+  const { command } = object(input)
+  if (typeof command !== 'string') return deny
+  const paths = [...command.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)]
+  if (!paths.length) return deny
+  let required = base
+  for (const [, path] of paths) {
+    const verdict = classify('Edit', { file_path: path })
+    if (verdict.tier === 'deny') return verdict
+    if (verdict.tier === 'confirm') required = verdict
+  }
+  return required
+}
+
+export function policyHookOutput(allowed: boolean, reason = 'Действие остановлено профилем разрешений Telegram.') {
+  return allowed ? {} : {
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason },
+  }
+}

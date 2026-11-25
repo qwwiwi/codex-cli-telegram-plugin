@@ -19,6 +19,13 @@ export async function reviewLearning(
   cwd: string, env: NodeJS.ProcessEnv, prompt: string, signal: AbortSignal, model?: string,
   command?: readonly [string, ...string[]],
 ): Promise<string> {
+  return requestStructured(cwd, env, prompt, outputSchema, signal, model, command)
+}
+
+export async function requestStructured(
+  cwd: string, env: NodeJS.ProcessEnv, prompt: string, schema: Record<string, unknown>, signal: AbortSignal,
+  model?: string, command?: readonly [string, ...string[]],
+): Promise<string> {
   const completed = Promise.withResolvers<string | undefined>()
   let threadId: string | undefined
   let turnId: string | undefined
@@ -76,7 +83,7 @@ export async function reviewLearning(
     }
     threadId = thread.id
     const result = await rpc.request('turn/start', {
-      threadId, input: [{ type: 'text', text: prompt, text_elements: [] }], outputSchema,
+      threadId, input: [{ type: 'text', text: prompt, text_elements: [] }], outputSchema: schema,
     })
     const turn = object(result.turn)
     if (typeof turn.id !== 'string') throw new Error('Review turn was not started')

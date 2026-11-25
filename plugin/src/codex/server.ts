@@ -43,7 +43,9 @@ import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChat
   safeActionTarget, type ChatAction } from './chat-actions.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
 import { LearningMemory } from './learning.js'
-import { reviewLearning } from './learning-review.js'
+import { requestStructured, reviewLearning } from './learning-review.js'
+import { legacyCommand } from './legacy-command.js'
+import { sideQuestion, sideReply, sideReplySchema } from './side-reply.js'
 import { hasMedia, prepareInbound } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { CodexSession } from './session.js'
@@ -86,7 +88,8 @@ async function main(): Promise<void> {
   }
   if (!tokenLock.acquire(paths)) throw new Error('A bot already owns this state directory')
 
-  const secrets = [env.TELEGRAM_BOT_TOKEN, env.GROQ_API_KEY ?? '', env.TELEGRAM_WEBHOOK_TOKEN ?? ''].filter(Boolean)
+  const policyToken = process.env.KROT_CODEX_POLICY_TOKEN
+  const secrets = [env.TELEGRAM_BOT_TOKEN, env.GROQ_API_KEY ?? '', env.TELEGRAM_WEBHOOK_TOKEN ?? '', policyToken ?? ''].filter(Boolean)
   const log = createLogger('krot-codex', { secrets })
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
   bot.use(richInboundMiddleware(undefined, () => log.warn('Could not normalize Telegram rich content')))
@@ -782,7 +785,7 @@ async function main(): Promise<void> {
       }
     }
 
-    async function handleCc(args: string): Promise<void> {
+    async function handleCc(args: string, messageId?: number): Promise<void> {
       const [action = '', ...rest] = args.split(/\s+/)
       const value = rest.join(' ')
       try {
@@ -887,6 +890,16 @@ async function main(): Promise<void> {
             : 'Codex пока не вернул данные о лимитах.')
           return
         }
+        const commandRoot = process.env.KROT_CODEX_COMMANDS_DIR
+        const custom = messageId && commandRoot ? legacyCommand(commandRoot, action, value) : undefined
+        if (custom && messageId) {
+          await acceptInput({
+            message_id: -messageId, date: Math.floor(Date.now() / 1000), text: custom,
+            chat: { id: ownerId, type: 'private', first_name: 'Telegram' },
+            from: { id: ownerId, is_bot: false, first_name: 'Telegram' },
+          })
+          return
+        }
         await send(['Команды Codex', '/cc compact', '/cc context', '/cc status', '/cc model [имя]',
           '/cc resume [номер или ID]', '/cc export', '/cc cost', '/cc clear'].join('\n'))
       } catch {
@@ -958,7 +971,7 @@ async function main(): Promise<void> {
       }
       if (name === 'stop') return stop()
       if (name === 'compact') return compact()
-      if (name === 'cc') return handleCc(args)
+      if (name === 'cc') return handleCc(args, messageId)
       if (name === 'goal') return handleGoal(args)
       if (name === 'memory' && learning) {
         if (args === 'review') {
@@ -1107,10 +1120,46 @@ async function main(): Promise<void> {
       })
     }
 
+    function launchSideReply(message: Message, epoch: number): boolean {
+      if (process.env.KROT_CODEX_SIDE_REPLY !== '1' || message.forward_origin ||
+          message.reply_to_message || !message.text) return false
+      const question = sideQuestion(message.text)
+      if (!question) return false
+      const id = message.message_id
+      const current = () => !stopping && epoch === stopEpoch && inbox.uncertainFollowUp?.message_id === id
+      void (async () => {
+        let consumed = false
+        try {
+          const room = join(paths.root, 'side-reply')
+          mkdirSync(room, { recursive: true, mode: 0o700 })
+          const progress = plans.slice(-5).map(step => step.status + ': ' + step.content)
+          const reply = await sideReply(redactSecrets(question, secrets), progress, prompt =>
+            requestStructured(room, codexEnv, prompt, sideReplySchema,
+              AbortSignal.any([learningAbort.signal, AbortSignal.timeout(25_000)])))
+          if (reply && current()) {
+            try {
+              await sendFinalText(reply, false, id)
+              consumed = true
+              markProcessed([message])
+            } catch (error) {
+              consumed = classifySendError(error, 30_000).kind === 'ambiguous'
+            }
+          }
+        } catch { log.info('Could not answer a Telegram side question independently') }
+        if (!stopping && inbox.uncertainFollowUp?.message_id === id) {
+          const enqueue = !consumed && epoch === stopEpoch
+          inbox.finishFollowUp(id, enqueue)
+          if (enqueue) resumeInbox()
+        }
+      })().catch(() => log.warn('Could not finish a Telegram side question'))
+      return true
+    }
+
     async function steerClaimed(messages: Message[], turnId: string): Promise<void> {
       const id = messages[0]!.message_id
       const epoch = stopEpoch
       let accepted = false
+      let completedRequest = false
       try {
         const input = await prepareMessages(messages)
         if (stopping || inbox.uncertainFollowUp?.message_id !== id) return
@@ -1118,10 +1167,13 @@ async function main(): Promise<void> {
           receipts.set(id, { turn: turnId, messages })
           accepted = await codex.steer([followUpInstructions, agentChatInstructions, chatContext(messages), input.text]
             .filter(Boolean).join('\n\n'), id, input.images, turnId)
+          completedRequest = true
         }
       } catch { log.info('Could not steer the current turn; preserving Telegram follow-up') }
       if (stopping) return
       if (!accepted) receipts.delete(id)
+      if (!accepted && completedRequest && epoch === stopEpoch && messages.length === 1 &&
+          launchSideReply(messages[0]!, epoch)) return
       inbox.finishFollowUp(id, !accepted && epoch === stopEpoch)
       if (accepted) log.info('Codex active turn received a Telegram follow-up', { album: messages.length > 1 })
       else resumeInbox()
@@ -1209,6 +1261,15 @@ async function main(): Promise<void> {
         return
       }
       const turnId = codex.steerableTurn
+      if (!action && text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
+          (task || goalActive || codex.isRunning) && process.env.KROT_CODEX_SIDE_REPLY === '1' &&
+          (!turnId || /^(?:отдельный|быстрый) вопрос:/iu.test(text)) && sideQuestion(text)) {
+        try {
+          const outcome = inbox.beginFollowUp(ctx.message)
+          if (outcome === 'duplicate') return
+          if (outcome === 'accepted' && launchSideReply(ctx.message, stopEpoch)) return
+        } catch { log.warn('Could not persist the Telegram side question') }
+      }
       if (!action && !ctx.message.media_group_id && turnId &&
           (text || hasMedia(ctx.message) || hasRichBody(ctx.message) || unhandledContentKeys(ctx.message).length)) {
         try {
@@ -1489,7 +1550,9 @@ async function main(): Promise<void> {
         })
         if (outcome === 'accepted') startNext()
         return outcome
-      })
+      }, approvals && policyToken && /^[a-z0-9_-]{32,128}$/i.test(policyToken) && policyToken !== env.TELEGRAM_WEBHOOK_TOKEN
+        ? { token: policyToken, request: request => stopping ? Promise.resolve('decline') : approvals.request(request) }
+        : undefined)
     }
     if (recoveringInbox) void resumeRecoveredInbox()
     startNext()

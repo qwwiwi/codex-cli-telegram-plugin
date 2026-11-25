@@ -2,21 +2,35 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import { WebhookMessagePayloadSchema } from '../schemas.js'
 import { bearerEquals, readBody, reply } from '../webhook/http.js'
+import { object } from './rpc.js'
+import type { ApprovalDecision, ApprovalRequest } from './session.js'
 
 type Queue = (request: string, id: number) => 'accepted' | 'duplicate' | 'full' | 'stopping'
+type PolicyApproval = { token: string; request: (approval: ApprovalRequest) => Promise<ApprovalDecision> }
 
-export async function startExternalTasks(port: number, token: string, chatId: string, enqueue: Queue) {
+export async function startExternalTasks(port: number, token: string, chatId: string, enqueue: Queue, policy?: PolicyApproval) {
   const server = createServer((req, res) => {
     void (async () => {
       if (req.method === 'GET' && req.url === '/health') return reply(res, 200, { status: 'ok' })
-      if (req.method !== 'POST' || req.url !== '/hooks/agent') return reply(res, 404, { error: 'not found' })
-      if (!bearerEquals(req.headers.authorization ?? '', 'Bearer ' + token)) {
+      const approvalRoute = req.url === '/hooks/permission/request' && policy
+      if (req.method !== 'POST' || (req.url !== '/hooks/agent' && !approvalRoute)) return reply(res, 404, { error: 'not found' })
+      if (!bearerEquals(req.headers.authorization ?? '', 'Bearer ' + (approvalRoute ? approvalRoute.token : token))) {
         return reply(res, 401, { error: 'unauthorized' })
       }
       const body = await readBody(req)
       if (body.tooLarge) return reply(res, 413, { error: 'payload too large' })
       let raw: unknown
       try { raw = JSON.parse(body.buf.toString('utf8')) } catch { return reply(res, 400, { error: 'invalid json' }) }
+      if (approvalRoute) {
+        const { kind, target, cwd, reason } = object(raw)
+        if ((kind !== 'command' && kind !== 'file') || typeof target !== 'string' || !target.trim() ||
+            target.length > 3000 || (cwd !== undefined && (typeof cwd !== 'string' || cwd.length > 1000))) {
+          return reply(res, 400, { decision: 'decline' })
+        }
+        const decision = await approvalRoute.request({ kind, target, ...(typeof cwd === 'string' ? { cwd } : {}),
+          ...(typeof reason === 'string' ? { reason: reason.slice(0, 400) } : {}) })
+        return reply(res, 200, { decision })
+      }
       const payload = WebhookMessagePayloadSchema.safeParse(raw)
       if (!payload.success || !payload.data.message.trim()) return reply(res, 400, { error: 'invalid payload' })
       if (payload.data.chatId !== chatId) return reply(res, 403, { error: 'chatId not in allowlist' })
