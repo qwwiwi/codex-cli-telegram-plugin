@@ -93,7 +93,7 @@ test('transcribes voice and retains the original attachment when transcription i
   const { deps } = fixture()
   globalThis.fetch = Object.assign(async () => new Response('Прочитай проект'), { preconnect: originalFetch.preconnect })
   expect(await prepareMedia({ voice: { ...baseFile, duration: 2 } }, deps)).toEqual({
-    kind: 'input', text: 'Прочитай проект', images: [],
+    kind: 'input', text: 'Прочитай проект', images: [], ownerTranscript: 'Прочитай проект',
   })
   expect(await prepareMedia({ voice: { ...baseFile, duration: 2 } }, { ...deps, env: {} })).toMatchObject({
     kind: 'input', text: expect.stringContaining('missing_key'),

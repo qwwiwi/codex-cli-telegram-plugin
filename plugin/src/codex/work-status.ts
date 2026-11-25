@@ -99,6 +99,12 @@ export class CodexWorkStatus {
     await this.pending
   }
 
+  repost(): void {
+    if (!this.busy || this.closed) return
+    this.generation++
+    this.render()
+  }
+
   receive({ method, params }: CodexEvent, currentThread: string | null): void {
     if (this.closed || typeof params.threadId !== 'string') return
     if (!['turn/started', 'turn/completed', 'thread/status/changed', 'thread/closed',

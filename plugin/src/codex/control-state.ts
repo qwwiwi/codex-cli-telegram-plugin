@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { atomicWriteInRoot } from '../autonomy/store.js'
 import { object } from './rpc.js'
 import type { LeaseTicket } from './lease.js'
+import { ownerExecutionTask } from './continuation.js'
 
 const filename = 'codex-controls.json'
 type FileDelivery = 'sending' | 'sent' | 'failed' | 'uncertain'
@@ -13,6 +14,7 @@ export class ControlState {
   goalThread: string | undefined
   goalDeliveryPending: boolean | undefined
   goalTextDelivery: 'sending' | 'sent' | undefined
+  pendingOwnerTask: { thread: string; objective: string } | undefined
   private threads: string[]
   private goalLeases: Record<string, LeaseTicket>
   private goalFiles: Record<string, FileDelivery>
@@ -30,6 +32,12 @@ export class ControlState {
     this.goalDeliveryPending = typeof data.goalDeliveryPending === 'boolean' ? data.goalDeliveryPending : undefined
     this.goalTextDelivery = data.goalTextDelivery === 'sending' || data.goalTextDelivery === 'sent'
       ? data.goalTextDelivery : undefined
+    const pending = object(data.pendingOwnerTask)
+    if (typeof pending.thread === 'string' && /^[a-z0-9-]{1,100}$/i.test(pending.thread) &&
+        typeof pending.objective === 'string' && pending.objective.length <= 4000 &&
+        ownerExecutionTask(pending.objective)) {
+      this.pendingOwnerTask = { thread: pending.thread, objective: pending.objective }
+    }
     this.goalFiles = Object.fromEntries(Object.entries(object(data.goalFiles)).flatMap(([key, value]) =>
       /^[a-f0-9]{64}$/.test(key) && (value === 'sending' || value === 'sent' || value === 'failed' || value === 'uncertain')
         ? [[key, value]] : []))
@@ -59,6 +67,17 @@ export class ControlState {
     this.goalLeases = Object.fromEntries(entries.slice(-10))
     try { this.save(this.mirror, this.model, this.threads) } catch (error) {
       this.goalLeases = previous
+      throw error
+    }
+  }
+
+  setPendingOwnerTask(thread: string | null, objective?: string): void {
+    const previous = this.pendingOwnerTask
+    if (!thread || (!objective && previous?.thread !== thread) ||
+        (previous?.thread === thread && previous.objective === objective)) return
+    this.pendingOwnerTask = objective ? { thread, objective } : undefined
+    try { this.save(this.mirror, this.model, this.threads) } catch (error) {
+      this.pendingOwnerTask = previous
       throw error
     }
   }
@@ -124,6 +143,7 @@ export class ControlState {
       JSON.stringify({
         mirror, model, threads, goalThread: this.goalThread, goalLeases: this.goalLeases,
         goalDeliveryPending: this.goalDeliveryPending, goalTextDelivery: this.goalTextDelivery, goalFiles: this.goalFiles,
+        pendingOwnerTask: this.pendingOwnerTask,
       }) + '\n')
     this.mirror = mirror
     this.model = model

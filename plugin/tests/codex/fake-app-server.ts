@@ -14,7 +14,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     const response = JSON.parse(line)
     emit({ method: 'item/completed', params: {
       threadId, turnId: activeTurn,
-      item: { type: 'agentMessage', phase: 'final_answer', text: response.result?.decision ?? 'unsupported' },
+      item: { type: 'agentMessage', phase: 'final_answer', text: response.result?.decision ??
+        (response.result?.action ? JSON.stringify(response.result) : 'unsupported') },
     } })
     emit({ method: 'turn/completed', params: {
       threadId, turn: { id: activeTurn, status: 'completed' },
@@ -109,6 +110,21 @@ for await (const line of createInterface({ input: process.stdin })) {
         } })
         emit({ method: 'turn/completed', params: { threadId, turn: { id: activeTurn, status: 'completed' } } })
         respond({ turn: { id: activeTurn } })
+        break
+      }
+      if (params.input[0].text.startsWith('mcp-approval:')) {
+        const scenario = params.input[0].text
+        respond({ turn: { id: activeTurn } })
+        emit({ method: 'turn/started', params: { threadId, turn: { id: activeTurn } } })
+        pendingApproval = 'mcp-approval-' + turnNumber
+        emit({ id: pendingApproval, method: 'mcpServer/elicitation/request', params: {
+          threadId, turnId: scenario.endsWith('stale') ? 'wrong-turn' : activeTurn,
+          serverName: 'example-tasks', mode: scenario.endsWith('url') ? 'url' : 'form',
+          message: 'Allow opening this test task?',
+          requestedSchema: { type: 'object', properties: {} },
+          _meta: { codex_approval_kind: 'mcp_tool_call', tool_name: 'task_read',
+            tool_params: { id: 42 }, persist: 'always' },
+        } })
         break
       }
       if (params.input[0].text.startsWith('approval:')) {

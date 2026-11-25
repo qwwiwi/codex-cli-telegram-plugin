@@ -20,7 +20,7 @@ import { buildForwardContext, buildReplyContext, type BotIdentity } from '../pro
 type MediaMessage = Pick<Message, 'caption' | 'photo' | 'document' | 'voice' | 'animation' | 'audio' | 'video' | 'video_note' | 'sticker'>
 type MediaDeps = MediaDownloadDeps & VoiceTranscribeDeps
 
-export type MediaInput = { kind: 'input'; text: string; images: string[] }
+export type MediaInput = { kind: 'input'; text: string; images: string[]; ownerTranscript?: string }
 type Preparation = MediaInput | { kind: 'error'; text: string }
 
 const TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -71,7 +71,7 @@ export async function prepareMedia(
     }
     const transcript = voice.transcript?.trim()
     if (!transcript) return { kind: 'error', text: 'В голосовом не удалось разобрать речь.' }
-    return { kind: 'input', text: caption ? caption + '\n\n' + transcript : transcript, images: [] }
+    return { kind: 'input', text: caption ? caption + '\n\n' + transcript : transcript, images: [], ownerTranscript: transcript }
   }
   if (message.photo?.length) {
     const [photo] = await buildPhotoDescriptor(message.photo, deps)
@@ -140,6 +140,7 @@ export function hasMedia(message: MediaMessage): boolean {
 export async function prepareInbound(messages: readonly Message[], deps: MediaDeps, bot: BotIdentity): Promise<Preparation> {
   const sections: string[] = []
   const images: string[] = []
+  let ownerTranscript: string | undefined
   let usable = 0
   for (const [index, message] of messages.entries()) {
     const origin = adaptForward(message)
@@ -173,10 +174,11 @@ export async function prepareInbound(messages: readonly Message[], deps: MediaDe
         JSON.stringify({ origin: attribution, content: prepared.text }))
     } else {
       sections.push(prepared.text)
+      if (index === 0) ownerTranscript = prepared.ownerTranscript
     }
     images.push(...prepared.images)
   }
   return usable
-    ? { kind: 'input', text: sections.join('\n\n'), images }
+    ? { kind: 'input', text: sections.join('\n\n'), images, ...(ownerTranscript ? { ownerTranscript } : {}) }
     : { kind: 'error', text: sections.join('\n') || 'Не удалось прочитать сообщение Telegram.' }
 }

@@ -6,8 +6,10 @@ import { agentChatTool, type AgentChatActions } from './chat-actions.js'
 import { isRoutineServerCommand } from './server-approval-policy.js'
 
 export type ApprovalDecision = 'accept' | 'decline' | 'cancel'
+import { parseMcpApproval } from './mcp-approval.js'
+
 export type ApprovalRequest = {
-  kind: 'command' | 'file' | 'network' | 'stdin'
+  kind: 'command' | 'file' | 'network' | 'stdin' | 'mcp'
   target: string
   cwd?: string
   reason?: string
@@ -195,7 +197,7 @@ export class CodexSession {
     if (threadId !== this.threadId) throw new Error('Wrong goal thread')
     await this.rpc.request('thread/goal/set', {
       threadId, status, origin,
-      ...(objective ? { objective, tokenBudget: 60000 } : {}),
+      ...(objective ? { objective, tokenBudget: null } : {}),
     })
   }
 
@@ -546,6 +548,19 @@ export class CodexSession {
       return { answers: ask
         ? await this.withServerRequest(id, current.threadId, signal => ask(params.questions, signal))
         : {} }
+    }
+    if (method === 'mcpServer/elicitation/request') {
+      const request = parseMcpApproval(params)
+      const approve = this.settings.approve
+      if (!request || !approve) return { action: 'cancel' }
+      const scope = await this.approvalExecution(request.threadId, request.turnId)
+      if (!scope) return { action: 'cancel' }
+      const { owner, execution } = scope
+      const decision = await this.withServerRequest(id, execution.threadId,
+        signal => approve(request.operation, signal)).catch(() => 'cancel')
+      if (!this.runningTurns().includes(owner) ||
+          (owner !== execution && owner.children.get(execution.threadId) !== execution)) return { action: 'cancel' }
+      return decision === 'accept' ? { action: 'accept', content: {} } : { action: decision }
     }
     const commandRequest = method === 'item/commandExecution/requestApproval'
     if (!commandRequest && method !== 'item/fileChange/requestApproval') return undefined

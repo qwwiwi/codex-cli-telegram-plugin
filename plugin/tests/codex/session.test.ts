@@ -49,6 +49,24 @@ test('keeps the final answer and resumes the same thread after restart', async (
   expect(state.readThread()).not.toBe(id)
 })
 
+test('relays a scoped MCP approval through the existing one-time callback', async () => {
+  const requests: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async request => {
+    requests.push(request)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  const accepted = await session.run('mcp-approval:valid')
+  expect(JSON.parse(accepted.text)).toEqual({ action: 'accept', content: {} })
+  for (const scenario of ['stale', 'url']) {
+    const invalid = await session.run('mcp-approval:' + scenario)
+    expect(JSON.parse(invalid.text)).toEqual({ action: 'cancel' })
+  }
+  expect(requests).toEqual([{
+    kind: 'mcp', reason: 'Allow opening this test task?', target: 'example-tasks / task_read\n{\n  "id": 42\n}',
+  }])
+})
+
 test('interrupts a running turn and can run a new turn afterward', async () => {
   const session = fixture().create()
   await session.initialize()

@@ -41,6 +41,20 @@ test('busy acknowledgement uses recent activity from the owner turn', async () =
   await status.close()
 })
 
+test('moves the working card below a public report and retains its activity timer', async () => {
+  let now = 1000
+  const { status, states, completed } = fixture(() => now)
+  status.begin(7)
+  await Bun.sleep(0)
+  now = 3200
+  status.repost()
+  await Bun.sleep(0)
+  expect(completed()).toBe(1)
+  const state = states.at(-1)
+  expect(state?.kind === 'activity' && renderActivityBlock(state.snapshot, 6000)).toContain('working -- 5s')
+  await status.close()
+})
+
 test('keeps the legacy working card open while a managed subagent outlives the turn', async () => {
   const { status, states, completed } = fixture()
   status.begin(7)
