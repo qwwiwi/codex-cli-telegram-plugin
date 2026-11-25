@@ -8,6 +8,11 @@ let pendingApproval = ''
 let childTurn = ''
 let resolveMcpDuringLookup: { requestId: string; threadId: string; turnId: string } | undefined
 let repeatedApproval: { prefix: string; results: Map<string, string> } | undefined
+// Threads started while the main turn waits are side threads; they keep the main thread intact.
+const sideThreads = new Set<string>()
+let mainWaiting = false
+let sideTurnNumber = 0
+let pendingSideApproval: { id: string; threadId: string; turnId: string } | undefined
 const goalState: { current: { objective: string; status: string; origin: string } | null } = { current: null }
 
 for await (const line of createInterface({ input: process.stdin })) {
@@ -30,6 +35,15 @@ for await (const line of createInterface({ input: process.stdin })) {
       } })
       repeatedApproval = undefined
     }
+    continue
+  }
+  if (!method && pendingSideApproval && id === pendingSideApproval.id) {
+    const { threadId: side, turnId } = pendingSideApproval
+    pendingSideApproval = undefined
+    emit({ method: 'item/completed', params: {
+      threadId: side, turnId, item: { type: 'agentMessage', phase: 'final_answer', text: 'side ' + JSON.parse(line).result?.decision },
+    } })
+    emit({ method: 'turn/completed', params: { threadId: side, turn: { id: turnId, status: 'completed' } } })
     continue
   }
   if (!method && id === pendingApproval) {
@@ -83,6 +97,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         emit({ id, error: { code: -32602, message: 'Unexpected sandbox policy' } })
         break
       }
+      if (mainWaiting && !params.threadId) {
+        const side = crypto.randomUUID()
+        sideThreads.add(side)
+        respond({ thread: { id: side }, model: 'side-model' })
+        break
+      }
       threadId = params.threadId ?? crypto.randomUUID()
       respond({ thread: { id: threadId }, model: 'gpt-test' })
       break
@@ -133,7 +153,32 @@ for await (const line of createInterface({ input: process.stdin })) {
       emit({ method: 'turn/completed', params: { threadId, turn: { id: activeTurn, status: 'completed' } } })
       break
     case 'turn/start': {
+      if (sideThreads.has(params.threadId)) {
+        const side = params.threadId
+        const turnId = 'side-turn-' + ++sideTurnNumber
+        const text = params.input[0].text
+        // A side turn reports as a fresh thread would: started, usage, then its answer.
+        emit({ method: 'turn/started', params: { threadId: side, turn: { id: turnId } } })
+        emit({ method: 'thread/tokenUsage/updated', params: {
+          threadId: side, turnId, tokenUsage: { last: { totalTokens: 99 }, modelContextWindow: 100 },
+        } })
+        emit({ method: 'item/started', params: { threadId: side, turnId, item: { id: 'side-cmd', type: 'commandExecution', command: 'ls' } } })
+        respond({ turn: { id: turnId } })
+        if (text.endsWith('side-approval')) {
+          pendingSideApproval = { id: 'side-approval-' + sideTurnNumber, threadId: side, turnId }
+          emit({ id: pendingSideApproval.id, method: 'item/commandExecution/requestApproval', params: {
+            threadId: side, turnId, itemId: 'side-item', command: 'printf side', cwd: '/workspace',
+          } })
+        } else if (!text.endsWith('side-wait')) {
+          emit({ method: 'item/completed', params: {
+            threadId: side, turnId, item: { type: 'agentMessage', phase: 'final_answer', text: 'side: ' + text },
+          } })
+          emit({ method: 'turn/completed', params: { threadId: side, turn: { id: turnId, status: 'completed' } } })
+        }
+        break
+      }
       activeTurn = 'turn-' + ++turnNumber
+      mainWaiting = params.input[0].text === 'wait'
       if (params.outputSchema) {
         emit({ method: 'item/completed', params: {
           threadId, turnId: activeTurn, item: { type: 'agentMessage', text: '{"entries":[]}' },
@@ -268,7 +313,13 @@ for await (const line of createInterface({ input: process.stdin })) {
       } })
       break
     case 'turn/interrupt':
+      if (sideThreads.has(params.threadId)) {
+        respond({})
+        emit({ method: 'turn/completed', params: { threadId: params.threadId, turn: { id: params.turnId, status: 'interrupted' } } })
+        break
+      }
       if (params.turnId !== activeTurn || params.threadId !== threadId) break
+      mainWaiting = false
       respond({})
       emit({ method: 'turn/completed', params: {
         threadId, turn: { id: activeTurn, status: 'interrupted' },

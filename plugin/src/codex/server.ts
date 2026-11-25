@@ -62,6 +62,7 @@ import { LearningMemory } from './learning.js'
 import { requestStructured, reviewLearning } from './learning-review.js'
 import { legacyCommand } from './legacy-command.js'
 import { sideQuestion, sideReply, sideReplySchema } from './side-reply.js'
+import { busyNotice, parallelSettings, routeWhileBusy, SideRegistry, sideInstructions, taskTitle } from './parallel.js'
 import { hasMedia, prepareInbound, type MediaInput } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { CodexSession } from './session.js'
@@ -292,6 +293,10 @@ async function main(): Promise<void> {
     let goalStarting: Promise<void> | undefined
     let hudReady = false
     let plans: TodoItem[] = []
+    // Parallel side threads (KROT_CODEX_PARALLEL=1); off keeps the single-thread flow.
+    const parallel = parallelSettings(process.env)
+    const sides = new SideRegistry()
+    let mainStartedAt = 0
     let milestoneThread = ''
     let lastNativePlan: { turnId: string; pending: boolean } | undefined
     const selfRestartEnabled = process.platform === 'linux' && process.env.KROT_CODEX_SELF_RESTART === '1'
@@ -300,7 +305,7 @@ async function main(): Promise<void> {
       idle: () => !stopping && !task && !work.busy && !codex.isRunning && !goalActive && !externalQuestion &&
         !resetting && !recoveringInbox && !recoveringGoal && !deliveringGoal && !approvals?.isPending &&
         !questions.isPending && !inbox.active && inbox.size === 0 && !inbox.uncertainFollowUp &&
-        Object.keys(inbox.recoveredAlbums).length === 0,
+        Object.keys(inbox.recoveredAlbums).length === 0 && sides.size === 0,
       notify: () => telegram.sendMessage(ownerChat, 'Перезапускаюсь. Итоговый ответ доставлен.', {}),
       restart: () => {
         log.info('Restarting bridge after owner notification')
@@ -544,7 +549,8 @@ async function main(): Promise<void> {
       } catch { log.warn('Could not write agent memory') }
     }
 
-    async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number): Promise<void> {
+    async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number,
+      onSent?: (id: number) => void): Promise<void> {
       text = normalizeChatReply(text)
       if (!text) return
       const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
@@ -606,6 +612,7 @@ async function main(): Promise<void> {
       }
       if (rich && 'message_id' in rich) {
         agentChat.remember(rich.message_id, true, true, true)
+        onSent?.(rich.message_id)
         await recordQuestion(rich.message_id)
         return
       }
@@ -618,6 +625,7 @@ async function main(): Promise<void> {
         try {
           const sent = await telegram.sendMessage(ownerChat, part, options)
           agentChat.remember(sent.message_id, true, true)
+          onSent?.(sent.message_id)
           if (index === 0) await recordQuestion(sent.message_id)
         } catch (error) {
           const flood = parse429(error)
@@ -628,6 +636,7 @@ async function main(): Promise<void> {
             if (!isTelegramHtmlParseError(error)) throw error
             const sent = await telegram.sendMessage(ownerChat, part, index === 0 ? quote : {})
             agentChat.remember(sent.message_id, true, true)
+            onSent?.(sent.message_id)
             if (index === 0) await recordQuestion(sent.message_id)
           }
         }
@@ -1127,7 +1136,11 @@ async function main(): Promise<void> {
         await codex.setGoal(controls.goalThread, 'paused')
         setGoalActive(false)
       }
-      return cancelMedia ? (cancelMedia(), true) : codex.stop()
+      const sideStopped = sides.size > 0 && await codex.stopSide().catch(() => {
+        log.warn('Could not stop a parallel Codex turn')
+        return true
+      })
+      return (cancelMedia ? (cancelMedia(), true) : await codex.stop()) || sideStopped
     }
 
     async function stop(): Promise<void> {
@@ -1349,6 +1362,106 @@ async function main(): Promise<void> {
       return true
     }
 
+    function mainSummary() {
+      const first = inbox.active?.messages[0]
+      const title = first ? taskTitle(first.text ?? first.caption) : goalActive ? 'цель агента' : 'текущая задача'
+      const step = plans.find(item => item.status === 'in_progress')?.content ?? plans.at(-1)?.content
+      return {
+        title: redactSecrets(title, secrets),
+        ...(step ? { step } : {}),
+        elapsedMs: mainStartedAt ? Date.now() - mainStartedAt : 0,
+      }
+    }
+
+    function sideDone(): void {
+      if (stopping) return
+      if (!task && !goalActive && !codex.isRunning && codex.sideRunning === 0) approvals?.cancelAll()
+      if (hudReady) void hud.bump(ownerChat)
+      startNext()
+      if (selfRestartEnabled) void bridgeRestart.check()
+    }
+
+    // Starts a side turn for one owner message; false leaves it to the usual path.
+    function launchSide(message: Message, reuse?: string): boolean {
+      const outcome = inbox.beginFollowUp(message)
+      if (outcome === 'duplicate') return true
+      if (outcome !== 'accepted') return false
+      const id = message.message_id
+      const epoch = stopEpoch
+      sides.begin(id, redactSecrets(taskTitle(message.text ?? message.caption), secrets), reuse)
+      void (async () => {
+        let started = false
+        const release = () => {
+          if (started) return
+          started = true
+          if (inbox.uncertainFollowUp?.message_id === id) inbox.finishFollowUp(id, false)
+          startNext()
+        }
+        try {
+          const input = await prepareMessages([message])
+          if (stopping || inbox.uncertainFollowUp?.message_id !== id) return
+          if (epoch !== stopEpoch) {
+            // The owner stopped work while the attachment was being prepared.
+            release()
+            return
+          }
+          if (input.kind === 'error') {
+            release()
+            await send(input.text)
+            return
+          }
+          const result = await codex.runSide([sideInstructions(mainSummary()), agentChatInstructions,
+            chatContext([message]), input.text].filter(Boolean).join('\n\n'), input.images, reuse, thread => {
+            sides.attach(id, thread)
+            release()
+          })
+          if (stopping) return
+          if (result.status === 'completed' && result.text.trim()) {
+            // A finished answer is delivered even if the main task was stopped meanwhile.
+            await sendFinalText(redactSecrets(hideLeaseCompletions(result.text), secrets), false, id, undefined,
+              sent => sides.remember(sent, result.threadId))
+            log.info('Codex side reply delivered')
+          } else if (epoch === stopEpoch) {
+            await send(result.status === 'interrupted' ? 'Параллельная задача остановлена.'
+              : 'Параллельный поток не вернул ответ. Отправь сообщение ещё раз.')
+          }
+        } catch {
+          log.warn('Could not finish a parallel Codex turn')
+          if (stopping) return
+          if (!started && inbox.uncertainFollowUp?.message_id === id) {
+            // Codex never took it: queue it for the main thread as before.
+            started = true
+            inbox.finishFollowUp(id, true)
+            resumeInbox(message)
+          } else if (epoch === stopEpoch) {
+            await send('Не удалось завершить параллельную задачу.').catch(() => undefined)
+          }
+        } finally {
+          sides.end(id)
+          sideDone()
+        }
+      })().catch(() => log.warn('Could not finish a parallel Codex turn'))
+      return true
+    }
+
+    async function queueWhileBusy(message: Message): Promise<void> {
+      try {
+        const outcome = inbox.receive(message)
+        if (outcome === 'full') {
+          await send('Очередь заполнена. Отправь это сообщение позже.')
+          return
+        }
+        if (outcome !== 'accepted') return
+        if (hudReady) void hud.bump(ownerChat)
+        startNext()
+        if (inbox.active?.messages[0]?.message_id !== message.message_id) {
+          await send(busyNotice(mainSummary(), sides.titles, parallel.maxParallel))
+        }
+      } catch {
+        await send('Не удалось сохранить сообщение. Отправь его ещё раз.')
+      }
+    }
+
     async function steerClaimed(messages: Message[], turnId: string): Promise<void> {
       const id = messages[0]!.message_id
       const epoch = stopEpoch
@@ -1477,6 +1590,20 @@ async function main(): Promise<void> {
         return
       }
       const turnId = codex.steerableTurn
+      if (parallel.enabled && !action && !ctx.message.media_group_id && (task || goalActive || codex.isRunning) &&
+          (text || hasMedia(ctx.message) || hasRichBody(ctx.message) || unhandledContentKeys(ctx.message).length)) {
+        const decision = routeWhileBusy({ text: text ?? ctx.message.caption, replyTo: ctx.message.reply_to_message?.message_id },
+          { keywords: parallel.keywords, maxParallel: parallel.maxParallel, sides })
+        if (decision.route === 'queue') {
+          await queueWhileBusy(ctx.message)
+          return
+        }
+        if (decision.route === 'side') {
+          try {
+            if (launchSide(ctx.message, decision.thread)) return
+          } catch { log.warn('Could not persist the Telegram message for a parallel turn') }
+        }
+      }
       if (!action && text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
           (task || goalActive || codex.isRunning) && process.env.KROT_CODEX_SIDE_REPLY === '1' &&
           (!turnId || /^(?:отдельный|быстрый) вопрос:/iu.test(text)) && sideQuestion(text)) {
@@ -1644,6 +1771,7 @@ async function main(): Promise<void> {
       const chatId = ownerChat
       const epoch = stopEpoch
       work.begin(first.message_id > 0 ? first.message_id : undefined)
+      mainStartedAt = Date.now()
       task = (async () => {
         let progressResult = 'Работа завершена'
         if (controls.mirror) {
@@ -1792,7 +1920,8 @@ async function main(): Promise<void> {
           progressResult = 'Работа завершилась с ошибкой'
           if (!stopping && inbox.active?.outcome.stage !== 'ready') await send('Не удалось завершить задачу Codex.')
         } finally {
-          if (!goalActive) approvals?.cancelAll()
+          // A running side turn may be waiting on its own approval card.
+          if (!goalActive && codex.sideRunning === 0) approvals?.cancelAll()
           cancelMedia = undefined
           work.finish()
           finishMirror(progressResult)

@@ -108,6 +108,10 @@ export class CodexSession {
   private lastActivity = Date.now()
   private active: Turn | undefined
   private goalTurn: Turn | undefined
+  // Parallel side turns, keyed by their own thread. Side threads never become
+  // the main conversation and are never treated as children of a main turn.
+  private readonly sides = new Map<string, Turn>()
+  private readonly sideThreads = new Set<string>()
 
   constructor(private readonly settings: Settings, onClose: () => void) {
     try {
@@ -123,6 +127,7 @@ export class CodexSession {
 
     this.rpc = new CodexRpc(settings.cwd, settings.env, event => this.receive(event), () => {
       this.active?.finish({ status: 'failed', text: '' })
+      for (const side of this.sides.values()) side.finish({ status: 'failed', text: '' })
       onClose()
     }, settings.command, request => this.requestApproval(request))
   }
@@ -305,6 +310,73 @@ export class CodexSession {
     })
   }
 
+  get sideRunning(): number {
+    return this.sides.size
+  }
+
+  // Runs one turn on a side thread next to the main conversation. `reuse`
+  // continues an earlier side thread; otherwise a fresh one is started.
+  // `onStarted` fires once Codex accepted the turn.
+  async runSide(text: string, imagePaths: readonly string[] = [], reuse?: string,
+    onStarted?: (threadId: string) => void): Promise<Result & { threadId: string }> {
+    if (reuse !== undefined && (!this.sideThreads.has(reuse) || this.sides.has(reuse))) {
+      throw new Error('This side thread is not available')
+    }
+    const model = this.settings.selectedModel?.() ?? this.settings.model
+    const threadId = reuse ?? await this.openSideThread(model)
+    let finish!: Turn['finish']
+    const completed = new Promise<Result>(resolve => { finish = resolve })
+    const turn: Turn = {
+      threadId, stop: false, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
+    }
+    this.sides.set(threadId, turn)
+    try {
+      const response = await this.rpc.request('turn/start', {
+        threadId,
+        ...(model ? { model } : {}),
+        input: [
+          { type: 'text', text, text_elements: [] },
+          ...imagePaths.map(path => ({ type: 'localImage', path })),
+        ],
+      })
+      const id = object(response.turn).id
+      if (typeof id !== 'string') throw new Error('Codex did not return a side turn ID')
+      if (!turn.id) this.setTurnId(turn, id)
+      onStarted?.(threadId)
+      return { ...await completed, threadId }
+    } finally {
+      if (this.sides.get(threadId) === turn) this.sides.delete(threadId)
+    }
+  }
+
+  // Interrupts every running side turn; true when there was one.
+  async stopSide(): Promise<boolean> {
+    const turns = [...this.sides.values()].filter(turn => !turn.stop)
+    for (const turn of turns) turn.stop = true
+    await Promise.all(turns.filter(turn => turn.id).map(turn =>
+      this.rpc.request('turn/interrupt', { threadId: turn.threadId, turnId: turn.id })))
+    return turns.length > 0
+  }
+
+  private async openSideThread(model: string | undefined): Promise<string> {
+    // Deliberately not openThread: the main thread, its model and usage stay as they are.
+    const reply = await this.rpc.request('thread/start', {
+      cwd: this.settings.cwd,
+      ...this.permissions(),
+      ...(model ? { model } : {}),
+      ...(this.settings.chatAction ? { dynamicTools: [agentChatTool] } : {}),
+    })
+    const id = object(reply.thread).id
+    if (typeof id !== 'string' || !id || id === this.threadId) throw new Error('Codex did not return a side thread ID')
+    this.sideThreads.add(id)
+    if (this.sideThreads.size > 64) {
+      for (const old of this.sideThreads) {
+        if (!this.sides.has(old)) { this.sideThreads.delete(old); break }
+      }
+    }
+    return id
+  }
+
   async compact(): Promise<Result['status']> {
     if (this.threadId === null) throw new Error('There is no Codex conversation to compact')
     return (await this.withTurn(async threadId => {
@@ -442,6 +514,11 @@ export class CodexSession {
       }
     }
     const observedId = typeof params.turnId === 'string' ? params.turnId : object(params.turn).id
+    if (typeof params.threadId === 'string' && this.sideThreads.has(params.threadId)) {
+      const side = this.sides.get(params.threadId)
+      if (side) this.receiveTurnEvent(side, method, params, false)
+      return
+    }
     if (method === 'turn/started' && typeof observedId === 'string' && typeof params.threadId === 'string' &&
         params.threadId === this.threadId && this.settings.mayRunGoal?.(params.threadId) &&
         (!this.active || !!this.active.id && this.active.id !== observedId)) {
@@ -470,14 +547,18 @@ export class CodexSession {
       }
     }
     if (!active || params.threadId !== active.threadId) return
+    this.receiveTurnEvent(active, method, params, true)
+  }
+
+  private receiveTurnEvent(active: Turn, method: string, params: Record<string, unknown>, progress: boolean): void {
     if (method === 'turn/started') {
       const id = object(params.turn).id
       if (!active.id && typeof id === 'string') this.setTurnId(active, id)
-      this.settings.onProgress?.('turn')
+      if (progress) this.settings.onProgress?.('turn')
     } else if (method === 'item/started') {
       if (active.id && params.turnId !== active.id) return
       const item = object(params.item)
-      if (typeof item.type === 'string') this.settings.onProgress?.(item.type)
+      if (progress && typeof item.type === 'string') this.settings.onProgress?.(item.type)
       recordFileChange(active, item)
     } else if (method === 'item/completed') {
       if (active.id && params.turnId !== active.id) return
@@ -501,7 +582,7 @@ export class CodexSession {
   }
 
   private runningTurns(): Turn[] {
-    return [this.active, this.goalTurn].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
+    return [this.active, this.goalTurn, ...this.sides.values()].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
   }
 
   private async approveInTurn(
