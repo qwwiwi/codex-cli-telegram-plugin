@@ -145,9 +145,11 @@ async function main(): Promise<void> {
   const approvals = process.env.KROT_CODEX_APPROVALS === '1'
     ? new ApprovalCards(ownerId, telegram, secrets, config.permission_gate.timeout_ms, cards)
     : undefined
+  const leases = new CodexLeases(paths, String(ownerId), log)
   const questions = new QuestionCards(String(ownerId), telegram, secrets, {
     timeoutMs: config.ask_user_question.timeout_ms, previewChars: config.ask_user_question.max_preview_chars,
-  }, cards)
+  }, cards, config.ask_user_question.enabled ? (intent, cardId, messageId) =>
+    leases.grantFromQuestion(intent, cardId, messageId) : undefined)
   const questionStore = new OpenQuestionStore(paths.openQuestions, log)
   const questionConfig = config.open_question_reminder
   const questionTick = createOpenQuestionTick({
@@ -196,7 +198,6 @@ async function main(): Promise<void> {
     let deliveryRetryAt = 0
     let recoveringGoal: string | undefined
     const controls = new ControlState(paths.root, config.tmux_mirror.enabled)
-    const leases = new CodexLeases(paths, ownerChat, log)
     const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => codexEnvironment.test(name)))
     const autoSaveLearning = process.env.KROT_CODEX_LEARNING_AUTO_SAVE === '1'
     let learning: LearningMemory | undefined
@@ -1462,6 +1463,9 @@ async function main(): Promise<void> {
             attachmentInstructions, leases.instructions(), agentChatInstructions, chatContext(messages),
             handoff,
             learning?.context(ownerText ?? input.text) ?? '',
+            config.ask_user_question.enabled
+              ? 'Чтобы предложить мандат, начни вопрос с [LEASE: точный объём; ttl=24h] и дай отдельные варианты «Да» и «Нет».'
+              : '',
             [autonomyInstructions, continuation?.instructions, leaseCompletion?.instructions,
               !editTarget && question.instructions].filter(Boolean).join(' '), input.text,
             ...(editTarget ? ['Для редактирования верни только готовый новый текст цитируемого сообщения в нужном формате.'] : []),
@@ -1478,7 +1482,8 @@ async function main(): Promise<void> {
               }
               return
             }
-            result = await codex.run('Ответы владельца на твой вопрос из карточки Telegram:\n' + JSON.stringify(answers), [], saveTurn)
+            result = await codex.run(leases.instructions() +
+              '\n\nОтветы владельца на твой вопрос из карточки Telegram:\n' + JSON.stringify(answers), [], saveTurn)
           }
           await agentChat.flush()
           if (stopping) return

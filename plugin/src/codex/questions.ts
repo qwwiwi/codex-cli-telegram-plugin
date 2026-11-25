@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { TelegramApi } from '../channel/tools.js'
+import { isAffirmativeLabel, parseLeaseMarker, type ParsedLeaseMarker } from '../autonomy/grant.js'
 import { redactSecrets } from '../safety/redact.js'
 import { object } from './rpc.js'
 import type { CardCleanup } from './card-cleanup.js'
@@ -8,8 +9,9 @@ export const QUESTION_CALLBACK = /^krot:q:([a-f0-9-]{36}):([0-9]|x|d)$/
 const questionMarker = /(?:^|\r?\n)(KROT_QUESTION_[a-f0-9-]{36}) (\{[^\r\n]*\})\s*$/u
 type Answer = Record<string, { answers: string[] }>
 type Choice = { label: string; description?: string }
-type Pending = { id: string; messageId?: number; answer: (choices?: string[]) => void; options: string[];
+type Pending = { id: string; messageId?: number; answer: (choices?: string[], affirmativeTap?: boolean) => void; options: string[];
   other: boolean; selected?: Set<number>; paint: () => void }
+type GrantLease = (intent: ParsedLeaseMarker, cardId: string, messageId: number) => Promise<string>
 
 export function questionFallback() {
   const marker = 'KROT_QUESTION_' + randomUUID()
@@ -45,6 +47,7 @@ export class QuestionCards {
     private readonly secrets: ReadonlyArray<string>,
     private readonly options = { timeoutMs: 120_000, previewChars: 1000 },
     private readonly cleanup?: CardCleanup,
+    private readonly grantLease?: GrantLease,
   ) {}
 
   get isPending(): boolean { return this.current !== undefined }
@@ -60,7 +63,7 @@ export class QuestionCards {
           ...(typeof option.description === 'string' ? { description: option.description } : {}),
         }] : []) : []
       const answer = await this.show(question.question, options, question.isOther === true || options.length === 0,
-        question.multiSelect === true && options.length > 1, signal)
+        question.multiSelect === true, signal)
       if (answer === undefined) break
       answers[question.id] = { answers: answer }
     }
@@ -82,7 +85,7 @@ export class QuestionCards {
       if (current.selected) {
         if (!current.selected.delete(index)) current.selected.add(index)
         current.paint()
-      } else current.answer([value])
+      } else current.answer([value], isAffirmativeLabel(value))
     }
     return true
   }
@@ -96,15 +99,25 @@ export class QuestionCards {
 
   cancel(): void { this.current?.answer() }
 
-  private show(question: string, choices: Choice[], other: boolean, multi: boolean, signal?: AbortSignal): Promise<string[] | undefined> {
-    if (this.current) return Promise.resolve(undefined)
+  private show(question: string, choices: Choice[], other: boolean, multiSelect: boolean, signal?: AbortSignal): Promise<string[] | undefined> {
+    if (this.current || signal?.aborted) return Promise.resolve(undefined)
     const id = randomUUID()
     const safe = (text: string) => redactSecrets(text, this.secrets)
     const options = choices.map(choice => choice.label)
+    const multi = multiSelect && options.length > 1
+    const approvals = options.filter(isAffirmativeLabel)
+    const marker = this.grantLease && !multiSelect && approvals.length ? parseLeaseMarker(question) : null
+    const lease = marker && safe(marker.scope) === marker.scope ? marker : null
+    const mandate = lease
+      ? 'Мандат: ' + lease.scope + '\nСрок: ' + lease.ttlHours + ' ч.' +
+        (lease.supersede ? '\nДействующие мандаты с другим объёмом будут отозваны.' : '') +
+        '\nМандат выдаётся по кнопке ' + approvals.map(label => '«' + label.trim() + '»').join(' или ') + '.\n\n'
+      : ''
     const details = choices.flatMap(choice => choice.description ? [
       safe(choice.label).slice(0, 80) + ' — ' + safe(choice.description).slice(0, this.options.previewChars),
     ] : []).join('\n').slice(0, 1100)
-    const body = '❔ ' + safe(question).slice(0, 2500) + (details ? '\n\n' + details : '') +
+    const body = mandate + '❔ ' + safe(lease?.displayText ?? question).slice(0, 2400 - mandate.length) +
+      (details ? '\n\n' + details : '') +
       (multi ? '\n\nВыбери один или несколько вариантов и нажми «Готово».' : '') +
       (other ? '\n\nЧтобы ввести свой вариант, ответь на эту карточку.' : '')
     const callback = 'krot:q:' + id + ':'
@@ -131,13 +144,20 @@ export class QuestionCards {
             await this.api.editMessageText(this.chat, pending.messageId, body, { reply_markup: keyboard() })
           }
         }).catch(() => undefined)
-      }, answer: value => {
+      }, answer: (value, affirmativeTap) => {
         if (this.current !== pending) return
         this.current = undefined
         clearTimeout(timer)
         signal?.removeEventListener('abort', cancel)
         if (pending.messageId !== undefined) void updates.then(() => close(pending.messageId!))
-        resolve(value)
+        const messageId = pending.messageId
+        if (lease && affirmativeTap && messageId !== undefined && this.grantLease) {
+          void this.grantLease(lease, id, messageId).catch(() => 'Мандат не выдан. Не удалось сохранить его в реестре.')
+            .then(feedback => {
+              void this.api.sendMessage(this.chat, feedback, {}).catch(() => undefined)
+              resolve(value)
+            })
+        } else resolve(value)
       } }
       const timer = setTimeout(() => pending.answer(), this.options.timeoutMs)
       this.current = pending

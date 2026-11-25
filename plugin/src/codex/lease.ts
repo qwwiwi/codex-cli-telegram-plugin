@@ -1,4 +1,4 @@
-import { grantLease, parseLeaseCommandArgs } from '../autonomy/grant.js'
+import { grantLease, parseLeaseCommandArgs, type ParsedLeaseMarker } from '../autonomy/grant.js'
 import {
   activeLeases, addQuestion, consumeLease, humanizeDurationMs, loadAutonomyState, openQuestions,
   resolveQuestion, revokeLease, updateAutonomyState,
@@ -102,6 +102,20 @@ export class CodexLeases {
       return { state: out.state, result: out.outcome }
     }, this.log, now)
     return result.kind === 'ok' && result.result === 'ok'
+  }
+
+  async grantFromQuestion(intent: ParsedLeaseMarker, cardId: string, messageId: number): Promise<string> {
+    const now = Date.now()
+    const result = await grantLease(this.paths, this.chatId, {
+      scope: intent.scope, ttlHours: intent.ttlHours, supersede: intent.supersede, source: 'ask_card',
+      grantSourceId: 'ask:codex:' + cardId, grantorMessageId: messageId,
+    }, this.log, now)
+    if (result.kind !== 'ok' || !result.lease || result.outcome === 'source_conflict' ||
+        result.lease.expiresAtMs <= now || result.lease.revokedAtMs || result.lease.consumedAtMs) {
+      return 'Мандат не выдан. Не удалось сохранить его в реестре.'
+    }
+    return 'Мандат ' + result.lease.id + ' действует ещё ' + humanizeDurationMs(result.lease.expiresAtMs - now) +
+      '. Карточки подтверждения Codex продолжают действовать.'
   }
 
   async command(args: string, messageId: number): Promise<string> {

@@ -273,6 +273,68 @@ test('multi-select keeps the card open until Done and returns both retained opti
   expect(await result).toEqual({ list: { answers: ['A', 'B'] } })
 })
 
+test('only an affirmative owner button on a visible single-choice card grants a mandate', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-ask-lease-'))
+  const leases = new CodexLeases({ root }, '111', createLogger('test'))
+  const sent: { text: string; buttons: Record<string, string>; id: number }[] = []
+  const cards = new QuestionCards('111', {
+    async sendMessage(_chat, text, options) {
+      const buttons: Record<string, string> = {}
+      for (const row of options?.reply_markup?.inline_keyboard ?? []) {
+        for (const button of row) if ('callback_data' in button) buttons[button.text] = button.callback_data
+      }
+      const id = sent.length + 1
+      sent.push({ text, buttons, id })
+      return { message_id: id }
+    },
+    async editMessageText() {},
+  }, ['hidden-scope'], { timeoutMs: 2000, previewChars: 100 }, undefined,
+  (intent, id, messageId) => leases.grantFromQuestion(intent, id, messageId))
+  const options = ['Да', 'Нет'].map(label => ({ label }))
+  const ask = (question: string, extra = {}) => cards.ask([{ id: 'q', question, options, isOther: true, ...extra }])
+  try {
+    const yes = ask('[LEASE: Проверить отчёт; ttl=2h] Продолжить?')
+    await Promise.resolve()
+    const first = sent.at(-1)!
+    expect(first.text).toContain('Проверить отчёт')
+    expect(first.text).toContain('2 ч')
+    expect(cards.resolve(first.buttons['Да']!, 42)).toBe(false)
+    expect(cards.resolve(first.buttons['Да']!, first.id)).toBe(true)
+    expect(cards.resolve(first.buttons['Да']!, first.id)).toBe(false)
+    expect(await yes).toEqual({ q: { answers: ['Да'] } })
+    expect(sent.at(-1)!.text).toContain('Мандат L-')
+    expect(leases.instructions()).toContain('Проверить отчёт')
+
+    const typed = ask('[LEASE: Текст вместо кнопки] Продолжить?')
+    await Promise.resolve()
+    expect(cards.reply(sent.at(-1)!.id, 'Да')).toBe(true)
+    await typed
+
+    const multi = ask('[LEASE: Несколько вариантов] Продолжить?', { multiSelect: true })
+    await Promise.resolve()
+    const multiCard = sent.at(-1)!
+    expect(cards.resolve(multiCard.buttons['Да']!, multiCard.id)).toBe(true)
+    expect(cards.resolve(multiCard.buttons['Готово']!, multiCard.id)).toBe(true)
+    await multi
+
+    const singleOptionMulti = ask('[LEASE: Один вариант в мультивыборе] Продолжить?', {
+      multiSelect: true, options: [{ label: 'Да' }],
+    })
+    await Promise.resolve()
+    const single = sent.at(-1)!
+    expect(cards.resolve(single.buttons['Да']!, single.id)).toBe(true)
+    await singleOptionMulti
+
+    const secret = ask('[LEASE: hidden-scope] Продолжить?')
+    await Promise.resolve()
+    const secretCard = sent.at(-1)!
+    expect(secretCard.text).not.toContain('hidden-scope')
+    expect(cards.resolve(secretCard.buttons['Да']!, secretCard.id)).toBe(true)
+    await secret
+    expect(leases.instructions()).not.toMatch(/Текст вместо кнопки|Несколько вариантов|Один вариант в мультивыборе|hidden-scope/u)
+  } finally { cards.cancel(); rmSync(root, { recursive: true, force: true }) }
+})
+
 test('selects one archived Claude session across dates without mixing same-day sessions', async () => {
   const root = mkdtempSync(join(tmpdir(), 'krot-archive-session-'))
   try {
