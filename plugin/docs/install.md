@@ -19,6 +19,11 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   `on-request` with its workspace sandbox. The owner sees the exact command or
   file diff. Set `permission_gate.timeout_ms` in the Telegram config to change
   the two-minute timeout.
+- Set `KROT_CODEX_SANDBOX=danger-full-access` for a fully autonomous agent.
+  Codex then runs without its sandbox: it has network access and can write
+  anywhere the service user can. With `KROT_CODEX_APPROVALS` unset or `0`
+  Codex uses `never` and shows no approval cards. Use it only when the bridge
+  runs as a dedicated unprivileged OS user. The default is `workspace-write`.
 - For an existing host-managed Codex App Server, follow the [local relay setup](root-backend.md).
   The relay uses a root-owned configuration file and the Telegram process runs as its own non-root user.
 - Set `KROT_CODEX_AGENT_ID` to match the destination identifier used by an external service.

@@ -17,6 +17,10 @@ export type ApprovalRequest = {
   notice?: string
   dedupeKey?: string
 }
+// Codex sandbox modes the bridge may request. 'danger-full-access' is meant only
+// for a dedicated unprivileged OS user; with approvals off it means no cards.
+export type CodexSandboxMode = 'workspace-write' | 'danger-full-access'
+
 export type PolicyApprovalRequest = ApprovalRequest & {
   kind: 'command' | 'file'
   operation?: { threadId: string; turnId: string; itemId: string }
@@ -36,6 +40,7 @@ type Settings = {
   onGoalResult?: (threadId: string, result: Result) => void
   approve?: (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>
   riskyApprovals?: boolean
+  sandbox?: CodexSandboxMode
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
   chatAction?: (key: string, args: unknown, current: () => boolean) => ReturnType<AgentChatActions['call']>
 }
@@ -165,8 +170,7 @@ export class CodexSession {
   async fork(): Promise<string> {
     const source = await this.attachGoalThread()
     const response = await this.rpc.request('thread/fork', {
-      threadId: source, cwd: this.settings.cwd, excludeTurns: true,
-      approvalPolicy: this.settings.approve ? 'on-request' : 'never', sandbox: 'workspace-write',
+      threadId: source, cwd: this.settings.cwd, excludeTurns: true, ...this.permissions(),
     })
     const id = object(response.thread).id
     if (typeof id !== 'string' || !id || id === source) throw new Error('Codex did not return a forked thread')
@@ -370,12 +374,18 @@ export class CodexSession {
     return this.openThread(this.threadId)
   }
 
+  private permissions(): { approvalPolicy: 'on-request' | 'never'; sandbox: CodexSandboxMode } {
+    return {
+      approvalPolicy: this.settings.approve ? 'on-request' : 'never',
+      sandbox: this.settings.sandbox ?? 'workspace-write',
+    }
+  }
+
   private async openThread(expected: string | null): Promise<string> {
     const model = this.settings.selectedModel?.() ?? this.settings.model
     const options = {
       cwd: this.settings.cwd,
-      approvalPolicy: this.settings.approve ? 'on-request' : 'never',
-      sandbox: 'workspace-write',
+      ...this.permissions(),
       ...(model ? { model } : {}),
     }
     const reply = expected

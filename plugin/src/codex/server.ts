@@ -215,6 +215,11 @@ async function main(): Promise<void> {
     tokenLock.release(paths)
     throw new Error('A Codex proxy requires an absolute path and Telegram approval handling')
   }
+  if (proxy && env.KROT_CODEX_SANDBOX === 'danger-full-access') {
+    // The root relay admits only workspace-write thread settings.
+    tokenLock.release(paths)
+    throw new Error('KROT_CODEX_SANDBOX=danger-full-access cannot be used with KROT_CODEX_PROXY')
+  }
   let stopping = false
   let session: CodexSession | undefined
   let task: Promise<void> | undefined
@@ -442,6 +447,7 @@ async function main(): Promise<void> {
         })
       },
       ...(approvals ? { approve: (request, signal) => approvals.request(request, signal), riskyApprovals } : {}),
+      ...(env.KROT_CODEX_SANDBOX ? { sandbox: env.KROT_CODEX_SANDBOX } : {}),
       ask: (input, signal) => questions.ask(input, signal),
       chatAction: (key, args, current) => {
         const epoch = stopEpoch

@@ -77,7 +77,9 @@ for await (const line of createInterface({ input: process.stdin })) {
         } })
         break
       }
-      if (!['never', 'on-request'].includes(params.approvalPolicy) || params.sandbox !== 'workspace-write') {
+      // argv[4] pins the exact "approvalPolicy/sandbox" pair a test expects.
+      if (process.argv[4] ? params.approvalPolicy + '/' + params.sandbox !== process.argv[4]
+        : !['never', 'on-request'].includes(params.approvalPolicy) || params.sandbox !== 'workspace-write') {
         emit({ id, error: { code: -32602, message: 'Unexpected sandbox policy' } })
         break
       }

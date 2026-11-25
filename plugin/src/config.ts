@@ -518,6 +518,9 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_ALBUM_FLUSH_MS: z.coerce.number().int().positive().optional(),
   GROQ_API_KEY: z.string().optional(),
   KROT_CODEX_APPROVAL_MODE: z.enum(['standard', 'risky']).optional(),
+  // Codex sandbox (session.ts CodexSandboxMode). Absent means workspace-write.
+  // danger-full-access only for a dedicated unprivileged OS user.
+  KROT_CODEX_SANDBOX: z.enum(['workspace-write', 'danger-full-access']).optional(),
   TELEGRAM_WEBHOOK_HOST: z.string().optional(),
   TELEGRAM_WEBHOOK_PORT: z.coerce.number().int().min(0).optional(),
   TELEGRAM_WEBHOOK_TOKEN: z.string().optional(),
