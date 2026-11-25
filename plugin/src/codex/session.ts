@@ -5,6 +5,7 @@ import { sameFilePatch, type NativeFileChange } from './file-approval.js'
 import { agentChatTool, type AgentChatActions } from './chat-actions.js'
 import { isRoutineServerCommand } from './server-approval-policy.js'
 import { parseMcpApproval } from './mcp-approval.js'
+import { parseRateLimits, type CodexLimitWindow } from '../status/codex-limits.js'
 
 export type ApprovalDecision = 'accept' | 'decline' | 'cancel'
 
@@ -247,14 +248,8 @@ export class CodexSession {
       .map(x => ({ name: x.model as string, default: x.isDefault === true })) : []
   }
 
-  async usageLimits(): Promise<Array<{ used: number; minutes?: number }>> {
-    const reply = await this.rpc.request('account/rateLimits/read', {})
-    const rate = object(object(reply.rateLimitsByLimitId).codex ?? reply.rateLimits)
-    return [rate.primary, rate.secondary].map(object).flatMap(window =>
-      typeof window.usedPercent === 'number' && Number.isFinite(window.usedPercent)
-        ? [{ used: Math.round(window.usedPercent),
-          ...(typeof window.windowDurationMins === 'number' ? { minutes: window.windowDurationMins } : {}) }]
-        : [])
+  async usageLimits(): Promise<CodexLimitWindow[]> {
+    return parseRateLimits(await this.rpc.request('account/rateLimits/read', {}))
   }
 
   async recentTurns(): Promise<{ turns: unknown[]; partial: boolean }> {

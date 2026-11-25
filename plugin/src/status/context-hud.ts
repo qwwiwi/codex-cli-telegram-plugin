@@ -179,6 +179,7 @@ function modeLabel(permissionMode: string): string {
  * «выполнение», only when the permission mode is known) and a compact
  * «Задачи» section (renderStatusTasks) — the combined status pin the
  * owner asked for on 2026-07-04: ONE pinned message = context + work.
+ * An optional `limitsLine` (Codex account rate limits) follows the mode line.
  *
  * PURE — no I/O, no clock — so it is trivially unit-testable against fixed inputs.
  */
@@ -188,6 +189,7 @@ export function renderHud(
   model?: string,
   work?: HudWorkView,
   autonomyLine?: string,
+  limitsLine?: string,
 ): { text: string; keyboard: InlineKeyboardLike } {
   const keyboard = buildHudKeyboard()
   const modelLine = model !== undefined && model.length > 0 ? `\n<i>${escapeHtml(model)}</i>` : ''
@@ -195,6 +197,9 @@ export function renderHud(
     work?.permissionMode !== undefined && work.permissionMode.length > 0
       ? `\n<i>режим: ${modeLabel(work.permissionMode)}</i>`
       : ''
+  // Codex account limits (formatCodexLimitsLine), plain text, escaped here.
+  const limitsBlock =
+    limitsLine !== undefined && limitsLine.length > 0 ? `\n${escapeHtml(limitsLine)}` : ''
   // Autonomy pin line (ported from upstream): one compact line when active
   // mandates / open owner questions exist. Already HTML-escaped by
   // buildAutonomyHudLine (the HUD passes escapeHtml), so it is safe under the
@@ -203,7 +208,7 @@ export function renderHud(
     autonomyLine !== undefined && autonomyLine.length > 0 ? `\n${autonomyLine}` : ''
   const tasksBlock = work !== undefined ? renderStatusTasks(work.todos) : ''
   const tasksSection = tasksBlock.length > 0 ? `\n\n${tasksBlock}` : ''
-  const tail = `${modelLine}${modeLine}${autonomyBlock}${tasksSection}`
+  const tail = `${modelLine}${modeLine}${limitsBlock}${autonomyBlock}${tasksSection}`
 
   if (usage === null) {
     return { text: `🧠 <b>Контекст</b>: —${tail}`, keyboard }

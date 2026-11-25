@@ -21,6 +21,7 @@ import { createSafeTelegramApi } from '../safety/safe-telegram-api.js'
 import { createRichLatch } from '../safety/rich-latch.js'
 import { ensureStateDirs, writeDeadLetter } from '../state/store.js'
 import { OpenQuestionStore } from '../state/open-question-store.js'
+import { CodexLimitsCache } from '../status/codex-limits.js'
 import { ContextHud, HUD_PREFIX, renderHud } from '../status/context-hud.js'
 import { FileOrphanStore, sweepOrphanBubbles } from '../status/orphan-store.js'
 import { StatusManager } from '../status/status-manager.js'
@@ -481,6 +482,12 @@ async function main(): Promise<void> {
     }
 
     const menu = codexCommands(config, !!learning)
+    // Account limits for the HUD: cached for a minute and refreshed in the
+    // background, so a slow or failing read never delays or breaks the HUD.
+    const codexLimits = new CodexLimitsCache(() => codex.usageLimits(), {
+      onChange: () => { if (hudReady) void hud.updateNow(ownerChat) },
+      onError: () => log.warn('Could not read Codex limits for the HUD'),
+    })
     const hud = new ContextHud({
       enabled: resolveHudEnabled(config),
       ownerChatIds: [ownerId],
@@ -493,7 +500,7 @@ async function main(): Promise<void> {
         const autonomy = buildAutonomyHudLine(loadAutonomyState(paths, ownerChat, log), Date.now(), {
           escape: text => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
         })
-        return renderHud(usage ?? null, usage?.windowTokens ?? 0, model, { todos: plans }, autonomy)
+        return renderHud(usage ?? null, usage?.windowTokens ?? 0, model, { todos: plans }, autonomy, codexLimits.line())
       },
       api: {
         ...telegram,
