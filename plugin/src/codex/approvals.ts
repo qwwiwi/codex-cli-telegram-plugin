@@ -41,7 +41,7 @@ export class ApprovalCards {
       return Promise.resolve('decline')
     }
 
-    const tool = request.kind === 'command' ? 'Bash' : 'Edit'
+    const tool = { network: 'Сетевой доступ', stdin: 'Ввод в терминал', command: 'Bash', file: 'Edit' }[request.kind]
     const reason = redactSecrets(request.reason?.trim().slice(0, 400) || 'Действие требует твоего подтверждения.', this.secrets)
     const preview = renderPermissionCard(tool, reason, operation)
     const summary = renderPermissionCard(tool, reason, '')

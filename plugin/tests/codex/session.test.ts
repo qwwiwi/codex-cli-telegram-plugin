@@ -191,6 +191,24 @@ test('relays a verified subagent approval and rejects a different child turn', a
   expect(seen[0]).toMatchObject({ kind: 'command', target: 'printf test' })
 })
 
+test('asks once for the exact local network destination without allowing persistent, remote or unseen actions', async () => {
+  const seen: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async approval => {
+    seen.push(approval)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  expect((await session.run('approval:network')).text).toBe('accept')
+  expect((await session.run('approval:network-persistent-only')).text).toBe('decline')
+  expect((await session.run('approval:network-remote')).text).toBe('decline')
+  expect((await session.run('approval:network-invalid')).text).toBe('decline')
+  expect((await session.run('approval:stdin')).text).toBe('decline')
+  expect((await session.run('approval:stdin-visible')).text).toBe('accept')
+  expect(seen).toHaveLength(2)
+  expect(seen[0]).toMatchObject({ kind: 'network', target: 'https://example.test:443\n\nprintf test' })
+  expect(seen[1]).toMatchObject({ kind: 'stdin', target: "write_stdin --session-id 123 'test input'" })
+})
+
 test('reuses one YAML decision for the same Codex command and asks again for a different command', async () => {
   const seen: ApprovalRequest[] = []
   let session: CodexSession
@@ -214,5 +232,12 @@ test('reuses one YAML decision for the same Codex command and asks again for a d
     expect(seen.map(request => request.target)).toEqual([
       'printf test', 'printf test', 'printf test', "/usr/bin/bash -lc 'printf other'",
     ])
+    seen.length = 0
+    expect((await session.run('approval:policy-file')).text).toBe('accept')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.target).toContain('*** Delete File: nested/remove.txt')
+    expect((await session.run('approval:policy-file-mismatch')).text).toBe('accept')
+    expect(seen).toHaveLength(3)
+    expect(seen.at(-1)?.target).toContain('+different')
   } finally { server.close() }
 })

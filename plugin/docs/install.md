@@ -174,6 +174,14 @@ with the configured bearer token. For example, send
 the configured owner. The request must include a real task ID and task content.
 `GET /healthz` returns the same liveness response as `GET /health`.
 
+With the same task bearer, local callers can post the legacy question envelope
+to `/hooks/ask-user-question/request` when `ask_user_question.enabled` is on.
+The owner's Telegram answer is returned in `updatedInput.answers`. Use
+`/hooks/react` to acknowledge a recent inbound message in the configured
+private chat. Legacy Bash previews can be sent to `/hooks/permission/request`
+with the separate policy bearer when the permission gate is enabled. The
+bridge handles final-reply recovery through its persisted inbox.
+
 The bridge supports one active turn, with up to ten incoming items per album.
 It keeps a thread ID in `codex-thread.json` and uses Codex's workspace sandbox.
 The Telegram offset identifies accepted updates. An interrupted or crashed

@@ -50,6 +50,7 @@ export class CodexWorkStatus {
   private thought = ''
   private replyTo: number | undefined
   private startedAt = 0
+  private lastActivityAt = 0
   private generation = 0
   private renderedGeneration = 0
   private handle: StatusHandle | undefined
@@ -68,6 +69,10 @@ export class CodexWorkStatus {
     return !this.closed && (this.foreground || this.native.size > 0 || this.children.size > 0 || this.commands.size > 0)
   }
 
+  recentlyBusy(thresholdMs: number): boolean {
+    return this.busy && this.now() - this.lastActivityAt < thresholdMs
+  }
+
   get hasWorker(): boolean {
     return this.children.size > 0 || this.commands.size > 0
   }
@@ -78,6 +83,7 @@ export class CodexWorkStatus {
 
   begin(messageId?: number): void {
     if (!this.busy) this.newActivity(messageId)
+    else this.lastActivityAt = this.now()
     this.foreground = true
     this.render()
   }
@@ -101,6 +107,7 @@ export class CodexWorkStatus {
     if (thread !== currentThread && !this.children.has(thread) && !this.native.has(thread) &&
         ![...this.commands.values()].includes(thread)) return
     const wasBusy = this.busy
+    if (wasBusy) this.lastActivityAt = this.now()
     let update = false
     const item = object(params.item)
     if (method === 'turn/started' || method === 'thread/status/changed') {
@@ -179,6 +186,7 @@ export class CodexWorkStatus {
     this.generation++
     this.replyTo = replyTo
     this.startedAt = this.now()
+    this.lastActivityAt = this.startedAt
     this.thought = ''
     this.calls.clear()
   }

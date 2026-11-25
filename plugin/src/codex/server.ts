@@ -43,7 +43,8 @@ import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal }
 import { deliverReplyPart, type PartStatus } from './reply-delivery.js'
 import { readHandoffContext } from './handoff-context.js'
 import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
-  safeActionTarget, type ChatAction } from './chat-actions.js'
+  downloadQuotedAttachment, safeActionTarget, type ChatAction } from './chat-actions.js'
+import { InboundWatcher } from '../telegram/watcher.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
 import { LearningMemory } from './learning.js'
 import { requestStructured, reviewLearning } from './learning-review.js'
@@ -146,11 +147,20 @@ async function main(): Promise<void> {
     ? new ApprovalCards(ownerId, telegram, secrets, config.permission_gate.timeout_ms, cards)
     : undefined
   const leases = new CodexLeases(paths, String(ownerId), log)
+  const questionStore = new OpenQuestionStore(paths.openQuestions, log)
   const questions = new QuestionCards(String(ownerId), telegram, secrets, {
     timeoutMs: config.ask_user_question.timeout_ms, previewChars: config.ask_user_question.max_preview_chars,
+    persistence: { root: paths.root, log },
+    async onUnanswered({ messageId, askedAtMs, snippet }) {
+      const chatId = String(ownerId)
+      const previous = questionStore.get(chatId)
+      if (previous?.messageId !== messageId && (previous?.askedAtMs ?? 0) <= askedAtMs) {
+        questionStore.set({ chatId, messageId, askedAtMs, code: 'AQ_CARD', snippet, remindersSent: 0 })
+      }
+      await leases.recordQuestion(messageId, snippet)
+    },
   }, cards, config.ask_user_question.enabled ? (intent, cardId, messageId) =>
     leases.grantFromQuestion(intent, cardId, messageId) : undefined)
-  const questionStore = new OpenQuestionStore(paths.openQuestions, log)
   const questionConfig = config.open_question_reminder
   const questionTick = createOpenQuestionTick({
     store: questionStore, config: questionConfig, log,
@@ -168,6 +178,7 @@ async function main(): Promise<void> {
   let session: CodexSession | undefined
   let task: Promise<void> | undefined
   let externalTasks: Awaited<ReturnType<typeof startExternalTasks>> | undefined
+  let externalQuestion = false
   const inbox = new CodexInbox(paths.root, ownerId)
   const albums = new AlbumBuffer<Message>({ flushMs: config.album.flush_ms })
   let cancelMedia: (() => void) | undefined
@@ -184,7 +195,7 @@ async function main(): Promise<void> {
     clearTimeout(recoveryTimer)
     clearTimeout(goalRecoveryTimer)
     approvals?.cancelAll()
-    questions.cancel()
+    questions.suspend()
     externalTasks?.close()
     session?.close()
     void poller.stop()
@@ -194,6 +205,17 @@ async function main(): Promise<void> {
 
   try {
     const ownerChat = String(ownerId)
+    const watcher = new InboundWatcher({
+      config: { ...config, watcher: { ...config.watcher,
+        busy_text: config.watcher.busy_text || 'example-agent занят. Жди или /stop.' } },
+      log,
+      telegramApi: telegram,
+      progressReporter: {
+        isBusy: (chat, threshold) => chat === ownerChat && work.busy &&
+          (status.isActive(chat) || work.recentlyBusy(threshold)),
+        getActiveToolName: () => undefined,
+      },
+    })
     let recoveringInbox = !!inbox.active || !!inbox.uncertainFollowUp || inbox.size > 0 || Object.keys(inbox.recoveredAlbums).length > 0
     let deliveryRetryAt = 0
     let recoveringGoal: string | undefined
@@ -363,6 +385,11 @@ async function main(): Promise<void> {
       },
       ...(approvals ? { approve: (request, signal) => approvals.request(request, signal) } : {}),
       ask: (input, signal) => questions.ask(input, signal),
+      chatAction: (key, args, current) => {
+        const epoch = stopEpoch
+        return agentChat.call(key, args, () => !stopping && epoch === stopEpoch && current(),
+          id => downloadQuotedAttachment(telegram, quotedAttachments.get(id), ownerChat, paths.inbox))
+      },
       ...(proxy ? { command: ['/usr/bin/sudo', '-n', '--', proxy] } : {}),
     }, () => {
       if (!stopping) process.exitCode = 1
@@ -374,6 +401,7 @@ async function main(): Promise<void> {
     if (String(bot.botInfo.id) !== String(env.TELEGRAM_EXPECTED_BOT_ID)) {
       throw new Error('Configured Telegram token does not match the expected bot')
     }
+    await questions.recover()
     void cards.recover(telegram)
     await sweepOrphanBubbles({
       filePath: paths.statusOrphans,
@@ -448,7 +476,7 @@ async function main(): Promise<void> {
             code: question.code, snippet: question.snippet, remindersSent: 0 })
           await leases.recordQuestion(messageId, question.snippet).catch(() => log.warn('Could not save an open question'))
         }
-        else questionStore.clear(ownerChat)
+        else if (questionStore.get(ownerChat)?.code !== 'AQ_CARD') questionStore.clear(ownerChat)
       }
       if (messageId !== undefined) {
         const richEligible = config.richMessages.enabled && !containsFiles &&
@@ -1151,17 +1179,29 @@ async function main(): Promise<void> {
       if (command) await handleCommand(command.name, command.args)
     })
 
+    const knownOwnerMessages = new Set<number>()
+
     function acknowledge(message: Message): void {
+      if (message.message_id > 0) {
+        knownOwnerMessages.add(message.message_id)
+        if (knownOwnerMessages.size > 300) knownOwnerMessages.delete(knownOwnerMessages.values().next().value!)
+      }
       if (!stopping && message.message_id > 0 && !agentChat.hasReacted(message.message_id)) {
         void telegram.setMessageReaction(ownerChat, message.message_id, '👀').catch(() => undefined)
       }
     }
 
-    function resumeInbox(): void {
+    function resumeInbox(message?: Message): void {
       if (stopping) return
-      const waiting = !!task || goalActive
+      const waiting = !!task || goalActive || externalQuestion
       startNext()
-      if (waiting) void send('Сообщение в очереди. Возьму его после текущей задачи.').catch(() => undefined)
+      if (!waiting) return
+      const notice = () => stopping ? undefined :
+        send('Сообщение в очереди. Возьму его после текущей задачи.').catch(() => undefined)
+      if (!message || message.message_id <= 0) { void notice(); return }
+      void watcher.maybeAutoReply({ chatId: ownerChat, messageId: message.message_id }).then(result => {
+        if (!result.replied && result.reason !== 'debounced') void notice()
+      })
     }
 
     function bufferAlbum(id: string, message: Message): void {
@@ -1173,7 +1213,7 @@ async function main(): Promise<void> {
             void steerClaimed(batch, turnId).catch(() => log.warn('Could not route Telegram album'))
             return
           }
-          if (inbox.sealAlbum(id)) resumeInbox()
+          if (inbox.sealAlbum(id)) resumeInbox(message)
         } catch { log.warn('Could not persist the assembled Telegram album') }
       })
     }
@@ -1206,7 +1246,7 @@ async function main(): Promise<void> {
         if (!stopping && inbox.uncertainFollowUp?.message_id === id) {
           const enqueue = !consumed
           inbox.finishFollowUp(id, enqueue)
-          if (enqueue) resumeInbox()
+          if (enqueue) resumeInbox(message)
           else startNext()
         }
       })().catch(() => log.warn('Could not finish a Telegram side question'))
@@ -1232,9 +1272,10 @@ async function main(): Promise<void> {
           launchSideReply(messages[0]!, epoch)) return
       inbox.finishFollowUp(id, !accepted)
       if (accepted) {
+        if (id > 0) void watcher.maybeAutoReply({ chatId: ownerChat, messageId: id })
         log.info('Codex active turn received a Telegram follow-up', { album: messages.length > 1 })
         startNext()
-      } else resumeInbox()
+      } else resumeInbox(messages[0])
     }
 
     async function acceptInput(message: Message): Promise<void> {
@@ -1244,7 +1285,7 @@ async function main(): Promise<void> {
           await send('Очередь заполнена. Отправь это сообщение позже.')
         } else if (outcome === 'accepted') {
           if (message.media_group_id) bufferAlbum(message.media_group_id, message)
-          else resumeInbox()
+          else resumeInbox(message)
         }
       } catch {
         await send('Не удалось сохранить сообщение. Отправь его ещё раз.')
@@ -1410,7 +1451,8 @@ async function main(): Promise<void> {
     }
 
     function startNext(): void {
-      if (task || stopping || resetting || recoveringInbox || recoveringGoal || deliveringGoal || goalActive || codex.isRunning) return
+      if (task || stopping || resetting || recoveringInbox || recoveringGoal || deliveringGoal ||
+          goalActive || externalQuestion || codex.isRunning) return
       let messages: Message[] | undefined
       try { messages = inbox.take() } catch {
         log.warn('Could not claim the next Telegram message')
@@ -1625,9 +1667,36 @@ async function main(): Promise<void> {
         if (outcome === 'accepted') startNext()
         return outcome
       }, approvals && policyToken && /^[a-z0-9_-]{32,128}$/i.test(policyToken) && policyToken !== env.TELEGRAM_WEBHOOK_TOKEN
-        ? { token: policyToken, request: request => stopping ? Promise.resolve('decline')
-          : session ? session.requestPolicyApproval(request) : approvals.request(request) }
-        : undefined)
+        ? {
+          token: policyToken,
+          request: request => stopping ? Promise.resolve('decline')
+            : session ? session.requestPolicyApproval(request) : approvals.request(request),
+          ...(config.permission_gate.enabled ? { legacy: {
+            timeoutMs: config.permission_gate.timeout_ms,
+            request: (request, signal) => stopping ? Promise.resolve('decline') : approvals.request(request, signal),
+          } } : {}),
+        } : undefined, {
+        ...(config.ask_user_question.enabled ? { ask: {
+          timeoutMs: config.ask_user_question.timeout_ms,
+          async request(inputs, signal) {
+            if (stopping || externalQuestion || task || goalActive || codex.isRunning || questions.isPending || signal.aborted) return
+            externalQuestion = true
+            try {
+              const answers = await questions.ask(inputs, signal)
+              for (const answer of Object.values(answers)) answer.answers = answer.answers.map(text => redactSecrets(text, secrets))
+              return answers
+            } finally {
+              externalQuestion = false
+              startNext()
+            }
+          },
+        } } : {}),
+        async react(id) {
+          if (stopping || !knownOwnerMessages.has(id) || agentChat.hasReacted(id)) return false
+          await telegram.setMessageReaction(ownerChat, id, '👀')
+          return true
+        },
+      })
     }
     if (recoveringInbox) void resumeRecoveredInbox()
     startNext()

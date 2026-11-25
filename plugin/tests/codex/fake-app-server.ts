@@ -113,6 +113,12 @@ for await (const line of createInterface({ input: process.stdin })) {
       }
       if (params.input[0].text.startsWith('approval:')) {
         const scenario = params.input[0].text
+        const fileApproval = scenario.startsWith('approval:policy-file')
+        const patch = [
+          '*** Begin Patch', '*** Add File: nested/new.txt', '+created',
+          '*** Update File: nested/change.txt', '@@', '-before', '+after',
+          '*** Delete File: nested/remove.txt', '*** End Patch',
+        ].join('\n')
         respond({ turn: { id: activeTurn } })
         emit({ method: 'turn/started', params: { threadId, turn: { id: activeTurn } } })
         childTurn = activeTurn + '-child'
@@ -123,11 +129,25 @@ for await (const line of createInterface({ input: process.stdin })) {
           const policy = { threadId, turnId: activeTurn, itemId: 'item' }
           const reply = await fetch(process.env.KROT_TEST_POLICY_URL!, {
             method: 'POST', headers: { authorization: 'Bearer test-policy', 'content-type': 'application/json' },
-            body: JSON.stringify({ kind: 'command', target: 'printf test', cwd: '/workspace', operation: policy }),
+            body: JSON.stringify(fileApproval
+              ? { kind: 'file', target: patch, cwd: '/workspace', operation: policy }
+              : { kind: 'command', target: 'printf test', cwd: '/workspace', operation: policy }),
           })
           if (!reply.ok) throw new Error('Policy fixture failed')
         }
         pendingApproval = 'approval-' + turnNumber
+        if (fileApproval) {
+          emit({ method: 'item/started', params: { threadId, turnId: activeTurn, item: { id: 'item',
+            type: 'fileChange', changes: [
+              { path: '/workspace/nested/new.txt', kind: { type: 'add' }, diff: 'created\n' },
+              { path: '/workspace/nested/change.txt', kind: { type: 'update', move_path: null },
+                diff: '@@ -1,2 +1,2 @@\n context\n-before\n+' + (scenario.endsWith('mismatch') ? 'different' : 'after') + '\n' },
+              { path: '/workspace/nested/remove.txt', kind: { type: 'delete' }, diff: 'removed file contents\n' },
+            ] } } })
+          emit({ id: pendingApproval, method: 'item/fileChange/requestApproval',
+            params: { threadId, turnId: activeTurn, itemId: 'item' } })
+          break
+        }
         emit({ id: pendingApproval, method: 'item/commandExecution/requestApproval', params: {
           threadId: scenario === 'approval:foreign' ? 'foreign' : scenario.startsWith('approval:child') ? 'child' : threadId,
           turnId: scenario === 'approval:child' ? childTurn : activeTurn,
@@ -136,6 +156,15 @@ for await (const line of createInterface({ input: process.stdin })) {
             : scenario === 'approval:policy-production-shell' ? "/bin/bash -c 'printf test'"
             : scenario === 'approval:policy-mismatch' ? "/usr/bin/bash -lc 'printf other'" : 'printf test',
           cwd: '/workspace',
+          ...(scenario.startsWith('approval:network') ? {
+            availableDecisions: scenario === 'approval:network-persistent-only' ? ['acceptForSession', 'cancel'] : ['accept', 'cancel'],
+            networkApprovalContext: { protocol: 'https', host: scenario === 'approval:network-invalid' ? 'example.test/path' : 'example.test:443' },
+            environmentId: scenario === 'approval:network-remote' ? 'remote' : 'local',
+          } : {}),
+          ...(scenario.startsWith('approval:stdin') ? {
+            kind: 'writeStdin', approvalId: 'stdin-approval', availableDecisions: ['accept', 'cancel'],
+            ...(scenario === 'approval:stdin-visible' ? { command: "write_stdin --session-id 123 'test input'" } : {}),
+          } : {}),
           ...(scenario === 'approval:incomplete' ? { command: undefined } : {}),
         } })
         break

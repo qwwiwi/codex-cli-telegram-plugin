@@ -4,7 +4,7 @@ import { CodexWorkStatus } from '../../src/codex/work-status.js'
 import { renderActivityBlock } from '../../src/status/activity-renderer.js'
 import type { StatusHandle, StatusState } from '../../src/status/status-manager.js'
 
-function fixture() {
+function fixture(now = () => 1000) {
   const states: StatusState[] = []
   let active = false
   let completed = 0
@@ -17,9 +17,29 @@ function fixture() {
     async update(_handle: StatusHandle, state: StatusState) { states.push(state) },
     async complete() { active = false; completed++ },
     isActive() { return active },
-  }, 'owner', AppConfigSchema.parse({ status: { thoughts: { enabled: true } } }).status, ['private-token'], () => 1000)
+  }, 'owner', AppConfigSchema.parse({ status: { thoughts: { enabled: true } } }).status, ['private-token'], now)
   return { status, states, completed: () => completed }
 }
+
+test('busy acknowledgement uses recent activity from the owner turn', async () => {
+  let now = 1000
+  const { status } = fixture(() => now)
+  status.begin(7)
+  expect(status.recentlyBusy(500)).toBe(true)
+  now += 500
+  expect(status.recentlyBusy(500)).toBe(false)
+  status.receive({ method: 'item/started', params: { threadId: 'foreign', item: {
+    type: 'commandExecution', id: 'foreign-job',
+  } } }, 'root')
+  expect(status.recentlyBusy(500)).toBe(false)
+  status.receive({ method: 'item/started', params: { threadId: 'root', item: {
+    type: 'commandExecution', id: 'owner-job',
+  } } }, 'root')
+  expect(status.recentlyBusy(500)).toBe(true)
+  status.finish()
+  expect(status.recentlyBusy(500)).toBe(false)
+  await status.close()
+})
 
 test('keeps the legacy working card open while a managed subagent outlives the turn', async () => {
   const { status, states, completed } = fixture()

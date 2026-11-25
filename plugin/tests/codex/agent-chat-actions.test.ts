@@ -113,3 +113,69 @@ test('remembers an agent reply sent through the rich renderer for subsequent edi
   expect(await actions.receive('edit-1', '@@TELEGRAM_ACTION {"action":"edit","target":"last_reply","text":"Новый итог"}', () => true)).toBe(true)
   expect(edited).toEqual([[55, 'Новый итог']])
 })
+
+test('a native chat action waits for Telegram and returns the actual IDs once per call', async () => {
+  const sent = Promise.withResolvers<{ message_id: number }>()
+  let sends = 0
+  const actions = new AgentChatActions({
+    async sendMessage() { sends++; return sent.promise },
+    async editMessageText() {}, async pinChatMessage() {}, async unpinChatMessage() {}, async setMessageReaction() {},
+  }, '123', { async sendFile() { return 25 } })
+  const args = { action: 'reply', text: 'Готово', files: ['result.txt'] }
+  let completed = false
+  const result = actions.call('call-1', args, () => true).then(value => {
+    completed = true
+    return value
+  })
+  const replay = actions.call('call-1', args, () => true)
+  await Promise.resolve()
+  expect(completed).toBe(false)
+  sent.resolve({ message_id: 24 })
+  const response = await result
+  expect(await replay).toEqual(response)
+  expect(sends).toBe(1)
+  expect(response.success).toBe(true)
+  expect(response.contentItems[0].type).toBe('inputText')
+  expect(JSON.parse(response.contentItems[0].text)).toEqual({ action: 'reply', ok: true, message_ids: [24, 25] })
+})
+
+test('native chat actions enforce target ownership and discard queued calls after stop', async () => {
+  const blocker = Promise.withResolvers<{ message_id: number }>()
+  const unexpected = async () => { throw new Error('Unexpected Telegram call') }
+  const actions = new AgentChatActions({
+    sendMessage: () => blocker.promise, editMessageText: unexpected, pinChatMessage: unexpected,
+    unpinChatMessage: unexpected, setMessageReaction: unexpected,
+  }, '123')
+  actions.remember(12, false)
+  expect((await actions.call('edit', { action: 'edit', target: 12, text: 'Отказ' }, () => true)).success).toBe(false)
+  expect((await actions.call('foreign', { action: 'reply', chat_id: 999, text: 'Отказ' }, () => true)).success).toBe(false)
+  const reply = actions.call('reply', { action: 'reply', text: 'В работе' }, () => true)
+  let current = true
+  const queued = actions.call('pin', { action: 'pin', target: 12 }, () => current)
+  current = false
+  blocker.resolve({ message_id: 24 })
+  expect((await reply).success).toBe(true)
+  expect((await queued).success).toBe(false)
+})
+
+test('native download returns only the file from a known Telegram message', async () => {
+  const unexpected = async () => { throw new Error('Unexpected Telegram call') }
+  const actions = new AgentChatActions({
+    sendMessage: unexpected, editMessageText: unexpected, pinChatMessage: unexpected,
+    unpinChatMessage: unexpected, setMessageReaction: unexpected,
+  }, '123')
+  actions.remember(12, false)
+  const targets: number[] = []
+  const download = async (target: number) => {
+    targets.push(target)
+    return target === 12 ? { path: '/inbox/report.pdf', size: 23 } : undefined
+  }
+  const denied = await actions.call('unknown', { action: 'download', target: 53 }, () => true, download)
+  expect(denied.success).toBe(false)
+  const result = await actions.call('download', { action: 'download', target: 12 }, () => true, download)
+  expect(targets).toEqual([12])
+  expect(result.success).toBe(true)
+  expect(JSON.parse(result.contentItems[0].text)).toEqual({
+    action: 'download', ok: true, message_ids: [12], attachment: { path: '/inbox/report.pdf', size: 23 },
+  })
+})

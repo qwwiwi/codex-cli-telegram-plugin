@@ -6,19 +6,38 @@ import json
 import os
 import sys
 
-import websockets
-
 SOCKET = "/run/example/rpc.sock"
 WORKSPACE = "/srv/example/workspace"
 TELEGRAM_INBOX = "/srv/example/live-state/inbox"
 MAX_MESSAGE = 16 * 1024 * 1024
+CHAT_TOOL_CALL = "item/tool/call"
+# Only this client-owned catalog may cross the root relay. Match chat-actions.ts.
+CHAT_TOOL = {
+    "type": "function",
+    "name": "telegram_action",
+    "description": "Perform an action requested by the Telegram owner in the private chat. Returns the Telegram result before the next step.",
+    "inputSchema": {
+        "type": "object", "additionalProperties": False, "required": ["action"],
+        "properties": {
+            "action": {"type": "string", "enum": [
+                "reply", "edit", "pin", "unpin", "react", "download", "revoke_mandate", "resolve_question",
+            ]},
+            "target": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "string", "enum": ["last_reply"]}]},
+            "text": {"type": "string", "maxLength": 3900},
+            "emoji": {"type": "string"},
+            "files": {"type": "array", "maxItems": 10, "items": {"type": "string", "maxLength": 4096}},
+            "id": {"type": "string", "maxLength": 256},
+            "resolution": {"type": "string", "enum": ["answered"]},
+        },
+    },
+}
 ALLOWED = {
     "initialize": {"clientInfo", "capabilities"},
     "initialized": set(),
     "account/read": {"refreshToken"},
     "account/rateLimits/read": set(),
     "model/list": {"limit", "includeHidden"},
-    "thread/start": {"cwd", "approvalPolicy", "sandbox", "model"},
+    "thread/start": {"cwd", "approvalPolicy", "sandbox", "model", "dynamicTools"},
     "thread/resume": {"cwd", "approvalPolicy", "sandbox", "model", "threadId", "excludeTurns"},
     "thread/fork": {"cwd", "approvalPolicy", "sandbox", "threadId", "excludeTurns"},
     "thread/compact/start": {"threadId"},
@@ -50,6 +69,31 @@ def valid_answers(result):
     )
 
 
+def valid_chat_call(params, opened):
+    if not isinstance(params, dict) or params.keys() != {"threadId", "turnId", "callId", "namespace", "tool", "arguments"}:
+        return False
+    thread = params["threadId"]
+    args = params["arguments"]
+    properties = CHAT_TOOL["inputSchema"]["properties"]
+    return (
+        isinstance(thread, str) and thread in opened
+        and all(isinstance(params[key], str) and 0 < len(params[key]) <= 128 for key in ("turnId", "callId"))
+        and params["namespace"] is None and params["tool"] == CHAT_TOOL["name"]
+        and isinstance(args, dict) and args.keys() <= properties.keys()
+        and args.get("action") in properties["action"]["enum"]
+        and len(json.dumps(args, ensure_ascii=False)) <= 65536
+    )
+
+
+def valid_chat_result(result):
+    if not isinstance(result, dict) or result.keys() != {"success", "contentItems"} or type(result["success"]) is not bool:
+        return False
+    items = result["contentItems"]
+    return (isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict)
+            and items[0].keys() == {"type", "text"} and items[0]["type"] == "inputText"
+            and isinstance(items[0]["text"], str) and 0 < len(items[0]["text"]) <= 8192)
+
+
 def allowed_request(message, opened, approval_threads=()):
     method = message.get("method")
     params = message.get("params", {})
@@ -64,6 +108,7 @@ def allowed_request(message, opened, approval_threads=()):
             params.get("cwd") == WORKSPACE
             and params.get("approvalPolicy") == "on-request"
             and params.get("sandbox") == "workspace-write"
+            and ("dynamicTools" not in params or params["dynamicTools"] == [CHAT_TOOL])
             and (method != "thread/fork" or
                  (isinstance(params.get("threadId"), str) and params["threadId"] in opened
                   and params.get("excludeTurns") is True))
@@ -147,6 +192,8 @@ def write(message):
 
 
 async def relay():
+    import websockets
+
     pending = {}
     requests = {}
     opened = set()
@@ -196,11 +243,17 @@ async def relay():
                         requests[message["id"]] = "child-metadata"
                 elif message.get("id") in pending:
                     method, _ = pending.pop(message["id"])
-                    decision = (message.get("result") or {}).get("decision")
+                    result = message.get("result")
+                    if method == CHAT_TOOL_CALL:
+                        if set(message) != {"id", "result"} or not valid_chat_result(result):
+                            message = {"id": message["id"], "error": {"code": -32601, "message": "Krot relay denied tool response"}}
+                        await server.send(json.dumps(message))
+                        continue
+                    decision = result.get("decision") if isinstance(result, dict) else None
                     accepted = (
                         "error" in message
                         or method in APPROVALS and decision in ("accept", "decline", "cancel")
-                        or method == "item/tool/requestUserInput" and valid_answers(message.get("result"))
+                        or method == "item/tool/requestUserInput" and valid_answers(result)
                     )
                 else:
                     accepted = False
@@ -214,8 +267,15 @@ async def relay():
             async for value in server:
                 message = json.loads(value)
                 if "method" in message and "id" in message:
-                    thread = (message.get("params") or {}).get("threadId")
-                    pending[message["id"]] = (message["method"], thread if isinstance(thread, str) else None)
+                    method = message["method"]
+                    params = message.get("params")
+                    if method == CHAT_TOOL_CALL and not valid_chat_call(params, opened):
+                        await server.send(json.dumps({
+                            "id": message["id"], "error": {"code": -32601, "message": "Krot relay denied tool request"},
+                        }))
+                        continue
+                    thread = params.get("threadId") if isinstance(params, dict) else None
+                    pending[message["id"]] = (method, thread if isinstance(thread, str) else None)
                 elif message.get("id") in requests:
                     method = requests.pop(message["id"])
                     result = message.get("result")

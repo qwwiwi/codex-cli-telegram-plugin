@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rpc.js'
+import { sameFilePatch, type NativeFileChange } from './file-approval.js'
+import { agentChatTool, type AgentChatActions } from './chat-actions.js'
 
 export type ApprovalDecision = 'accept' | 'decline' | 'cancel'
 export type ApprovalRequest = {
-  kind: 'command' | 'file'
+  kind: 'command' | 'file' | 'network' | 'stdin'
   target: string
   cwd?: string
   reason?: string
 }
 export type PolicyApprovalRequest = ApprovalRequest & {
+  kind: 'command' | 'file'
   operation?: { threadId: string; turnId: string; itemId: string }
 }
 
@@ -27,6 +30,7 @@ type Settings = {
   onGoalResult?: (threadId: string, result: Result) => void
   approve?: (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
+  chatAction?: (key: string, args: unknown, current: () => boolean) => ReturnType<AgentChatActions['call']>
 }
 
 type Result = { status: 'completed' | 'interrupted' | 'failed'; text: string }
@@ -39,7 +43,7 @@ type SessionStatus = {
 type Execution = {
   id?: string
   threadId: string
-  fileChanges: Map<string, string[]>
+  fileChanges: Map<string, NativeFileChange[]>
 }
 
 type Turn = Execution & {
@@ -47,7 +51,7 @@ type Turn = Execution & {
   lastText: string
   finalText?: string
   children: Map<string, Execution>
-  approvedPolicy: Map<string, { target: string; cwd: string; until: number }>
+  approvedPolicy: Map<string, { kind: PolicyApprovalRequest['kind']; target: string; cwd: string; until: number }>
   finish: (result: Result) => void
 }
 
@@ -56,7 +60,7 @@ function recordFileChange(execution: Execution, item: Record<string, unknown>): 
   const changes = item.changes.flatMap(entry => {
     const change = object(entry)
     return typeof change.path === 'string' && typeof change.diff === 'string'
-      ? [change.path + '\n' + change.diff] : []
+      ? [{ path: change.path, diff: change.diff, kind: object(change.kind) }] : []
   })
   if (changes.length === item.changes.length) execution.fileChanges.set(item.id, changes)
 }
@@ -66,6 +70,13 @@ function sameShellCommand(native: string, hook: string): boolean {
   const quoted = "'" + hook.replaceAll("'", "'\\''") + "'"
   const shellPrefix = /^(?:\/usr)?\/bin\/bash -(?:l)?c /u.exec(native)?.[0]
   return native === hook || (shellPrefix !== undefined && native.slice(shellPrefix.length) === quoted)
+}
+
+function networkDestination(context: unknown): string | undefined {
+  const { host, protocol } = object(context)
+  if (typeof host !== 'string' || host.length > 255 || !/^[a-zA-Z0-9.:[\]_-]+$/u.test(host) ||
+      typeof protocol !== 'string' || !['http', 'https', 'socks5Tcp', 'socks5Udp'].includes(protocol)) return
+  return protocol + '://' + host
 }
 
 export class CodexSession {
@@ -359,7 +370,10 @@ export class CodexSession {
     }
     const reply = expected
       ? await this.rpc.request('thread/resume', { ...options, threadId: expected, excludeTurns: true })
-      : await this.rpc.request('thread/start', options)
+      : await this.rpc.request('thread/start', {
+        ...options,
+        ...(this.settings.chatAction ? { dynamicTools: [agentChatTool] } : {}),
+      })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || (expected && id !== expected)) {
       throw new Error('Codex did not return the expected thread ID')
@@ -470,22 +484,25 @@ export class CodexSession {
   async requestPolicyApproval({ operation, ...request }: PolicyApprovalRequest): Promise<ApprovalDecision> {
     const approve = this.settings.approve
     if (!approve) return 'decline'
-    if (request.kind !== 'command' || !operation || !request.cwd) return approve(request)
+    if (!operation || !request.cwd) return approve(request)
     const matches = this.runningTurns().filter(turn => turn.threadId === operation.threadId)
       .flatMap(owner => [owner, ...owner.children.values()].filter(execution => execution.id === operation.turnId)
         .map(execution => ({ owner, execution })))
     if (matches.length !== 1) return approve(request)
-    const [{ owner, execution }] = matches
+    const { owner, execution } = matches[0]!
     const decision = await approve({
       ...request,
-      reason: ['Если эта же команда потребует нативное разрешение, её можно один раз выполнить вне песочницы.', request.reason]
+      reason: [request.kind === 'command'
+        ? 'Если эта же команда потребует нативное разрешение, её можно один раз выполнить вне песочницы.'
+        : 'Если этот же набор изменений потребует нативное разрешение, его можно один раз применить вне песочницы.',
+      request.reason]
         .filter(Boolean).join('\n\n'),
     })
     if (!this.runningTurns().includes(owner) ||
         (owner !== execution && owner.children.get(execution.threadId) !== execution)) return 'cancel'
     if (decision === 'accept' && owner.approvedPolicy.size < 128) {
       owner.approvedPolicy.set(JSON.stringify([execution.threadId, operation.turnId, operation.itemId]), {
-        target: request.target, cwd: request.cwd, until: Date.now() + 30_000,
+        kind: request.kind, target: request.target, cwd: request.cwd, until: Date.now() + 30_000,
       })
     }
     return decision
@@ -505,12 +522,21 @@ export class CodexSession {
     if (parents.length !== 1 || thread.id !== threadId || thread.cwd !== this.settings.cwd ||
         typeof thread.parentThreadId !== 'string' || spawn.parent_thread_id !== thread.parentThreadId ||
         typeof spawn.depth !== 'number' || !Number.isSafeInteger(spawn.depth) || spawn.depth < 1 ||
-        (spawn.depth === 1 && thread.parentThreadId !== parents[0].threadId)) return
-    const [owner] = parents
+        (spawn.depth === 1 && thread.parentThreadId !== parents[0]!.threadId)) return
+    const owner = parents[0]!
     return { owner, execution: owner.children.get(threadId)! }
   }
 
   private async requestApproval({ id, method, params }: CodexServerRequest) {
+    if (method === 'item/tool/call') {
+      const { threadId, turnId, callId, namespace, tool, arguments: args } = params
+      const run = this.settings.chatAction
+      const turn = this.runningTurns().find(turn => turn.threadId === threadId && turn.id === turnId)
+      if (!run || !turn || namespace !== null || tool !== agentChatTool.name ||
+          typeof callId !== 'string' || !/^[\w.:-]{1,128}$/u.test(callId)) return
+      return this.withServerRequest(id, turn.threadId, signal =>
+        run(JSON.stringify([threadId, turnId, callId]), args, () => !signal.aborted && this.runningTurns().includes(turn)))
+    }
     if (method === 'item/tool/requestUserInput') {
       const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active
       if (!current || current.stop || current.threadId !== params.threadId || current.id !== params.turnId) return { answers: {} }
@@ -527,32 +553,54 @@ export class CodexSession {
       return { decision: 'decline' }
     }
 
-    if (commandRequest && (params.networkApprovalContext || params.approvalId != null || (params.kind && params.kind !== 'command'))) {
+    const stdin = commandRequest && params.kind === 'writeStdin'
+    const network = commandRequest && params.networkApprovalContext != null
+    const destination = network ? networkDestination(params.networkApprovalContext) : undefined
+    if (commandRequest && (params.additionalPermissions != null ||
+        (params.kind && params.kind !== 'command' && !stdin))) return { decision: 'decline' }
+    if ((network || stdin) && ((params.environmentId != null && params.environmentId !== 'local') ||
+        (params.availableDecisions !== undefined &&
+          (!Array.isArray(params.availableDecisions) || !params.availableDecisions.includes('accept'))))) {
       return { decision: 'decline' }
     }
+    if (network && (!destination || stdin)) return { decision: 'decline' }
+    if (stdin) {
+      // App Server 0.171 serializes these exact arguments with shlex_join.
+      if (typeof params.approvalId !== 'string' || !/^[\w.:-]{1,128}$/u.test(params.approvalId) ||
+          typeof params.command !== 'string' || !/^write_stdin --session-id \d{1,10} [\s\S]+$/u.test(params.command)) {
+        return { decision: 'decline' }
+      }
+    } else if (commandRequest && !network && params.approvalId != null) return { decision: 'decline' }
     if (!commandRequest && params.grantRoot) return { decision: 'decline' }
     const scope = await this.approvalExecution(params.threadId, params.turnId)
     if (!scope) return { decision: 'decline' }
     const { owner, execution } = scope
-    const target = commandRequest ? params.command
-      : execution.fileChanges.get(params.itemId)?.join('\n')
+    const changes = commandRequest ? undefined : execution.fileChanges.get(params.itemId)
+    const target = destination
+      ? destination + (typeof params.command === 'string' && params.command.trim() ? '\n\n' + params.command : '')
+      : commandRequest ? params.command
+      : changes?.map(change => change.path + '\n' + change.diff).join('\n')
     if (typeof target !== 'string' || !target.trim()) return { decision: 'decline' }
-    if (commandRequest && (params.environmentId == null || params.environmentId === 'local')) {
+    if (!network && !stdin && (params.environmentId == null || params.environmentId === 'local')) {
       const key = JSON.stringify([params.threadId, params.turnId, params.itemId])
       const receipt = owner.approvedPolicy.get(key)
       owner.approvedPolicy.delete(key)
-      if (receipt && receipt.until >= Date.now() && receipt.cwd === params.cwd && sameShellCommand(target, receipt.target)) {
-        return { decision: 'accept' }
+      if (receipt && receipt.until >= Date.now()) {
+        const matches = commandRequest
+          ? receipt.kind === 'command' && receipt.cwd === params.cwd && sameShellCommand(target, receipt.target)
+          : receipt.kind === 'file' && changes !== undefined && sameFilePatch(receipt.target, receipt.cwd, changes)
+        if (matches) return { decision: 'accept' }
       }
     }
     const decision = await this.withServerRequest(id, execution.threadId, signal => approve({
-      kind: commandRequest ? 'command' : 'file',
+      kind: network ? 'network' : stdin ? 'stdin' : commandRequest ? 'command' : 'file',
       target,
       ...(typeof params.cwd === 'string' ? { cwd: params.cwd } : {}),
       ...(typeof params.reason === 'string' ? { reason: params.reason } : {}),
     }, signal)).catch(() => 'decline' as const)
     return { decision: this.runningTurns().includes(owner) &&
-      (owner === execution || owner.children.get(execution.threadId) === execution) ? decision : 'cancel' }
+      (owner === execution || owner.children.get(execution.threadId) === execution)
+      ? stdin && decision === 'decline' ? 'cancel' : decision : 'cancel' }
   }
 
   private async withServerRequest<T>(id: number | string, threadId: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
