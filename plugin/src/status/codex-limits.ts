@@ -1,5 +1,5 @@
 // Codex account rate limits for the pinned context HUD: one line such as
-// «Лимиты Codex: 5ч 12% · неделя 36% (сброс 01.12 00:30 МСК)».
+// «Лимиты Codex: потрачено за неделю 36% · за 5ч 12% (сброс 01.12 00:30 МСК)».
 //
 // The HUD renders synchronously and must never wait on (or fail because of)
 // the App Server, so the limits come from a small cache: the HUD reads the last
@@ -62,12 +62,16 @@ function formatResetMsk(epochSeconds: number): string {
 }
 
 /**
- * Render the HUD limits line, or undefined when no window is known. Only the
- * weekly window carries its reset time, and only when the App Server gave one.
+ * Render the HUD limits line, or undefined when no window is known. The line
+ * says the share is SPENT («потрачено за неделю 36% · за 5ч 12%»), weekly window
+ * first. Only the weekly window carries its reset time, and only when the App
+ * Server gave one.
  */
 export function formatCodexLimitsLine(windows: ReadonlyArray<CodexLimitWindow>): string | undefined {
   if (windows.length === 0) return undefined
-  const parts = windows.map(w => `${limitWindowLabel(w.minutes)} ${w.used}%`)
+  const ordered = [...windows.filter(w => w.minutes === WEEK), ...windows.filter(w => w.minutes !== WEEK)]
+  const parts = ordered.map((w, index) =>
+    `${index === 0 ? 'потрачено ' : ''}за ${w.minutes === WEEK ? 'неделю' : limitWindowLabel(w.minutes)} ${w.used}%`)
   const week = windows.find(w => w.minutes === WEEK && w.resetsAt !== undefined)
   const reset = week?.resetsAt !== undefined ? ` (сброс ${formatResetMsk(week.resetsAt)})` : ''
   return `Лимиты Codex: ${parts.join(' · ')}${reset}`

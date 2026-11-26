@@ -12,13 +12,15 @@ test('labels Codex limit windows by their length', () => {
   expect(limitWindowLabel(2880)).toBe('2д')
 })
 
-test('formats used percentages and the weekly reset in Moscow time', () => {
+test('says the percentages are spent, weekly window first, with the weekly reset in Moscow time', () => {
   expect(formatCodexLimitsLine([
     { used: 12, minutes: 300, resetsAt: Date.UTC(2026, 10, 25, 23, 0) / 1000 },
     { used: 36, minutes: 10080, resetsAt: WEEK_RESET },
-  ])).toBe('Лимиты Codex: 5ч 12% · неделя 36% (сброс 01.12 00:30 МСК)')
-  expect(formatCodexLimitsLine([{ used: 12, minutes: 300 }])).toBe('Лимиты Codex: 5ч 12%')
-  expect(formatCodexLimitsLine([{ used: 36, minutes: 10080 }])).toBe('Лимиты Codex: неделя 36%')
+  ])).toBe('Лимиты Codex: потрачено за неделю 36% · за 5ч 12% (сброс 01.12 00:30 МСК)')
+  expect(formatCodexLimitsLine([{ used: 36, minutes: 10080, resetsAt: WEEK_RESET }]))
+    .toBe('Лимиты Codex: потрачено за неделю 36% (сброс 01.12 00:30 МСК)')
+  expect(formatCodexLimitsLine([{ used: 12, minutes: 300 }])).toBe('Лимиты Codex: потрачено за 5ч 12%')
+  expect(formatCodexLimitsLine([{ used: 36, minutes: 10080 }])).toBe('Лимиты Codex: потрачено за неделю 36%')
   expect(formatCodexLimitsLine([])).toBeUndefined()
 })
 
@@ -35,7 +37,7 @@ test('caches Codex limits for a minute and keeps the last value on errors', asyn
 
   expect(cache.line()).toBeUndefined()
   await cache.refresh()
-  expect(cache.line()).toBe('Лимиты Codex: 5ч 10%')
+  expect(cache.line()).toBe('Лимиты Codex: потрачено за 5ч 10%')
   expect(changes).toBe(1)
 
   now += 59_000
@@ -47,7 +49,7 @@ test('caches Codex limits for a minute and keeps the last value on errors', asyn
   fail = true
   await cache.refresh()
   expect(calls).toBe(2)
-  expect(cache.line()).toBe('Лимиты Codex: 5ч 10%')
+  expect(cache.line()).toBe('Лимиты Codex: потрачено за 5ч 10%')
   expect(changes).toBe(1)
 
   // A failed read is not retried on every HUD refresh either.
@@ -56,10 +58,10 @@ test('caches Codex limits for a minute and keeps the last value on errors', asyn
 
   now += 61_000
   fail = false
-  expect(cache.line()).toBe('Лимиты Codex: 5ч 10%')
+  expect(cache.line()).toBe('Лимиты Codex: потрачено за 5ч 10%')
   await cache.refresh()
   expect(calls).toBe(3)
-  expect(cache.line()).toBe('Лимиты Codex: 5ч 30%')
+  expect(cache.line()).toBe('Лимиты Codex: потрачено за 5ч 30%')
   expect(changes).toBe(2)
 })
 
