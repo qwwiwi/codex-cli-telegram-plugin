@@ -7,6 +7,7 @@ import { AgentChatActions } from '../../src/codex/chat-actions.js'
 import { AgentComponents, COMPONENT_NAMES, componentTools } from '../../src/codex/components.js'
 import { createLogger } from '../../src/log.js'
 import { WidgetPreSendError } from '../../src/safety/pre-send-error.js'
+import { redactSecrets } from '../../src/safety/redact.js'
 import { createRateLimitedTelegramApi } from '../../src/safety/rate-limited-telegram-api.js'
 import { createSafeTelegramApi } from '../../src/safety/safe-telegram-api.js'
 import { fakeTelegramChat, settledWithin } from './fake-telegram-chat.js'
@@ -234,4 +235,43 @@ test('[R12] a component stopped while it waits for the HUD card is never sent', 
   const result = await actions.component('stop', 'send_component', { component: 'kpi', data: pack('kpi', 'example.json') }, () => current)
   expect(result.success).toBe(false)
   expect(calls).toEqual([])
+})
+
+test('[R12][R13] a configured secret with an HTML-escaped character in the model data never reaches the widget transport', async () => {
+  const secret = 'owner&secret-value'
+  const widgets: SendWidgetParams[] = []
+  const texts: string[] = []
+  const chat = fakeTelegramChat()
+  const api = createSafeTelegramApi({
+    ...chat.raw,
+    async sendWidget(_chat, params) { widgets.push(params); return { message_id: 9 } },
+    async sendMessage(_chat, text) { texts.push(text); return { message_id: 10 } },
+  }, createLogger('components-test'), [secret])
+  const components = new AgentComponents(api, OWNER, { redact: text => redactSecrets(text, [secret]) })
+  const data = { title: `Ключ ${secret}`, metrics: [{ label: 'Занятий', value: 12 }] }
+  const outcome = await components.run('send_component', { component: 'kpi', data }, () => true)
+  // The renderer escapes `&` to `&amp;`, so only the raw model fields still show the secret.
+  expect(widgets).toEqual([])
+  expect(outcome).toMatchObject({ ok: true, delivery: 'text' })
+  expect(texts).toHaveLength(1)
+  expect(texts[0]).not.toContain(secret)
+  expect(texts[0]).toContain('Занятий')
+})
+
+test('[R12] a turn stopped while Telegram refuses the widget gets no text copy', async () => {
+  let current = true
+  const calls: string[] = []
+  const components = new AgentComponents({
+    async sendWidget() {
+      calls.push('widget')
+      current = false
+      throw Object.assign(new Error('Bad Request: widget rejected'), { error_code: 400 })
+    },
+    async sendMessage() { calls.push('text'); return { message_id: 6 } },
+    async deleteMessage() { calls.push('delete') },
+  }, OWNER)
+  const outcome = await components.run('send_component', { component: 'kpi', data: pack('kpi', 'example.json') }, () => true, () => current)
+  expect(outcome.ok).toBe(false)
+  expect(outcome.message_ids).toEqual([])
+  expect(calls).toEqual(['widget'])
 })

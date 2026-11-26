@@ -160,6 +160,19 @@ export function componentFallbackText(name: ComponentName, data: Record<string, 
   return safe.length <= TELEGRAM_MAX_MESSAGE ? safe : safe.slice(0, TELEGRAM_MAX_MESSAGE - 1).replace(/[\uD800-\uDBFF]$/u, '') + '…'
 }
 
+// True when the redactor would change any key or primitive value of the raw
+// model data. Checked before rendering: the rendered html escapes characters
+// (`&` becomes `&amp;`), so a secret is no longer recognisable in it.
+function carriesSecret(value: unknown, redact: (text: string) => string, depth = 0): boolean {
+  if (depth > 32) return true
+  if (isPrimitive(value)) return redact(String(value)) !== String(value)
+  if (Array.isArray(value)) return value.some(item => carriesSecret(item, redact, depth + 1))
+  if (isPlainObject(value)) {
+    return Object.entries(value).some(([key, item]) => redact(key) !== key || carriesSecret(item, redact, depth + 1))
+  }
+  return false
+}
+
 export type ComponentApi = Pick<TelegramApi, 'sendWidget' | 'sendMessage' | 'deleteMessage'>
 
 type ComponentOptions = {
@@ -294,7 +307,8 @@ export class AgentComponents {
     await this.options.beforeSend?.()
     if (!current()) return { kind: 'failed', reason: 'Ход остановлен, компонент не отправлен.' }
     let replyTo = target
-    let reason = checkWidgetChat(this.ownerChat)
+    let reason = checkWidgetChat(this.ownerChat) ??
+      (carriesSecret(data, redact) ? 'данные содержат секрет, он скрыт в текстовой версии' : undefined)
     if (reason === undefined) {
       const rendered = renderComponentWidget(component, data)
       if (!rendered.ok) reason = rendered.reason
@@ -322,8 +336,10 @@ export class AgentComponents {
         }
       }
     }
+    // The widget request may have taken long enough for the owner to stop the turn.
+    if (!current()) return { kind: 'failed', reason: `Виджет не показан (${reason}), ход остановлен, текстовая версия не отправлена.` }
     const text = componentFallbackText(component, data, caption, redact)
-    const send = (threadUnder: number | undefined): Promise<{ message_id: number }> => {
+    const send =(threadUnder: number | undefined): Promise<{ message_id: number }> => {
       const opts: SendMessageOpts = threadUnder === undefined ? {} : { reply_to_message_id: threadUnder }
       return this.api.sendMessage(this.ownerChat, text, opts)
     }
