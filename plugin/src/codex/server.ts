@@ -33,6 +33,7 @@ import { TelegramPoller, tokenLock } from '../telegram/poller.js'
 import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
 import { removeOwnPinService } from './pin-service.js'
+import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
 import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
@@ -447,7 +448,7 @@ async function main(): Promise<void> {
           }
         }).finally(() => {
           deliveringGoal = false
-          if (hudReady && !stopping) void hud.bump(ownerChat)
+          if (hudReady && !stopping) hudAnchor.refresh()
           reconcileNotifiedGoal(thread)
           startNext()
         })
@@ -522,7 +523,13 @@ async function main(): Promise<void> {
         deleteMessage: async (chatId, id) => { await bot.api.deleteMessage(chatId, id) },
       },
     })
-    const send = async (text: string): Promise<void> => { await telegram.sendMessage(ownerChat, text, {}) }
+    // Owner message -> HUD card -> reply: the card moves on accepted owner
+    // messages only, and replies wait (capped) for it to land first.
+    const hudAnchor = new HudAnchor(hud, ownerChat)
+    const send = async (text: string): Promise<void> => {
+      await hudAnchor.settled()
+      await telegram.sendMessage(ownerChat, text, {})
+    }
     let learningRetryAfter = 0
     function runLearning(force = false): void {
       if (!learning || stopping || !force && Date.now() < learningRetryAfter) return
@@ -553,6 +560,7 @@ async function main(): Promise<void> {
       onSent?: (id: number) => void): Promise<void> {
       text = normalizeChatReply(text)
       if (!text) return
+      await hudAnchor.settled()
       const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
       const question = questionConfig.enabled ? detectOpenQuestion(redactSecrets(text, secrets)) : undefined
       async function recordQuestion(messageId: number): Promise<void> {
@@ -1114,7 +1122,7 @@ async function main(): Promise<void> {
         task = undefined
         work.finish()
         finishMirror('Сжатие завершено')
-        if (!stopping) void hud.bump(ownerChat)
+        if (!stopping) hudAnchor.refresh()
         startNext()
       })
     }
@@ -1376,7 +1384,7 @@ async function main(): Promise<void> {
     function sideDone(): void {
       if (stopping) return
       if (!task && !goalActive && !codex.isRunning && codex.sideRunning === 0) approvals?.cancelAll()
-      if (hudReady) void hud.bump(ownerChat)
+      if (hudReady) hudAnchor.refresh()
       startNext()
       if (selfRestartEnabled) void bridgeRestart.check()
     }
@@ -1386,6 +1394,7 @@ async function main(): Promise<void> {
       const outcome = inbox.beginFollowUp(message)
       if (outcome === 'duplicate') return true
       if (outcome !== 'accepted') return false
+      if (hudReady) hudAnchor.ownerMessage()
       const id = message.message_id
       const epoch = stopEpoch
       sides.begin(id, redactSecrets(taskTitle(message.text ?? message.caption), secrets), reuse)
@@ -1452,7 +1461,7 @@ async function main(): Promise<void> {
           return
         }
         if (outcome !== 'accepted') return
-        if (hudReady) void hud.bump(ownerChat)
+        if (hudReady) hudAnchor.ownerMessage()
         startNext()
         if (inbox.active?.messages[0]?.message_id !== message.message_id) {
           await send(busyNotice(mainSummary(), sides.titles, parallel.maxParallel))
@@ -1499,7 +1508,7 @@ async function main(): Promise<void> {
           await send('Очередь заполнена. Отправь это сообщение позже.')
         } else if (outcome === 'accepted') {
           // Keep the HUD card under the owner's latest message (debounced in the HUD).
-          if (hudReady) void hud.bump(ownerChat)
+          if (hudReady) hudAnchor.ownerMessage()
           if (message.media_group_id) bufferAlbum(message.media_group_id, message)
           else resumeInbox(message)
         }
@@ -1610,6 +1619,7 @@ async function main(): Promise<void> {
         try {
           const outcome = inbox.beginFollowUp(ctx.message)
           if (outcome === 'duplicate') return
+          if (outcome === 'accepted' && hudReady) hudAnchor.ownerMessage()
           if (outcome === 'accepted' && launchSideReply(ctx.message, stopEpoch)) return
         } catch { log.warn('Could not persist the Telegram side question') }
       }
@@ -1618,7 +1628,10 @@ async function main(): Promise<void> {
         try {
           const outcome = inbox.beginFollowUp(ctx.message)
           if (outcome === 'duplicate') return
-          if (outcome === 'accepted') return await steerClaimed([ctx.message], turnId)
+          if (outcome === 'accepted') {
+            if (hudReady) hudAnchor.ownerMessage()
+            return await steerClaimed([ctx.message], turnId)
+          }
         } catch { log.warn('Could not persist the Telegram follow-up') }
       }
       if (ctx.message.media_group_id || text || hasMedia(ctx.message) || hasRichBody(ctx.message) ||
@@ -1652,6 +1665,8 @@ async function main(): Promise<void> {
     }
 
     async function deliverReply(reply: InboxReply, messageId: number): Promise<boolean> {
+      // A file-only reply skips sendFinalText's wait, so wait here as well.
+      await hudAnchor.settled()
       await sendFinalText(reply.text, reply.files.length > 0, reply.replyTo, messageId)
       for (const [index, file] of reply.files.entries()) {
         const key = 'file:' + index
@@ -1925,8 +1940,8 @@ async function main(): Promise<void> {
           cancelMedia = undefined
           work.finish()
           finishMirror(progressResult)
-          // Turn done: move the HUD card below the reply.
-          if (!stopping) void hud.bump(chatId)
+          // Turn done: refresh the HUD card in place; it already sits above the reply.
+          if (!stopping) hudAnchor.refresh()
         }
       })().catch(() => log.warn('Could not deliver the turn status')).finally(() => {
         task = undefined

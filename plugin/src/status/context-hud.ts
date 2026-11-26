@@ -435,7 +435,8 @@ export class ContextHud {
   }
 
   // Re-anchor the pinned card at the BOTTOM of the chat (the server fires this
-  // after an owner message is accepted and when a turn completes). Deletes the
+  // only when an owner message is accepted, so the card sits between that
+  // message and the agent's reply; turn end only refreshes it). Deletes the
   // old message — which also removes its pin, so the one-pin invariant holds —
   // and sends+pins a fresh one. When Telegram refuses the delete (bots cannot
   // delete own messages older than 48h) we fall back to unpinChatMessage so two
