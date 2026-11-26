@@ -77,9 +77,26 @@ export const componentInstructions =
   'система и связи (architecture, network3d), план с датами (timeline-roadmap), сравнение (compare, radar, pros-cons), ' +
   'вопросы и ответы (faq), статус работы (status). Перед первым использованием вызови component_schema. ' +
   'Короткий ответ, мнение или разговор отправляй текстом, не компонентом. Не больше одного компонента на ответ. ' +
-  'В финальном ответе напиши 1–2 строки о том, что показывает компонент. Если результат говорит, что данные ушли текстом ' +
-  'или статус доставки неизвестен, не отправляй их повторно. update_component принимает только message_id из ' +
-  'send_component или update_component.'
+  'Если виджет показан, в финальном ответе напиши 1–2 строки о том, что показывает компонент. Если данные ушли текстом, ' +
+  'не отправляй их повторно и не сообщай о сбое: заверши ход пустым финальным ответом. Если статус доставки неизвестен, ' +
+  'не отправляй данные повторно. update_component принимает только message_id из send_component или update_component.'
+
+// Longest final answer after a text fallback that still counts as the 1–2 line component note, not content.
+const fallbackNoteChars = 300
+const fallbackNoteLines = 2
+
+// What the bridge does with the visible final answer of a turn that sent a component (`delivery`: the turn's
+// component outcome, `text` when any of them fell back to plain text). An empty final is dropped: the component
+// already answered. After a text fallback the owner already has the data, so a short note without a question
+// (the component note the instructions ask for, or a report of the failure) is dropped as well.
+export function finalAfterComponents(text: string, delivery: 'widget' | 'text' | undefined): 'send' | 'drop' {
+  if (delivery === undefined) return 'send'
+  const visible = text.trim()
+  if (visible.length === 0) return 'drop'
+  if (delivery !== 'text') return 'send'
+  const lines = visible.split('\n').filter(line => line.trim().length > 0).length
+  return lines <= fallbackNoteLines && visible.length <= fallbackNoteChars && !visible.includes('?') ? 'drop' : 'send'
+}
 
 function isComponentName(value: unknown): value is ComponentName {
   return COMPONENT_NAMES.some(name => name === value)
@@ -215,6 +232,15 @@ function isMissingReplyTarget(error: unknown): boolean {
   return text.includes('message to be replied not found') || text.includes('replied message not found')
 }
 
+// A 400 whose Telegram code ends in ALLOWED (`*_NOT_ALLOWED`): the request shape is refused, not the data. The live
+// refusal of a widget threaded under a voice message had this shape; the exact code was masked, so the bridge
+// retries such a refusal once without reply_parameters, the only optional part of the request.
+function isNotAllowed(error: unknown): boolean {
+  if (classifySendError(error, 0).kind !== 'permanent') return false
+  const status = typeof error === 'object' && error !== null ? (error as { error_code?: unknown }).error_code : undefined
+  return status === 400 && /\b[A-Z][A-Z_]*ALLOWED\b/.test(error instanceof Error ? error.message : String(error))
+}
+
 // Ids of the messages this process sent as components; update_component may
 // delete only these. In memory: after a restart the model sends a new component.
 const registryLimit = 200
@@ -282,7 +308,8 @@ export class AgentComponents {
     if (out.kind === 'text') {
       this.record(out.messageId)
       return { ok: true, message_ids: [out.messageId], delivery: 'text',
-        hint: `Виджет не показан (${out.reason}). Владелец получил те же данные обычным текстом, не отправляй их повторно. ` +
+        hint: `Виджет не показан (${out.reason}). Владелец получил те же данные обычным текстом, не отправляй их повторно ` +
+          'и не сообщай о сбое отдельным сообщением: заверши ход пустым финальным ответом. ' +
           'Для виджета в следующий раз проверь поля через component_schema.' }
     }
     if (out.kind === 'unknown') {
@@ -320,15 +347,22 @@ export class AgentComponents {
           ...(replyTo !== undefined ? { reply_to_message_id: replyTo } : {}),
         }
         reason = checkWidgetPayload(params)
-        if (reason === undefined) {
+        let attempt = params
+        while (reason === undefined) {
           try {
-            const sent = await this.api.sendWidget(this.ownerChat, params)
+            const sent = await this.api.sendWidget(this.ownerChat, attempt)
             return { kind: 'widget', messageId: sent.message_id, ...(rendered.variant ? { variant: rendered.variant } : {}) }
           } catch (error) {
             if (isAmbiguous(error)) return { kind: 'unknown', reason: `отправка виджета прервалась (${errorText(error)})` }
             // A flood wait is still running: any text copy now would be one more send into it.
             if (classifySendError(error, 0).kind === 'rate_limited') {
               return { kind: 'failed', reason: 'Telegram ограничил частоту отправки, ничего не отправлено. Повтори позже.' }
+            }
+            // A 400 is a refusal: nothing was shown, so one more widget without the reply cannot double-post.
+            if (attempt.reply_to_message_id !== undefined && isNotAllowed(error) && current()) {
+              const { reply_to_message_id: _dropped, ...unthreaded } = attempt
+              attempt = unthreaded
+              continue
             }
             if (replyTo !== undefined && isMissingReplyTarget(error)) replyTo = undefined
             reason = `Telegram не принял виджет: ${errorText(error)}`
