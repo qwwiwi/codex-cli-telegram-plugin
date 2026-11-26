@@ -69,13 +69,16 @@ type Settings = {
   sandbox?: CodexSandboxMode
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
   chatAction?: (key: string, args: unknown, current: () => boolean) => ReturnType<AgentChatActions['call']>
+  // Operational notes without user content, e.g. a fallback the bridge took.
+  onWarning?: (message: string) => void
 }
 
 type Result = { status: 'completed' | 'interrupted' | 'failed'; text: string }
 type SessionStatus = {
   hasThread: boolean
   model: string | undefined
-  usage: { usedTokens: number; windowTokens: number } | undefined
+  // cachePercent: share of the last main request's input read from the prompt cache.
+  usage: { usedTokens: number; windowTokens: number; cachePercent?: number } | undefined
 }
 
 type Execution = {
@@ -102,6 +105,13 @@ function recordFileChange(execution: Execution, item: Record<string, unknown>): 
       ? [{ path: change.path, diff: change.diff, kind: object(change.kind) }] : []
   })
   if (changes.length === item.changes.length) execution.fileChanges.set(item.id, changes)
+}
+
+// Cached input is part of input in Codex token usage; missing or odd numbers give no share.
+function cacheShare(input: unknown, cached: unknown): number | undefined {
+  if (typeof input !== 'number' || !Number.isFinite(input) || input <= 0 ||
+      typeof cached !== 'number' || !Number.isFinite(cached) || cached < 0) return
+  return Math.min(100, Math.round(cached / input * 100))
 }
 
 function sameShellCommand(native: string, hook: string): boolean {
@@ -138,7 +148,10 @@ export class CodexSession {
   // Parallel side turns, keyed by their own thread. Side threads never become
   // the main conversation and are never treated as children of a main turn.
   private readonly sides = new Map<string, Turn>()
-  private readonly sideThreads = new Set<string>()
+  // Known side threads and the model each one runs on (undefined: not known).
+  private readonly sideThreads = new Map<string, string | undefined>()
+  // Owner sides fork the main thread until the App Server refuses a fork once.
+  private forkSides = true
   // Side turns whose thread is still opening; stopSide() reaches them too.
   private readonly startingSides = new Set<{ stop: boolean }>()
   // Threads whose last turn ran restricted; Codex keeps turn overrides for later turns.
@@ -329,7 +342,8 @@ export class CodexSession {
       const model = this.settings.selectedModel?.() ?? this.settings.model
       const response = await this.rpc.request('turn/start', {
         threadId,
-        ...(model ? { model } : {}),
+        // A turn override stays for later turns; resending an unchanged model is noise.
+        ...(model && model !== this.model ? { model } : {}),
         ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
@@ -382,7 +396,8 @@ export class CodexSession {
   }
 
   // Runs one turn on a side thread next to the main conversation. `reuse`
-  // continues an earlier side thread; otherwise a fresh one is started.
+  // continues an earlier side thread; otherwise an owner side forks the main
+  // thread and an untrusted (agent) side starts a fresh one.
   // `onStarted` fires once Codex accepted the turn.
   async runSide(text: string, imagePaths: readonly string[] = [], reuse?: string,
     onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string }> {
@@ -395,7 +410,7 @@ export class CodexSession {
     this.startingSides.add(starting)
     let threadId: string
     try {
-      threadId = reuse ?? await this.openSideThread(model)
+      threadId = reuse ?? await this.openSideThread(model, !!options.untrusted)
     } finally {
       this.startingSides.delete(starting)
     }
@@ -408,9 +423,10 @@ export class CodexSession {
     }
     this.sides.set(threadId, turn)
     try {
+      const sendModel = !!model && model !== this.sideThreads.get(threadId)
       const response = await this.rpc.request('turn/start', {
         threadId,
-        ...(model ? { model } : {}),
+        ...(sendModel ? { model } : {}),
         ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
@@ -419,6 +435,7 @@ export class CodexSession {
       })
       const id = object(response.turn).id
       if (typeof id !== 'string') throw new Error('Codex did not return a side turn ID')
+      if (sendModel && this.sideThreads.has(threadId)) this.sideThreads.set(threadId, model)
       if (!turn.id) this.setTurnId(turn, id)
       onStarted?.(threadId)
       return { ...await completed, threadId }
@@ -438,9 +455,10 @@ export class CodexSession {
     return turns.length + starting.length > 0
   }
 
-  private async openSideThread(model: string | undefined): Promise<string> {
+  private async openSideThread(model: string | undefined, untrusted: boolean): Promise<string> {
     // Deliberately not openThread: the main thread, its model and usage stay as they are.
-    const reply = await this.rpc.request('thread/start', {
+    const fork = untrusted ? undefined : await this.forkMainThread()
+    const reply = fork ?? await this.rpc.request('thread/start', {
       cwd: this.settings.cwd,
       ...this.permissions(),
       ...(model ? { model } : {}),
@@ -448,13 +466,32 @@ export class CodexSession {
     })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || id === this.threadId) throw new Error('Codex did not return a side thread ID')
-    this.sideThreads.add(id)
+    this.sideThreads.set(id, typeof reply.model === 'string' ? reply.model : fork ? undefined : model)
     if (this.sideThreads.size > 64) {
-      for (const old of this.sideThreads) {
+      for (const old of this.sideThreads.keys()) {
         if (!this.sides.has(old)) { this.sideThreads.delete(old); break }
       }
     }
     return id
+  }
+
+  // An ephemeral fork of the main thread shares its prompt prefix and, per the
+  // Codex source, its prompt-cache key. Undefined: start a fresh thread instead.
+  private async forkMainThread(): Promise<Record<string, unknown> | undefined> {
+    const main = this.threadId
+    if (!this.forkSides || !main || this.needsResume) return
+    try {
+      const reply = await this.rpc.request('thread/fork', {
+        threadId: main, cwd: this.settings.cwd, excludeTurns: true, ephemeral: true, ...this.permissions(),
+      })
+      const id = object(reply.thread).id
+      if (typeof id === 'string' && id && id !== main) return reply
+    } catch {
+      // Refused (older App Server, root relay): handled below like a bad reply.
+    }
+    this.forkSides = false
+    this.settings.onWarning?.('Codex refused thread/fork for a side thread; side threads use thread/start from now on')
+    return undefined
   }
 
   async compact(): Promise<Result['status']> {
@@ -586,11 +623,13 @@ export class CodexSession {
     }
     if (method === 'thread/tokenUsage/updated' && params.threadId === this.threadId) {
       const usage = object(params.tokenUsage)
-      const usedTokens = object(usage.last).totalTokens
+      const last = object(usage.last)
+      const usedTokens = last.totalTokens
       const windowTokens = usage.modelContextWindow
       if (typeof usedTokens === 'number' && Number.isFinite(usedTokens) && usedTokens >= 0
           && typeof windowTokens === 'number' && Number.isFinite(windowTokens) && windowTokens > 0) {
-        this.usage = { usedTokens, windowTokens }
+        const cachePercent = cacheShare(last.inputTokens, last.cachedInputTokens)
+        this.usage = { usedTokens, windowTokens, ...(cachePercent === undefined ? {} : { cachePercent }) }
       }
     }
     const observedId = typeof params.turnId === 'string' ? params.turnId : object(params.turn).id
