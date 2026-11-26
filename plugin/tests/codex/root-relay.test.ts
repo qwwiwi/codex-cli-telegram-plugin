@@ -90,6 +90,12 @@ resume = dict(params, threadId='thread')
 del resume['dynamicTools']
 assert not allowed_request({'method': 'thread/resume', 'params': resume}, opened, config)
 assert allowed_request({'method': 'thread/resume', 'params': dict(resume, excludeTurns=True)}, opened, config)
+# A side thread forks the main thread ephemerally to reuse its prompt cache.
+fork = dict(resume, excludeTurns=True)
+assert allowed_request({'method': 'thread/fork', 'params': dict(fork, ephemeral=True)}, opened, config)
+assert not allowed_request({'method': 'thread/fork', 'params': dict(fork, ephemeral=False)}, opened, config)
+assert not allowed_request({'method': 'thread/start', 'params': dict(params, ephemeral=True)}, opened, config)
+assert not allowed_request({'method': 'thread/fork', 'params': dict(fork, ephemeral=True, threadId='other')}, opened, config)
 
 call = {
     'threadId': 'thread', 'turnId': 'turn', 'callId': 'call', 'namespace': None,

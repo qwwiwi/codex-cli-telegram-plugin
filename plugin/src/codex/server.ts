@@ -335,6 +335,7 @@ async function main(): Promise<void> {
       env: codexEnv,
       ...(process.env.KROT_CODEX_MODEL ? { model: process.env.KROT_CODEX_MODEL } : {}),
       selectedModel: () => controls.model,
+      onWarning: message => log.warn(message),
       onThread: id => {
         try { controls.remember(id) } catch { log.warn('Could not remember the Codex conversation') }
       },

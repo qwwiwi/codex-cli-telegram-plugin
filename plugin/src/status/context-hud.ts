@@ -184,7 +184,7 @@ function modeLabel(permissionMode: string): string {
  * PURE — no I/O, no clock — so it is trivially unit-testable against fixed inputs.
  */
 export function renderHud(
-  usage: { usedTokens: number } | null,
+  usage: { usedTokens: number; cachePercent?: number } | null,
   windowTokens: number,
   model?: string,
   work?: HudWorkView,
@@ -223,7 +223,11 @@ export function renderHud(
   const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round(pct / 10)))
   const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
 
-  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowK}k)${tail}`
+  // Prompt-cache share of the last request, only when Codex reported it.
+  const cache = usage.cachePercent
+  const cacheText = typeof cache === 'number' && Number.isFinite(cache)
+    ? ` · кеш ${Math.max(0, Math.min(100, Math.round(cache)))}%` : ''
+  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowK}k)${cacheText}${tail}`
   return { text, keyboard }
 }
 

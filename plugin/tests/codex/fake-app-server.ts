@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 const emit = (message: object) => process.stdout.write(JSON.stringify(message) + '\n')
@@ -17,6 +18,8 @@ const goalState: { current: { objective: string; status: string; origin: string 
 
 for await (const line of createInterface({ input: process.stdin })) {
   const { id, method, params, result } = JSON.parse(line)
+  // KROT_FAKE_LOG: tests read back every client request (one JSON line each).
+  if (method && process.env.KROT_FAKE_LOG) appendFileSync(process.env.KROT_FAKE_LOG, JSON.stringify({ method, params }) + '\n')
   if (!method && repeatedApproval && typeof id === 'string' && id.startsWith(repeatedApproval.prefix)) {
     const { prefix, results } = repeatedApproval
     results.set(id, result?.decision ?? 'unsupported')
@@ -106,6 +109,18 @@ for await (const line of createInterface({ input: process.stdin })) {
       threadId = params.threadId ?? crypto.randomUUID()
       respond({ thread: { id: threadId }, model: 'gpt-test' })
       break
+    case 'thread/fork': {
+      // KROT_FAKE_NO_FORK: an App Server (or relay) that refuses forks.
+      if (process.env.KROT_FAKE_NO_FORK === '1' || params.threadId !== threadId || params.excludeTurns !== true) {
+        emit({ id, error: { code: -32601, message: 'Fork refused' } })
+        break
+      }
+      const side = crypto.randomUUID()
+      if (mainWaiting) sideThreads.add(side)
+      else threadId = side
+      respond({ thread: { id: side, ephemeral: params.ephemeral === true, forkedFromId: params.threadId }, model: 'gpt-test' })
+      break
+    }
     case 'thread/turns/list':
       if (params.threadId !== threadId) break
       respond({ data: [{ items: [{ type: 'agentMessage', text: 'Example' }] }], nextCursor: null })
@@ -283,6 +298,14 @@ for await (const line of createInterface({ input: process.stdin })) {
         } })
         break
       } else if (params.input[0].text !== 'wait') {
+        if (params.input[0].text.startsWith('usage:')) {
+          // 'usage:cached' reports cache counters, 'usage:plain' omits them.
+          const cached = params.input[0].text === 'usage:cached'
+          emit({ method: 'thread/tokenUsage/updated', params: { threadId, turnId: activeTurn, tokenUsage: {
+            last: { totalTokens: 5000, ...(cached ? { inputTokens: 4000, cachedInputTokens: 3280 } : {}) },
+            modelContextWindow: 100000,
+          } } })
+        }
         // Exercise the race where notifications arrive before the RPC reply.
         emit({ method: 'item/completed', params: {
           threadId: 'other-thread', turnId: activeTurn,

@@ -55,7 +55,7 @@ ALLOWED = {
     "model/list": {"limit", "includeHidden"},
     "thread/start": {"cwd", "approvalPolicy", "sandbox", "model", "dynamicTools"},
     "thread/resume": {"cwd", "approvalPolicy", "sandbox", "model", "threadId", "excludeTurns"},
-    "thread/fork": {"cwd", "approvalPolicy", "sandbox", "threadId", "excludeTurns"},
+    "thread/fork": {"cwd", "approvalPolicy", "sandbox", "threadId", "excludeTurns", "ephemeral"},
     "thread/compact/start": {"threadId"},
     "thread/inject_items": {"threadId", "items"},
     "thread/read": {"threadId", "includeTurns"},
@@ -332,7 +332,7 @@ def allowed_request(message, opened, config, approval_threads=(), observed_worke
                  (isinstance(params.get("threadId"), str) and 0 < len(params["threadId"]) <= 128
                   and params.get("excludeTurns") is True))
             and (method != "thread/fork" or
-                 params["threadId"] in opened)
+                 (params["threadId"] in opened and params.get("ephemeral", True) is True))
         )
     if method == "account/read":
         return params.get("refreshToken") is False
