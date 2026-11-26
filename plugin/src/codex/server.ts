@@ -535,8 +535,8 @@ async function main(): Promise<void> {
       },
     })
     // Owner message -> HUD card -> reply: the card moves on accepted owner
-    // messages only, and replies wait (capped) for it to land first.
-    const hudAnchor = new HudAnchor(hud, ownerChat)
+    // messages only, and replies wait for it to land first (see hud-anchor.ts).
+    const hudAnchor = new HudAnchor(hud, ownerChat, undefined, log)
     const send = async (text: string): Promise<void> => {
       await hudAnchor.settled()
       await telegram.sendMessage(ownerChat, text, {})
@@ -1536,7 +1536,7 @@ async function main(): Promise<void> {
         if (outcome === 'full') {
           await send('Очередь заполнена. Отправь это сообщение позже.')
         } else if (outcome === 'accepted') {
-          // Keep the HUD card under the owner's latest message (debounced in the HUD).
+          // Keep the HUD card under the owner's latest message (bursts coalesce in HudAnchor).
           if (hudReady) hudAnchor.ownerMessage()
           if (message.media_group_id) bufferAlbum(message.media_group_id, message)
           else resumeInbox(message)
