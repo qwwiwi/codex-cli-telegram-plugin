@@ -152,6 +152,8 @@ export class CodexSession {
   private readonly sideThreads = new Map<string, string | undefined>()
   // Owner sides fork the main thread until the App Server refuses a fork once.
   private forkSides = true
+  // Last main-thread turn that finished; a fork during a running turn stops there.
+  private lastMainTurn: { threadId: string; id: string } | undefined
   // Side turns whose thread is still opening; stopSide() reaches them too.
   private readonly startingSides = new Set<{ stop: boolean }>()
   // Threads whose last turn ran restricted; Codex keeps turn overrides for later turns.
@@ -480,9 +482,15 @@ export class CodexSession {
   private async forkMainThread(): Promise<Record<string, unknown> | undefined> {
     const main = this.threadId
     if (!this.forkSides || !main || this.needsResume) return
+    // A running main turn is half-finished: fork up to the last finished turn
+    // (ThreadForkParams.lastTurnId) or, with none known, start a fresh thread.
+    const running = this.isRunning
+    const lastTurnId = this.lastMainTurn?.threadId === main ? this.lastMainTurn.id : undefined
+    if (running && !lastTurnId) return
     try {
       const reply = await this.rpc.request('thread/fork', {
         threadId: main, cwd: this.settings.cwd, excludeTurns: true, ephemeral: true, ...this.permissions(),
+        ...(running ? { lastTurnId } : {}),
       })
       const id = object(reply.thread).id
       if (typeof id === 'string' && id && id !== main) return reply
@@ -633,6 +641,10 @@ export class CodexSession {
       }
     }
     const observedId = typeof params.turnId === 'string' ? params.turnId : object(params.turn).id
+    if (method === 'turn/completed' && typeof observedId === 'string' && typeof params.threadId === 'string' &&
+        params.threadId === this.threadId) {
+      this.lastMainTurn = { threadId: params.threadId, id: observedId }
+    }
     if (typeof params.threadId === 'string' && this.sideThreads.has(params.threadId)) {
       const side = this.sides.get(params.threadId)
       if (side) this.receiveTurnEvent(side, method, params, false)

@@ -37,10 +37,12 @@ async function until(check: () => boolean): Promise<void> {
   expect(check()).toBe(true)
 }
 
-async function mainBusy(session: CodexSession): Promise<Promise<unknown>> {
+// Wrapped: an async function returning the bare promise would wait for the
+// main turn itself, which only ends at session.stop().
+async function mainBusy(session: CodexSession): Promise<{ main: Promise<unknown> }> {
   const main = session.run('wait')
   await until(() => session.steerableTurn !== undefined)
-  return main
+  return { main }
 }
 
 afterEach(() => {
@@ -51,7 +53,8 @@ afterEach(() => {
 test('an owner side thread is an ephemeral fork of the main thread and a reply reuses it', async () => {
   const { session, requests } = fixture()
   await session.initialize()
-  const main = await mainBusy(session)
+  await session.run('один')
+  const { main } = await mainBusy(session)
   const mainThread = session.currentThread
   const side = await session.runSide('Какая погода?')
   expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId })
@@ -59,7 +62,8 @@ test('an owner side thread is an ephemeral fork of the main thread and a reply r
   expect(session.currentThread).toBe(mainThread)
   const forks = requests('thread/fork')
   expect(forks).toHaveLength(1)
-  expect(forks[0]!.params).toMatchObject({ threadId: mainThread, ephemeral: true, excludeTurns: true })
+  // Forked up to the last finished main turn, never the one still running.
+  expect(forks[0]!.params).toMatchObject({ threadId: mainThread, ephemeral: true, excludeTurns: true, lastTurnId: 'turn-1' })
   // Only the main thread was ever started.
   expect(requests('thread/start')).toHaveLength(1)
   const again = await session.runSide('ещё', [], side.threadId)
@@ -72,7 +76,7 @@ test('an owner side thread is an ephemeral fork of the main thread and a reply r
 test('an agent side thread never forks the owner main thread', async () => {
   const { session, requests } = fixture()
   await session.initialize()
-  const main = await mainBusy(session)
+  const { main } = await mainBusy(session)
   const side = await session.runSide('Verify the summary.', [], undefined, undefined, { untrusted: true })
   expect(side.status).toBe('completed')
   expect(requests('thread/fork')).toHaveLength(0)
@@ -81,10 +85,25 @@ test('an agent side thread never forks the owner main thread', async () => {
   await main
 })
 
+test('a side during the first main turn starts a fresh thread instead of forking a half-finished turn', async () => {
+  const { session, requests, warnings } = fixture()
+  await session.initialize()
+  const { main } = await mainBusy(session)
+  const side = await session.runSide('Какая погода?')
+  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId })
+  expect(requests('thread/fork')).toHaveLength(0)
+  expect(requests('thread/start')).toHaveLength(2)
+  // Not a refusal: later sides may still fork once a main turn has finished.
+  expect(warnings).toHaveLength(0)
+  await session.stop()
+  await main
+})
+
 test('without fork support a side thread falls back to thread/start once and says so', async () => {
   const { session, requests, warnings } = fixture({ noFork: true })
   await session.initialize()
-  const main = await mainBusy(session)
+  await session.run('один')
+  const { main } = await mainBusy(session)
   const first = await session.runSide('раз')
   expect(first).toEqual({ status: 'completed', text: 'side: раз', threadId: first.threadId })
   const second = await session.runSide('два')

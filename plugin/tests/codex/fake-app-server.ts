@@ -115,6 +115,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         emit({ id, error: { code: -32601, message: 'Fork refused' } })
         break
       }
+      // While the main turn runs, a fork must stop at a finished turn (lastTurnId).
+      if (mainWaiting && (typeof params.lastTurnId !== 'string' || !params.lastTurnId.startsWith('turn-') ||
+          params.lastTurnId === activeTurn)) {
+        emit({ id, error: { code: -32602, message: 'Fork would copy the running turn' } })
+        break
+      }
       const side = crypto.randomUUID()
       if (mainWaiting) sideThreads.add(side)
       else threadId = side
