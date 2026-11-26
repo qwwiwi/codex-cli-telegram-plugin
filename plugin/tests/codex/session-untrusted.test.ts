@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import type { CodexEvent, CodexServerRequest, Json } from '../../src/codex/rpc.js'
 import { CodexSession, type ApprovalRequest } from '../../src/codex/session.js'
@@ -64,11 +64,12 @@ interface SessionInternals {
 function fixture(rpc: HeldRpc, options: {
   approve?: (request: ApprovalRequest) => Promise<'accept' | 'decline' | 'cancel'>
   chatAction?: () => Promise<{ contentItems: [{ type: 'inputText'; text: string }]; success: boolean }>
+  sandbox?: 'workspace-write' | 'danger-full-access'
 } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-untrusted-'))
   dirs.push(cwd)
   const session = new CodexSession({
-    cwd, stateFile: join(cwd, 'thread.json'), env: process.env, sandbox: 'danger-full-access',
+    cwd, stateFile: join(cwd, 'thread.json'), env: process.env, sandbox: options.sandbox ?? 'danger-full-access',
     command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'],
     ...(options.approve ? { approve: options.approve } : {}),
     ...(options.chatAction ? { chatAction: options.chatAction } : {}),
@@ -82,7 +83,18 @@ function fixture(rpc: HeldRpc, options: {
       item: { type: 'agentMessage', phase: 'final_answer', text } } })
     internals.receive({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } })
   }
-  return { session, internals, complete }
+  return { session, internals, complete, cwd }
+}
+
+// The full Codex app-server workspaceWrite SandboxPolicy (v2 TurnStartParams):
+// every field is required, a bare { type } is rejected by the real server.
+function expectFullWorkspaceWrite(policy: unknown, cwd: string): void {
+  expect(policy).toEqual({
+    type: 'workspaceWrite', writableRoots: [cwd], networkAccess: true,
+    excludeTmpdirEnvVar: false, excludeSlashTmp: false,
+  })
+  const roots = (policy as { writableRoots: unknown[] }).writableRoots
+  for (const root of roots) expect(typeof root === 'string' && isAbsolute(root)).toBe(true)
 }
 
 async function until(check: () => boolean): Promise<void> {
@@ -122,11 +134,12 @@ test('F2: a side stopped while turn/start is pending is interrupted as soon as C
 
 test('F1: an agent turn runs in workspace-write without approvals and the next owner turn restores the mode', async () => {
   const rpc = new HeldRpc()
-  const { session, complete } = fixture(rpc)
+  const { session, complete, cwd } = fixture(rpc)
   const agent = session.run('agent input', [], undefined, { untrusted: true })
   await until(() => turnStarts(rpc).length === 1)
   const thread = String(turnStarts(rpc)[0]!.threadId)
-  expect(turnStarts(rpc)[0]).toMatchObject({ approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite' } })
+  expect(turnStarts(rpc)[0]).toMatchObject({ approvalPolicy: 'never' })
+  expectFullWorkspaceWrite(turnStarts(rpc)[0]!.sandboxPolicy, cwd)
   complete(thread, 'turn-1')
   await agent
   const owner = session.run('owner input')
@@ -147,14 +160,15 @@ test('F1: an agent side turn is restricted and never reaches owner approvals, qu
   const rpc = new HeldRpc()
   const approvals: ApprovalRequest[] = []
   let chatActions = 0
-  const { session, internals, complete } = fixture(rpc, {
+  const { session, internals, complete, cwd } = fixture(rpc, {
     approve: async request => { approvals.push(request); return 'accept' },
     chatAction: async () => { chatActions++; return { contentItems: [{ type: 'inputText', text: 'ok' }], success: true } },
   })
   const side = session.runSide('agent side', [], undefined, undefined, { untrusted: true })
   await until(() => turnStarts(rpc).length === 1)
   const start = turnStarts(rpc)[0]!
-  expect(start).toMatchObject({ approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite' } })
+  expect(start).toMatchObject({ approvalPolicy: 'never' })
+  expectFullWorkspaceWrite(start.sandboxPolicy, cwd)
   const threadId = String(start.threadId)
   await until(() => session.isUntrustedTurn(threadId, 'turn-1'))
   const command = await internals.requestApproval({ id: 1, method: 'item/commandExecution/requestApproval',
@@ -167,4 +181,20 @@ test('F1: an agent side turn is restricted and never reaches owner approvals, qu
   expect(chatActions).toBe(0)
   complete(threadId, 'turn-1')
   expect((await side).status).toBe('completed')
+})
+
+test('F1: in workspace-write mode the owner turn after an agent turn restores a full workspaceWrite policy', async () => {
+  const rpc = new HeldRpc()
+  const { session, complete, cwd } = fixture(rpc, { sandbox: 'workspace-write' })
+  const agent = session.run('agent input', [], undefined, { untrusted: true })
+  await until(() => turnStarts(rpc).length === 1)
+  const thread = String(turnStarts(rpc)[0]!.threadId)
+  complete(thread, 'turn-1')
+  await agent
+  const owner = session.run('owner input')
+  await until(() => turnStarts(rpc).length === 2)
+  expect(turnStarts(rpc)[1]).toMatchObject({ approvalPolicy: 'never' })
+  expectFullWorkspaceWrite(turnStarts(rpc)[1]!.sandboxPolicy, cwd)
+  complete(thread, 'turn-2')
+  await owner
 })

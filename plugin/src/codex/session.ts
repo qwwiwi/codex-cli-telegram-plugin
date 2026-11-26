@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { resolve as resolvePath } from 'node:path'
 import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rpc.js'
 import { sameFilePatch, type NativeFileChange } from './file-approval.js'
 import { agentChatTool, type AgentChatActions } from './chat-actions.js'
@@ -20,6 +21,24 @@ export type ApprovalRequest = {
 // Codex sandbox modes the bridge may request. 'danger-full-access' is meant only
 // for a dedicated unprivileged OS user; with approvals off it means no cards.
 export type CodexSandboxMode = 'workspace-write' | 'danger-full-access'
+
+// Per-turn sandbox override of the Codex app-server (v2 TurnStartParams.sandboxPolicy,
+// schema of `codex app-server generate-ts`). Every field is required: a partial
+// object is rejected by the server, so it must also fail tsc here.
+// The bridge never sends externalSandbox; its NetworkAccess enum values are not
+// pinned here: <<PLACEHOLDER: NetworkAccess literal values from the generated schema>>.
+export type CodexNetworkAccess = string
+export type CodexSandboxPolicy =
+  | { type: 'dangerFullAccess' }
+  | { type: 'readOnly'; networkAccess: boolean }
+  | { type: 'externalSandbox'; networkAccess: CodexNetworkAccess }
+  | {
+    type: 'workspaceWrite'
+    writableRoots: string[]
+    networkAccess: boolean
+    excludeTmpdirEnvVar: boolean
+    excludeSlashTmp: boolean
+  }
 
 // Per-turn options. An untrusted turn answers input the owner did not write
 // (another agent): it runs in workspace-write without approvals and never
@@ -336,14 +355,30 @@ export class CodexSession {
 
   // Turn overrides: an untrusted turn is restricted; the next trusted turn on
   // that thread restores the configured mode. Other turns send nothing extra.
-  private turnPermissions(threadId: string, untrusted: boolean): Record<string, unknown> {
+  private turnPermissions(threadId: string, untrusted: boolean):
+    { approvalPolicy?: 'on-request' | 'never'; sandboxPolicy?: CodexSandboxPolicy } {
     if (untrusted) {
       this.restrictedThreads.add(threadId)
-      return { approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite' } }
+      return { approvalPolicy: 'never', sandboxPolicy: this.workspaceWritePolicy() }
     }
     if (!this.restrictedThreads.delete(threadId)) return {}
     const { approvalPolicy, sandbox } = this.permissions()
-    return { approvalPolicy, sandboxPolicy: { type: sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite' } }
+    return {
+      approvalPolicy,
+      sandboxPolicy: sandbox === 'danger-full-access' ? { type: 'dangerFullAccess' } : this.workspaceWritePolicy(),
+    }
+  }
+
+  // Writes only inside the bridge workspace; network stays on because agent
+  // tasks need git, gh and gbrain. Temp directories keep their default access.
+  private workspaceWritePolicy(): CodexSandboxPolicy {
+    return {
+      type: 'workspaceWrite',
+      writableRoots: [resolvePath(this.settings.cwd)],
+      networkAccess: true,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    }
   }
 
   // Runs one turn on a side thread next to the main conversation. `reuse`
