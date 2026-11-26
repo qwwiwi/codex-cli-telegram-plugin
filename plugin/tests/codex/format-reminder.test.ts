@@ -84,6 +84,21 @@ test('[R02] the split never cuts a list, a link, inline code or a bold span', ()
   expect(split.split('\n\n').join(' ')).toBe(protectedSpans)
 })
 
+test('[R02] the split never cuts a single-italic span or an HTML element, including a multi-line <pre> block', () => {
+  const spans = '*Итог. Всё работает.* Готово. _Шаг 1. Шаг 2._ Дальше. <pre>cfg. Ключ. Значение.</pre> Ок. ' +
+    '<i>Раз. Два.</i> ' + longBlock
+  const split = splitLongBlock(spans)
+  expect(split).not.toBe(spans)
+  for (const span of ['*Итог. Всё работает.*', '_Шаг 1. Шаг 2._', '<pre>cfg. Ключ. Значение.</pre>', '<i>Раз. Два.</i>']) {
+    expect(split).toContain(span)
+  }
+  expect(split.split('\n\n').join(' ')).toBe(spans)
+  const pre = longBlock + '\n<pre>\n' + longBlock + '\n</pre>'
+  const prose = splitLongBlock(pre)
+  expect(prose.endsWith('\n<pre>\n' + longBlock + '\n</pre>')).toBe(true)
+  expect(prose.slice(0, -('\n<pre>\n' + longBlock + '\n</pre>').length)).toContain('\n\n')
+})
+
 test('[R02] a long prose line before a code block is split and the code stays as written', () => {
   const code = '```sh\necho one. Two\n```'
   const text = longBlock + '\n' + code
