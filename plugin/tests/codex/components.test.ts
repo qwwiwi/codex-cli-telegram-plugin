@@ -390,8 +390,9 @@ test('[R12][R13] a widget refused as not allowed with a reply target is sent onc
   expect(bare.calls.map(call => call[0])).toEqual(['text'])
 })
 
-test('[R12][R13] after a text fallback the owner gets exactly one message: a short failure report or an empty final is dropped', async () => {
-  for (const final of ['Telegram не отобразил демо-виджет, данные пришли обычным текстом.', '', '  \n']) {
+test('[R12][R13] after a text fallback the owner gets exactly one message: a repeat of the fallback text or an empty final is dropped', async () => {
+  // undefined stands for the fallback text itself, repeated by the model with different spacing.
+  for (const planned of [undefined, '', '  \n']) {
     const chat = fakeTelegramChat()
     chat.owner('voice')
     const components = new AgentComponents({
@@ -409,13 +410,32 @@ test('[R12][R13] after a text fallback the owner gets exactly one message: a sho
     // The tool result tells the model to end the turn without a final message.
     expect(String(parsed(result).hint)).toContain('пустым финальным ответом')
     expect(actions.componentDelivery(['turn-1'])).toBe('text')
+    const final = planned ?? '  ' + (chat.texts()[1] ?? '').replace(/\n/g, '\n\n') + '\n'
     // The bridge decides on the final answer: what it sends lands in the chat.
-    if (finalAfterComponents(final, actions.componentDelivery(['turn-1'])) === 'send') await chat.raw.sendMessage(OWNER, final, {})
+    if (finalAfterComponents(final, actions.componentDelivery(['turn-1']), actions.componentTexts(['turn-1'])) === 'send') {
+      await chat.raw.sendMessage(OWNER, final, {})
+    }
     expect(chat.texts()).toHaveLength(2)
     expect(chat.texts()[0]).toBe('voice')
     expect(chat.texts()[1]).toContain('Выполнено задач')
   }
   expect(componentInstructions).toContain('пустым финальным ответом')
+})
+
+test('[R12][R13] after a text fallback a distinct short final, such as a rollback result, still reaches the owner', async () => {
+  const chat = fakeTelegramChat()
+  const components = new AgentComponents({ ...chat.raw, async sendWidget() { throw refusal(TELEGRAM_CODE) } }, OWNER)
+  const actions = new AgentChatActions({
+    sendMessage: unexpected, editMessageText: unexpected, setMessageReaction: unexpected,
+    pinChatMessage: unexpected, unpinChatMessage: unexpected,
+  }, OWNER, { components })
+  await actions.component(JSON.stringify(['thread', 'turn-1', 'call-1']), 'send_component',
+    { component: 'progress', data: { title: 'Миграция', label: 'Выполнено шагов', value: 40 } }, () => true)
+  expect(actions.componentDelivery(['turn-1'])).toBe('text')
+  const rollback = 'Откатил миграцию. База снова на версии 12.'
+  expect(finalAfterComponents(rollback, 'text')).toBe('send')
+  expect(finalAfterComponents(rollback, actions.componentDelivery(['turn-1']), actions.componentTexts(['turn-1']))).toBe('send')
+  expect(finalAfterComponents('Telegram не отобразил виджет, данные пришли текстом.', 'text')).toBe('send')
 })
 
 test('[R12][R13] the final answer after a component: an empty one is dropped, real answers still go out', () => {

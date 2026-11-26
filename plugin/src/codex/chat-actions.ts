@@ -162,7 +162,7 @@ export class AgentChatActions {
   // however many other calls the turn makes; dropped once the turn is over (a replay is refused then).
   private readonly sendReceipts = new Map<string, { result: Promise<ToolResult>; current: () => boolean }>()
   // Codex turn ID -> what its components delivered; read when the turn's final answer is handled.
-  private readonly componentTurns = new Map<string, 'widget' | 'text'>()
+  private readonly componentTurns = new Map<string, { delivery: 'widget' | 'text'; texts: string[] }>()
   private pending = Promise.resolve()
   lastReply: number | undefined
 
@@ -255,8 +255,9 @@ export class AgentChatActions {
       const outcome = await components.run(tool, raw, id => this.targets.has(id), current)
       // A component message is a known target for this run: the model may pin or react to it.
       for (const id of outcome.message_ids) this.remember(id, false, false, false, true)
-      this.recordComponentTurn(key, outcome.delivery)
-      return { success: outcome.ok, contentItems: [{ type: 'inputText', text: JSON.stringify({ tool, ...outcome }) }] }
+      const { fallbackText, ...visible } = outcome
+      this.recordComponentTurn(key, outcome.delivery, fallbackText)
+      return { success: outcome.ok, contentItems: [{ type: 'inputText', text: JSON.stringify({ tool, ...visible }) }] }
     })
     this.pending = result.then(() => undefined, () => undefined)
     if (tool === 'component_schema') {
@@ -272,18 +273,27 @@ export class AgentChatActions {
   // The component outcome of the given Codex turns: `text` when any component fell back to plain text,
   // `widget` when components were shown, undefined when none reached the chat.
   componentDelivery(turnIds: readonly string[]): 'widget' | 'text' | undefined {
-    const outcomes = turnIds.map(id => this.componentTurns.get(id))
+    const outcomes = turnIds.map(id => this.componentTurns.get(id)?.delivery)
     return outcomes.includes('text') ? 'text' : outcomes.includes('widget') ? 'widget' : undefined
   }
 
-  private recordComponentTurn(key: string, delivery: unknown): void {
+  // The plain texts the given turns' component fallbacks put in the chat: a final repeating one adds nothing.
+  componentTexts(turnIds: readonly string[]): string[] {
+    return turnIds.flatMap(id => this.componentTurns.get(id)?.texts ?? [])
+  }
+
+  private recordComponentTurn(key: string, delivery: unknown, fallbackText: string | undefined): void {
     if (delivery !== 'widget' && delivery !== 'text') return
     let parts: unknown
     try { parts = JSON.parse(key) } catch { return }
     // Native tool call keys are [threadId, turnId, callId] (CodexSession.requestApproval).
     if (!Array.isArray(parts) || parts.length !== 3 || typeof parts[1] !== 'string') return
     const turnId = parts[1]
-    if (this.componentTurns.get(turnId) !== 'text') this.componentTurns.set(turnId, delivery)
+    const previous = this.componentTurns.get(turnId)
+    this.componentTurns.set(turnId, {
+      delivery: previous?.delivery === 'text' ? 'text' : delivery,
+      texts: [...previous?.texts ?? [], ...fallbackText === undefined ? [] : [fallbackText]],
+    })
     if (this.componentTurns.size > targetLimit) this.componentTurns.delete(this.componentTurns.keys().next().value!)
   }
 

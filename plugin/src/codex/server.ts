@@ -2005,8 +2005,9 @@ async function main(): Promise<void> {
           await agentChat.flush()
           if (stopping) return
           const componentDelivery = agentChat.componentDelivery(turnIds)
+          const componentTexts = agentChat.componentTexts(turnIds)
           if (result.status === 'completed' && !editTarget && !result.text.trim() &&
-              finalAfterComponents(result.text, componentDelivery) === 'drop') {
+              finalAfterComponents(result.text, componentDelivery, componentTexts) === 'drop') {
             // The component was the answer: no second message, not even a "no answer" notice.
             log.info('Codex turn ended with a component and an empty final answer')
             inbox.finish(first.message_id)
@@ -2028,9 +2029,9 @@ async function main(): Promise<void> {
           const restart = bridgeRestartReply(completed, mayRestartBridge, interim !== undefined, verificationEligible)
           const targetId = first.reply_to_message?.message_id
           const shown = extractAttachments(hideQuestionMarker(hideContinuationMarker(restart.text)))
-          // After a component fell back to text, a short note about it would be a second message with nothing new.
+          // After a component fell back to text, a final repeating that text would be a second message with nothing new.
           const dropNote = !editTarget && interim === undefined && !restart.requested && shown.files.length === 0 &&
-            finalAfterComponents(shown.text, componentDelivery) === 'drop'
+            finalAfterComponents(shown.text, componentDelivery, componentTexts) === 'drop'
           if (dropNote) log.info('Dropped the short final answer after a component text fallback')
           const extracted = dropNote ? { ...shown, text: '' } : shown
           const reply = { ...extracted, text: editTarget ? extracted.text :

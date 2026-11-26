@@ -81,21 +81,19 @@ export const componentInstructions =
   'не отправляй их повторно и не сообщай о сбое: заверши ход пустым финальным ответом. Если статус доставки неизвестен, ' +
   'не отправляй данные повторно. update_component принимает только message_id из send_component или update_component.'
 
-// Longest final answer after a text fallback that still counts as the 1–2 line component note, not content.
-const fallbackNoteChars = 300
-const fallbackNoteLines = 2
+const sameText = (text: string): string => text.replace(/\s+/g, ' ').trim()
 
 // What the bridge does with the visible final answer of a turn that sent a component (`delivery`: the turn's
-// component outcome, `text` when any of them fell back to plain text). An empty final is dropped: the component
-// already answered. After a text fallback the owner already has the data, so a short note without a question
-// (the component note the instructions ask for, or a report of the failure) is dropped as well.
-export function finalAfterComponents(text: string, delivery: 'widget' | 'text' | undefined): 'send' | 'drop' {
+// component outcome, `text` when any of them fell back to plain text; `delivered`: the fallback texts that reached
+// the chat). An empty final is dropped: the component already answered. After a text fallback only a final that
+// repeats a delivered fallback text is dropped; any other final, however short, may carry a new result.
+export function finalAfterComponents(text: string, delivery: 'widget' | 'text' | undefined,
+  delivered: readonly string[] = []): 'send' | 'drop' {
   if (delivery === undefined) return 'send'
-  const visible = text.trim()
+  const visible = sameText(text)
   if (visible.length === 0) return 'drop'
   if (delivery !== 'text') return 'send'
-  const lines = visible.split('\n').filter(line => line.trim().length > 0).length
-  return lines <= fallbackNoteLines && visible.length <= fallbackNoteChars && !visible.includes('?') ? 'drop' : 'send'
+  return delivered.some(fallback => sameText(fallback) === visible) ? 'drop' : 'send'
 }
 
 function isComponentName(value: unknown): value is ComponentName {
@@ -209,11 +207,13 @@ export type ComponentOutcome = {
   component?: ComponentName
   schema?: unknown
   example?: unknown
+  // The plain text that reached the chat after a fallback; for the bridge, never echoed to the model.
+  fallbackText?: string
 }
 
 type Delivery =
   | { kind: 'widget'; messageId: number; variant?: 'static' }
-  | { kind: 'text'; messageId: number; reason: string }
+  | { kind: 'text'; messageId: number; reason: string; text: string }
   | { kind: 'unknown'; reason: string }
   | { kind: 'failed'; reason: string }
 
@@ -307,7 +307,7 @@ export class AgentComponents {
     }
     if (out.kind === 'text') {
       this.record(out.messageId)
-      return { ok: true, message_ids: [out.messageId], delivery: 'text',
+      return { ok: true, message_ids: [out.messageId], delivery: 'text', fallbackText: out.text,
         hint: `Виджет не показан (${out.reason}). Владелец получил те же данные обычным текстом, не отправляй их повторно ` +
           'и не сообщай о сбое отдельным сообщением: заверши ход пустым финальным ответом. ' +
           'Для виджета в следующий раз проверь поля через component_schema.' }
@@ -383,7 +383,7 @@ export class AgentComponents {
         if (replyTo === undefined || !isMissingReplyTarget(error)) throw error
         sent = await send(undefined)
       }
-      return { kind: 'text', messageId: sent.message_id, reason }
+      return { kind: 'text', messageId: sent.message_id, reason, text }
     } catch (error) {
       if (isAmbiguous(error)) {
         return { kind: 'unknown', reason: `виджет не показан (${reason}), текстовая версия прервалась (${errorText(error)})` }
