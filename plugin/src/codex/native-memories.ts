@@ -1,36 +1,29 @@
-import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { CodexRpc, object } from './rpc.js'
 
-function hasMemoriesSetting(path: string): boolean {
-  try {
-    const { features } = Bun.TOML.parse(readFileSync(path, 'utf8')) as { features?: unknown }
-    return features !== undefined && (
-      typeof features !== 'object' || features === null || Array.isArray(features) ||
-      Object.hasOwn(features, 'memories')
-    )
-  } catch (error) {
-    // A missing layer has no preference. For any other error, let Codex handle it.
-    return (error as NodeJS.ErrnoException).code !== 'ENOENT'
-  }
-}
+const localAppServer = ['codex', 'app-server', '--listen', 'stdio://'] as const
+const probeTimeoutMs = 5000
 
-export function codexAppServerCommand(
+export async function codexAppServerCommand(
   cwd: string, env: NodeJS.ProcessEnv, defaultEnabled: boolean,
-): readonly [string, ...string[]] {
-  const command = ['codex', 'app-server', '--listen', 'stdio://'] as const
+  command: readonly [string, ...string[]] = localAppServer,
+): Promise<readonly [string, ...string[]]> {
   if (!defaultEnabled) return command
 
-  const codexHome = env.CODEX_HOME ? resolve(cwd, env.CODEX_HOME) : join(env.HOME ?? homedir(), '.codex')
-  if (hasMemoriesSetting(join(codexHome, 'config.toml')) || hasMemoriesSetting('/etc/codex/config.toml')) {
-    return command
+  // Only Codex knows which project layers are trusted and which managed layers apply.
+  const probe = new CodexRpc(cwd, env, () => {}, () => {}, command)
+  try {
+    await probe.initialize(probeTimeoutMs)
+    const { config, origins } = await probe.request('config/read', { cwd }, probeTimeoutMs)
+    const features = object(object(config).features)
+    if (!origins || typeof origins !== 'object' || Array.isArray(origins)) return command
+    if (features.memories === false && !Object.hasOwn(origins, 'features.memories')) {
+      return [...command, '-c', 'features.memories=true']
+    }
+  } catch {
+    // An unavailable probe leaves the user's Codex configuration in effect.
+  } finally {
+    probe.close()
   }
 
-  // Project settings can be more specific than the Codex home configuration.
-  for (let directory = resolve(cwd); ; directory = dirname(directory)) {
-    if (hasMemoriesSetting(join(directory, '.codex', 'config.toml'))) return command
-    if (directory === dirname(directory)) break
-  }
-
-  return [...command, '-c', 'features.memories=true']
+  return command
 }

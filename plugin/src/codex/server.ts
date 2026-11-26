@@ -368,6 +368,9 @@ async function main(): Promise<void> {
       statusConfig.status.interval_ms = active ? Math.max(5000, config.status.interval_ms) : config.status.interval_ms
     }
     setGoalActive(goalActive)
+    const command = proxy ? ['/usr/bin/sudo', '-n', '--', proxy] as const
+      : await codexAppServerCommand(workspace, codexEnv, process.env.KROT_CODEX_MEMORIES_DEFAULT === '1')
+    if (stopping) return
     const codex = session = new CodexSession({
       cwd: workspace,
       stateFile: join(paths.root, 'codex-thread.json'),
@@ -525,8 +528,7 @@ async function main(): Promise<void> {
         void result.then(value => sideDeliveries.record(key, value), () => undefined)
         return result
       },
-      command: proxy ? ['/usr/bin/sudo', '-n', '--', proxy]
-        : codexAppServerCommand(workspace, codexEnv, process.env.KROT_CODEX_MEMORIES_DEFAULT === '1'),
+      command,
     }, () => {
       if (!stopping) process.exitCode = 1
       shutdown()

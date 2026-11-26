@@ -85,7 +85,8 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 
 A fresh `./install.sh` sets `KROT_CODEX_MEMORIES_DEFAULT=1` in `plugin/.env`.
 When the bridge starts its local Codex App Server, it enables native Codex
-memories if no explicit `features.memories` setting is present. This leaves
+memories if Codex reports no explicit `features.memories` setting in its
+resolved configuration. This leaves
 the user's Codex configuration file intact. The [optional bridge learning
 feature](learning.md) has its own settings.
 
