@@ -39,16 +39,24 @@ export class HudAnchor {
     void attempt(() => this.hud.updateNow(this.chatId))
   }
 
-  /** Resolves once the latest move landed (or after the cap). Never rejects. */
+  /**
+   * Resolves once the latest move landed (or after the cap). Never rejects.
+   * One cap per move: once a wait for it timed out, later waits (the second
+   * wait of the same reply) return at once instead of adding another cap.
+   */
   async settled(): Promise<void> {
     const pending = this.pending
     if (pending === undefined) return
     let timer: ReturnType<typeof setTimeout> | undefined
-    const cap = new Promise<void>(resolve => { timer = setTimeout(resolve, this.capMs) })
+    let expired = false
+    const cap = new Promise<void>(resolve => {
+      timer = setTimeout(() => { expired = true; resolve() }, this.capMs)
+    })
     try {
       await Promise.race([pending, cap])
     } finally {
       clearTimeout(timer)
+      if (expired && this.pending === pending) this.pending = undefined
     }
   }
 }

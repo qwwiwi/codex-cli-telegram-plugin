@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import {
   busyNotice, parallelSettings, routeWhileBusy, SideRegistry, sideInstructions,
 } from '../../src/codex/parallel.js'
+import { ownerProvenance } from '../../src/codex/provenance.js'
 
 const keywords = parallelSettings({ KROT_CODEX_PARALLEL: '1' }).keywords
 
@@ -65,10 +66,10 @@ test('the queue notice and side note say what is running', () => {
   expect(notice).toContain('5 мин')
   expect(notice).toContain('Найди рецепт борща')
   expect(notice).toContain('очеред')
-  const note = sideInstructions({ title: 'Перепиши лендинг', step: 'Правлю index.html', elapsedMs: 90_000 })
+  const note = sideInstructions({ title: 'Перепиши лендинг', step: 'Правлю index.html', elapsedMs: 90_000 }, ownerProvenance)
   expect(note).toContain('Перепиши лендинг')
   expect(note).toContain('Правлю index.html')
   expect(note).toContain('2 мин')
   expect(note).toContain('файл')
-  expect(sideInstructions({ title: 'x'.repeat(500), elapsedMs: 0 }).length).toBeLessThan(1500)
+  expect(sideInstructions({ title: 'x'.repeat(500), elapsedMs: 0 }, ownerProvenance).length).toBeLessThan(1500)
 })

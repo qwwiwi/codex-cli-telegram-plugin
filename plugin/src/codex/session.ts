@@ -21,6 +21,13 @@ export type ApprovalRequest = {
 // for a dedicated unprivileged OS user; with approvals off it means no cards.
 export type CodexSandboxMode = 'workspace-write' | 'danger-full-access'
 
+// Per-turn options. An untrusted turn answers input the owner did not write
+// (another agent): it runs in workspace-write without approvals and never
+// reaches owner approval cards, owner questions or Telegram chat actions.
+export interface TurnOptions {
+  untrusted?: boolean
+}
+
 export type PolicyApprovalRequest = ApprovalRequest & {
   kind: 'command' | 'file'
   operation?: { threadId: string; turnId: string; itemId: string }
@@ -60,6 +67,7 @@ type Execution = {
 
 type Turn = Execution & {
   stop: boolean
+  untrusted?: true
   lastText: string
   finalText?: string
   children: Map<string, Execution>
@@ -112,6 +120,10 @@ export class CodexSession {
   // the main conversation and are never treated as children of a main turn.
   private readonly sides = new Map<string, Turn>()
   private readonly sideThreads = new Set<string>()
+  // Side turns whose thread is still opening; stopSide() reaches them too.
+  private readonly startingSides = new Set<{ stop: boolean }>()
+  // Threads whose last turn ran restricted; Codex keeps turn overrides for later turns.
+  private readonly restrictedThreads = new Set<string>()
 
   constructor(private readonly settings: Settings, onClose: () => void) {
     try {
@@ -291,12 +303,15 @@ export class CodexSession {
     this.model = undefined
   }
 
-  async run(text: string, imagePaths: readonly string[] = [], onStarted?: (turnId: string) => void): Promise<Result> {
+  async run(text: string, imagePaths: readonly string[] = [], onStarted?: (turnId: string) => void,
+    options: TurnOptions = {}): Promise<Result> {
     return this.withTurn(async (threadId, turn) => {
+      if (options.untrusted) turn.untrusted = true
       const model = this.settings.selectedModel?.() ?? this.settings.model
       const response = await this.rpc.request('turn/start', {
         threadId,
         ...(model ? { model } : {}),
+        ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
           ...imagePaths.map(path => ({ type: 'localImage', path })),
@@ -311,29 +326,57 @@ export class CodexSession {
   }
 
   get sideRunning(): number {
-    return this.sides.size
+    return this.sides.size + this.startingSides.size
+  }
+
+  /** True when the running turn with this id answers untrusted (agent) input. */
+  isUntrustedTurn(threadId: string, turnId: string): boolean {
+    return this.runningTurns().some(turn => turn.threadId === threadId && turn.id === turnId && turn.untrusted === true)
+  }
+
+  // Turn overrides: an untrusted turn is restricted; the next trusted turn on
+  // that thread restores the configured mode. Other turns send nothing extra.
+  private turnPermissions(threadId: string, untrusted: boolean): Record<string, unknown> {
+    if (untrusted) {
+      this.restrictedThreads.add(threadId)
+      return { approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite' } }
+    }
+    if (!this.restrictedThreads.delete(threadId)) return {}
+    const { approvalPolicy, sandbox } = this.permissions()
+    return { approvalPolicy, sandboxPolicy: { type: sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite' } }
   }
 
   // Runs one turn on a side thread next to the main conversation. `reuse`
   // continues an earlier side thread; otherwise a fresh one is started.
   // `onStarted` fires once Codex accepted the turn.
   async runSide(text: string, imagePaths: readonly string[] = [], reuse?: string,
-    onStarted?: (threadId: string) => void): Promise<Result & { threadId: string }> {
+    onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string }> {
     if (reuse !== undefined && (!this.sideThreads.has(reuse) || this.sides.has(reuse))) {
       throw new Error('This side thread is not available')
     }
     const model = this.settings.selectedModel?.() ?? this.settings.model
-    const threadId = reuse ?? await this.openSideThread(model)
+    // Registered before thread/start so a stop during start-up is never missed.
+    const starting = { stop: false }
+    this.startingSides.add(starting)
+    let threadId: string
+    try {
+      threadId = reuse ?? await this.openSideThread(model)
+    } finally {
+      this.startingSides.delete(starting)
+    }
+    if (starting.stop) return { status: 'interrupted', text: '', threadId }
     let finish!: Turn['finish']
     const completed = new Promise<Result>(resolve => { finish = resolve })
     const turn: Turn = {
       threadId, stop: false, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
+      ...(options.untrusted ? { untrusted: true as const } : {}),
     }
     this.sides.set(threadId, turn)
     try {
       const response = await this.rpc.request('turn/start', {
         threadId,
         ...(model ? { model } : {}),
+        ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
           ...imagePaths.map(path => ({ type: 'localImage', path })),
@@ -351,11 +394,13 @@ export class CodexSession {
 
   // Interrupts every running side turn; true when there was one.
   async stopSide(): Promise<boolean> {
+    const starting = [...this.startingSides].filter(side => !side.stop)
+    for (const side of starting) side.stop = true
     const turns = [...this.sides.values()].filter(turn => !turn.stop)
     for (const turn of turns) turn.stop = true
     await Promise.all(turns.filter(turn => turn.id).map(turn =>
       this.rpc.request('turn/interrupt', { threadId: turn.threadId, turnId: turn.id })))
-    return turns.length > 0
+    return turns.length + starting.length > 0
   }
 
   private async openSideThread(model: string | undefined): Promise<string> {
@@ -619,7 +664,11 @@ export class CodexSession {
       .flatMap(owner => [owner, ...owner.children.values()].filter(execution => execution.id === operation.turnId)
         .map(execution => ({ owner, execution })))
     const scope = matches.length === 1 ? matches[0] : await this.approvalExecution(operation.threadId, operation.turnId)
-    if (!scope) return approve(request)
+    if (!scope) {
+      const untrusted = this.runningTurns().some(turn => turn.untrusted && turn.threadId === operation.threadId)
+      return untrusted ? 'decline' : approve(request)
+    }
+    if (scope.owner.untrusted) return 'decline'
     const { owner, execution } = scope
     const canRecordReceipt = owner.threadId === operation.threadId
     const decision = await this.approveInTurn(execution, canRecordReceipt ? {
@@ -662,14 +711,15 @@ export class CodexSession {
       const { threadId, turnId, callId, namespace, tool, arguments: args } = params
       const run = this.settings.chatAction
       const turn = this.runningTurns().find(turn => turn.threadId === threadId && turn.id === turnId)
-      if (!run || !turn || namespace !== null || tool !== agentChatTool.name ||
+      if (!run || !turn || turn.untrusted || namespace !== null || tool !== agentChatTool.name ||
           typeof callId !== 'string' || !/^[\w.:-]{1,128}$/u.test(callId)) return
       return this.withServerRequest(id, turn.threadId, signal =>
         run(JSON.stringify([threadId, turnId, callId]), args, () => !signal.aborted && this.runningTurns().includes(turn)))
     }
     if (method === 'item/tool/requestUserInput') {
       const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active
-      if (!current || current.stop || current.threadId !== params.threadId || current.id !== params.turnId) return { answers: {} }
+      if (!current || current.stop || current.untrusted || current.threadId !== params.threadId ||
+          current.id !== params.turnId) return { answers: {} }
       const ask = this.settings.ask
       return { answers: ask
         ? await this.withServerRequest(id, current.threadId, signal => ask(params.questions, signal))
@@ -681,7 +731,7 @@ export class CodexSession {
       if (!request || !approve) return { action: 'cancel' }
       const decision = await this.withServerRequest(id, request.threadId, async signal => {
         const scope = await this.approvalExecution(request.threadId, request.turnId)
-        if (signal.aborted || !scope) return 'cancel'
+        if (signal.aborted || !scope || scope.owner.untrusted) return 'cancel'
         const { owner, execution } = scope
         const decision = await this.approveInTurn(execution, request.operation, approve, signal)
         if (signal.aborted || !this.runningTurns().includes(owner) ||
@@ -718,7 +768,7 @@ export class CodexSession {
     } else if (commandRequest && !network && params.approvalId != null) return { decision: 'decline' }
     if (!commandRequest && params.grantRoot) return { decision: 'decline' }
     const scope = await this.approvalExecution(params.threadId, params.turnId)
-    if (!scope) return { decision: 'decline' }
+    if (!scope || scope.owner.untrusted) return { decision: 'decline' }
     const { owner, execution } = scope
     const changes = commandRequest ? undefined : execution.fileChanges.get(params.itemId)
     const target = destination

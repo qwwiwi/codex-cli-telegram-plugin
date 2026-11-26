@@ -92,6 +92,17 @@ test('a failing HUD never blocks or breaks the reply', async () => {
   await expect(safe.settled()).resolves.toBeUndefined()
 })
 
+test('F4: a reply waits for a hanging card at most once, across both of its HUD waits', async () => {
+  const { hud } = fakeHud({ bumpHangs: true })
+  const anchor = new HudAnchor(hud, OWNER, 60)
+  anchor.ownerMessage()
+  const started = Date.now()
+  // deliverReply waits, then sendFinalText waits again for the same card.
+  await anchor.settled()
+  await anchor.settled()
+  expect(Date.now() - started).toBeLessThan(100)
+})
+
 test('without an owner message the reply does not wait for the HUD', async () => {
   const { hud } = fakeHud({ bumpHangs: true })
   const anchor = new HudAnchor(hud, OWNER, 10_000)

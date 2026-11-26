@@ -314,6 +314,10 @@ export class ContextHud {
   // bump() debounce per chat — a burst of inbound messages collapses to one
   // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
   private readonly lastBumpAt = new Map<string, number>()
+  // Chats whose bump retired the old card but could not send its replacement.
+  // A later updateNow must not create the card below the reply; the next bump
+  // (the next owner message) puts it back in place.
+  private readonly bumpFailed = new Set<string>()
   // FIX-9 (both reviews): per-chat serialization. A concurrent SessionStart +
   // Stop (both firing before the first send persists an id) would each see an
   // empty cache and sendFresh → TWO pinned HUDs. Chaining every HUD operation
@@ -494,7 +498,8 @@ export class ContextHud {
           }
         }
         // sendFresh persists the new id (overwriting the stale one) and pins.
-        await this.sendFresh(chatId, text, keyboard)
+        if (await this.sendFresh(chatId, text, keyboard) === undefined) this.bumpFailed.add(chatId)
+        else this.bumpFailed.delete(chatId)
       } catch (err) {
         this.log.warn('context hud bump failed (ignored)', {
           chat_id: chatId,
@@ -511,6 +516,8 @@ export class ContextHud {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     return this.runSerialized(chatId, async () => {
       try {
+        if (this.bumpFailed.has(chatId) && this.messageIds.get(chatId) === undefined &&
+            this.loadPersisted(chatId) === undefined) return
         const { text, keyboard } = await this.renderCurrent(chatId)
         const ensured = await this.ensureMessage(chatId, text, keyboard)
         // No message and send failed → swallow. Freshly created → already current.

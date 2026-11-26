@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CodexInbox } from '../../src/codex/inbox.js'
+import { ownerProvenance } from '../../src/codex/provenance.js'
 import {
   BridgeRestart, bridgeRestartReply, ownerRequestedBridgeRestart, ownerRequestedRestartVerification,
 } from '../../src/codex/restart-bridge.js'
@@ -120,7 +121,7 @@ test('the inbox recovers the restart request and cancels it without losing deliv
     const owner = { id: 100, is_bot: false as const, first_name: 'Owner' }
     const chat = { id: owner.id, type: 'private' as const, first_name: owner.first_name }
     let inbox = new CodexInbox(root, owner.id)
-    inbox.receive({ message_id: 7, date: 1, chat, from: owner, text: 'Restart the bridge' })
+    inbox.receive({ message_id: 7, date: 1, chat, from: owner, text: 'Restart the bridge' }, ownerProvenance)
     inbox.take()
     inbox.start(7, { mayRestartBridge: true, verificationEligible: true, voiceTaskText: 'Restart the bridge' })
     inbox.assignTurn(7, 'turn-7')

@@ -11,6 +11,8 @@
 //      KROT_CODEX_MAX_PARALLEL threads (main included, default 2) are running;
 //      otherwise it is queued for the main thread and the owner is told what runs.
 
+import { agentTurnInstructions, type Provenance } from './provenance.js'
+
 export interface ParallelSettings {
   enabled: boolean
   maxParallel: number
@@ -123,11 +125,19 @@ export function busyNotice(main: RunningSummary, sides: readonly string[], maxPa
   return lines.join('\n')
 }
 
-export function sideInstructions(main: RunningSummary): string {
+export function sideInstructions(main: RunningSummary, provenance: Provenance): string {
+  const running = 'Ты параллельный поток того же агента. Основной поток сейчас выполняет другую задачу владельца:'
+  const task = '«' + clip(main.title, 200) + '»' + (main.step ? ', текущий шаг: «' + clip(main.step, 160) + '»' : '') +
+    ', идёт ' + minutes(main.elapsedMs) + '.'
+  if (provenance.origin === 'agent') {
+    // A message from another agent is never presented as the owner's.
+    return [running, task, agentTurnInstructions(provenance.agent),
+      'Рабочая папка общая: не меняй файлы, которые затрагивает основная задача, не останавливай её и не перезапускай мост.',
+    ].join('\n')
+  }
   return [
-    'Ты параллельный поток того же агента. Основной поток сейчас выполняет другую задачу владельца:',
-    '«' + clip(main.title, 200) + '»' + (main.step ? ', текущий шаг: «' + clip(main.step, 160) + '»' : '') +
-      ', идёт ' + minutes(main.elapsedMs) + '.',
+    running,
+    task,
     'Ответь на новое сообщение владельца сам и быстро, не дожидаясь основной задачи. ' +
       'Если просят о ней, коротко скажи, чем занят основной поток. ' +
       'Если это отдельная долгая задача, можешь выполнить её здесь.',

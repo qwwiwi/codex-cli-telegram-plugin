@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { atomicWriteInRoot } from '../autonomy/store.js'
 import type { CodexInbox } from './inbox.js'
+import { ownerProvenance } from './provenance.js'
 
 const filename = 'bridge-restart-handoff.json'
 const verificationIdOffset = 2 ** 48
@@ -57,7 +58,7 @@ export class BridgeRestartHandoff {
       message_id: verificationMessageId(handoff), date: Math.floor(Date.now() / 1000), text: verificationInput,
       chat: { id: this.ownerId, type: 'private', first_name },
       from: { id: this.ownerId, is_bot: false, first_name },
-    }, true)
+    }, ownerProvenance, true)
     if (queued === 'full') return 'full'
     this.write({ ...handoff, phase: 'queued' })
     return 'queued'

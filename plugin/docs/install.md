@@ -238,3 +238,13 @@ characters>». An idle Codex starts a turn with the message. A busy Codex queues
 it like an owner message, or, with `KROT_CODEX_PARALLEL=1`, opens a side thread
 when a slot is free. An agent message never steers the running main turn.
 Logs record the agent name and message length, never the token or the body.
+
+Every queued message keeps its origin (owner or agent) across restarts. A turn
+for an agent message runs with sandbox `workspace-write` and no approvals; the
+owner's own turns keep the configured mode. Agent input never reaches the
+owner-task classifiers, the saved pending owner task, automatic continuation,
+leases, learning, memory, bridge restart, question cards, Telegram chat actions
+or attachments. The reply reaches the owner as «Ответ на сообщение агента
+<name>: …». If the bridge stops while an agent's side turn runs, the owner gets
+a plain notice after the restart and the message body is kept in the
+`webhook` dead-letter bucket.
