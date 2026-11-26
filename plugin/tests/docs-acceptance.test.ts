@@ -142,3 +142,18 @@ test('[R16] the known Codex CLI problems map exists, every row has a status and 
   expect(doc).not.toMatch(/https?:\/\//)
   expect(read('README.md')).toContain('](docs/codex-known-problems.md)')
 })
+
+test('README badges use plain shields.io paths without escape sequences that mobile renderers rewrite', () => {
+  for (const readme of ['README.md', 'README.ru.md']) {
+    const badges = [...read(readme).matchAll(/!\[[^\]]*\]\((https:\/\/img\.shields\.io\/badge\/[^)\s]+)\)/g)].map(match => match[1]!)
+    expect(badges, readme).toHaveLength(5)
+    for (const url of badges) {
+      const path = new URL(url).pathname.slice('/badge/'.length)
+      // Shields escapes (`--` for a dash, `_` for a space, an encoded pipe) break on GitHub mobile.
+      expect(path, url).not.toMatch(/--|_|%7C/i)
+      const parts = path.split('-')
+      expect(parts, url).toHaveLength(3)
+      expect(parts[2], url).toMatch(/^[0-9A-F]{6}$/)
+    }
+  }
+})
