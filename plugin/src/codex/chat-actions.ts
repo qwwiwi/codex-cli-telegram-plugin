@@ -116,7 +116,8 @@ export const agentChatInstructions =
 export const agentTools = [agentChatTool, ...componentTools] as const
 export const chatContextPrefix = 'ID входящих сообщений Telegram: '
 
-type Target = { editable: boolean; reacted: boolean; rich?: true }
+// A transient target (a component message) is known for this bridge run only and never persisted.
+type Target = { editable: boolean; reacted: boolean; rich?: true; transient?: true }
 type ActionDetails = { message_ids: number[]; hint?: string; attachment?: DownloadResult }
 type ActionReceipt = Omit<ActionDetails, 'attachment'> & { request_id: string; action: AgentAction; ok: boolean }
 type ActionArguments = ReturnType<typeof object> & { action: AgentAction }
@@ -149,6 +150,9 @@ export class AgentChatActions {
   private readonly targets = new Map<number, Target>()
   private readonly seen = new Set<string>()
   private readonly nativeCalls = new Map<string, Promise<ToolResult>>()
+  // Receipts of component sends, kept while their turn runs so a replay never posts a second widget,
+  // however many other calls the turn makes; dropped once the turn is over (a replay is refused then).
+  private readonly sendReceipts = new Map<string, { result: Promise<ToolResult>; current: () => boolean }>()
   private pending = Promise.resolve()
   lastReply: number | undefined
 
@@ -169,24 +173,26 @@ export class AgentChatActions {
     } catch { /* Missing or unreadable cache does not block Telegram. */ }
   }
 
-  remember(id: number, editable: boolean, lastReply = false, rich = false): void {
+  remember(id: number, editable: boolean, lastReply = false, rich = false, transient = false): void {
     if (!Number.isSafeInteger(id) || id <= 0) return
     const previous = this.targets.get(id)
+    const keepTransient = transient && (previous === undefined || previous.transient === true)
     this.targets.delete(id)
     this.targets.set(id, {
       editable: editable || previous?.editable === true, reacted: previous?.reacted === true,
-      ...(rich || previous?.rich ? { rich: true } : {}),
+      ...(rich || previous?.rich ? { rich: true } : {}), ...(keepTransient ? { transient: true } : {}),
     })
     if (this.targets.size > targetLimit) this.targets.delete(this.targets.keys().next().value!)
     if (lastReply) this.lastReply = id
-    this.saveTargets()
+    if (!keepTransient) this.saveTargets()
   }
 
   private saveTargets(): void {
     if (!this.options.root) return
     try {
       atomicWriteInRoot({ root: this.options.root }, targetState,
-        JSON.stringify({ chat: this.ownerChat, lastReply: this.lastReply, targets: [...this.targets] }) + '\n')
+        JSON.stringify({ chat: this.ownerChat, lastReply: this.lastReply,
+          targets: [...this.targets].filter(([, target]) => target.transient !== true) }) + '\n')
     } catch { /* The in-memory targets can still be used. */ }
   }
 
@@ -222,18 +228,23 @@ export class AgentChatActions {
     const refused = (hint: string): ToolResult =>
       ({ success: false, contentItems: [{ type: 'inputText', text: JSON.stringify({ tool, ok: false, message_ids: [], hint }) }] })
     if (!key || !current() || !components) return Promise.resolve(refused('Действие Telegram недоступно для этого хода.'))
-    const previous = this.nativeCalls.get(key)
+    const previous = this.nativeCalls.get(key) ?? this.sendReceipts.get(key)?.result
     if (previous) return previous
     const result = this.pending.then(async (): Promise<ToolResult> => {
       if (!current()) return refused('Действие Telegram недоступно для этого хода.')
       const outcome = await components.run(tool, raw, id => this.targets.has(id), current)
-      // A component message is a known target: the model may pin or react to it.
-      for (const id of outcome.message_ids) this.remember(id, false)
+      // A component message is a known target for this run: the model may pin or react to it.
+      for (const id of outcome.message_ids) this.remember(id, false, false, false, true)
       return { success: outcome.ok, contentItems: [{ type: 'inputText', text: JSON.stringify({ tool, ...outcome }) }] }
     })
     this.pending = result.then(() => undefined, () => undefined)
-    this.nativeCalls.set(key, result)
-    if (this.nativeCalls.size > targetLimit) this.nativeCalls.delete(this.nativeCalls.keys().next().value!)
+    if (tool === 'component_schema') {
+      this.nativeCalls.set(key, result)
+      if (this.nativeCalls.size > targetLimit) this.nativeCalls.delete(this.nativeCalls.keys().next().value!)
+    } else {
+      for (const [old, receipt] of this.sendReceipts) if (!receipt.current()) this.sendReceipts.delete(old)
+      this.sendReceipts.set(key, { result, current })
+    }
     return result
   }
 

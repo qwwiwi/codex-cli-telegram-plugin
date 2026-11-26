@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
-import { readdirSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { SendWidgetParams } from '../../src/channel/tools.js'
@@ -295,4 +296,42 @@ test('[R12] a flood wait from a widget holds every later send until its deadline
   await api.sendMessage('456', 'other chat', {})
   expect(sentAt.map(([what]) => what)).toEqual([`${OWNER}:after`, '456:other chat'])
   for (const [, at] of sentAt) expect(at - start).toBeGreaterThanOrEqual(30_000)
+})
+
+test('[R12][R13] component message IDs stay out of the persisted target cache', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-component-targets-'))
+  try {
+    let next = 76
+    const components = new AgentComponents({
+      async sendWidget() { return { message_id: ++next } },
+      async sendMessage() { return { message_id: ++next } },
+      async deleteMessage() {},
+    }, OWNER)
+    const pins: number[] = []
+    const api = {
+      sendMessage: unexpected, editMessageText: unexpected, setMessageReaction: unexpected,
+      async pinChatMessage(_chat: string, id: number) { pins.push(id) }, unpinChatMessage: unexpected,
+    }
+    const actions = new AgentChatActions(api, OWNER, { root, components })
+    actions.remember(12, true)
+    await actions.component('c1', 'send_component', { component: 'kpi', data: pack('kpi', 'example.json') }, () => true)
+    // Known for this run: the model may pin its widget.
+    expect((await actions.call('pin', { action: 'pin', target: 77 }, () => true)).success).toBe(true)
+    expect(pins).toEqual([77])
+    const saved = JSON.parse(readFileSync(join(root, 'codex-chat-targets.json'), 'utf8')) as { targets: [number, unknown][] }
+    expect(saved.targets.map(([id]) => id)).toEqual([12])
+    const restarted = new AgentChatActions(api, OWNER, { root, components })
+    expect((await restarted.call('pin2', { action: 'pin', target: 77 }, () => true)).success).toBe(false)
+    expect((await restarted.call('pin3', { action: 'pin', target: 12 }, () => true)).success).toBe(true)
+  } finally { rmSync(root, { force: true, recursive: true }) }
+})
+
+test('[R12][R13] a send_component replayed after 1,000 schema calls in the same turn posts no second widget', async () => {
+  const { actions, calls } = bridge()
+  const data = pack('kpi', 'example.json')
+  await actions.component('send', 'send_component', { component: 'kpi', data }, () => true)
+  for (let i = 0; i < 1000; i++) await actions.component(`schema-${i}`, 'component_schema', { component: 'kpi' }, () => true)
+  const replay = await actions.component('send', 'send_component', { component: 'kpi', data }, () => true)
+  expect(parsed(replay)).toMatchObject({ ok: true, message_ids: [77], delivery: 'widget' })
+  expect(calls.map(call => call[0])).toEqual(['widget'])
 })
