@@ -47,10 +47,6 @@ const BAR_SEGMENTS = 10
 const BAR_FILLED = '▰'
 const BAR_EMPTY = '▱'
 
-// bump() debounce window — collapses inbound-message bursts (multi-part voice,
-// albums) into a single delete+resend. Mirrors TmuxMirror.BUMP_DEBOUNCE_MS.
-const HUD_BUMP_DEBOUNCE_MS = 1500
-
 // Escape the model string for HTML parse mode. Model ids ("claude-opus-4-8")
 // carry no markup, but escape defensively so a surprising value can never break
 // the HUD's entity parsing (the safe wrapper would then downgrade it silently).
@@ -315,12 +311,10 @@ export class ContextHud {
   // does not clear it, so the pinned card keeps showing «что сделали» until
   // the next task replaces the snapshot.
   private readonly work = new Map<string, { todos: ReadonlyArray<TodoItem>; taskMap: Map<string, TodoItem> }>()
-  // bump() debounce per chat — a burst of inbound messages collapses to one
-  // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
-  private readonly lastBumpAt = new Map<string, number>()
-  // Chats whose bump retired the old card but could not send its replacement.
-  // A later updateNow must not create the card below the reply; the next bump
-  // (the next owner message) puts it back in place.
+  // Chats whose bump retired the old card but could not send its replacement,
+  // or whose late card was retired (retire()). A later updateNow must not
+  // create the card below the reply; the next bump (the next owner message)
+  // puts it back in place.
   private readonly bumpFailed = new Set<string>()
   // FIX-9 (both reviews): per-chat serialization. A concurrent SessionStart +
   // Stop (both firing before the first send persists an id) would each see an
@@ -448,15 +442,12 @@ export class ContextHud {
   // old message — which also removes its pin, so the one-pin invariant holds —
   // and sends+pins a fresh one. When Telegram refuses the delete (bots cannot
   // delete own messages older than 48h) we fall back to unpinChatMessage so two
-  // pins can never coexist. Debounced per chat: a bump inside the window
-  // (HUD_BUMP_DEBOUNCE_MS) does not move the card again, it only refreshes it
-  // in place via updateNow. Serialized and best-effort like every other HUD op.
+  // pins can never coexist. Every bump moves the card: a card reused from an
+  // earlier owner message would sit above the newest one, not under it. Bursts
+  // are coalesced by the caller (HudAnchor), not dropped here. Serialized and
+  // best-effort like every other HUD op.
   bump(chatId: string): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
-    const now = Date.now()
-    const last = this.lastBumpAt.get(chatId)
-    if (last !== undefined && now - last < HUD_BUMP_DEBOUNCE_MS) return this.updateNow(chatId)
-    this.lastBumpAt.set(chatId, now)
     return this.runSerialized(chatId, async () => {
       try {
         const { text, keyboard } = await this.renderCurrent(chatId)
@@ -506,6 +497,40 @@ export class ContextHud {
         else this.bumpFailed.delete(chatId)
       } catch (err) {
         this.log.warn('context hud bump failed (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    })
+  }
+
+  // The answer went out before the card of its turn landed (HudAnchor's hang
+  // guard). Serialized behind that late bump, so it runs once the card landed
+  // or failed: deletes the card so it never stays below the answer, and keeps
+  // updateNow from recreating it there. The next bump puts a fresh card back.
+  // Best-effort: never throws.
+  retire(chatId: string): Promise<void> {
+    if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    return this.runSerialized(chatId, async () => {
+      this.bumpFailed.add(chatId)
+      try {
+        const id = this.messageIds.get(chatId) ?? this.loadPersisted(chatId)
+        if (id === undefined) return
+        this.messageIds.delete(chatId)
+        this.clearPersisted(chatId)
+        try {
+          await this.api.deleteMessage(chatId, id)
+        } catch (err) {
+          // Cannot delete: at least drop its pin so a later card is the only pinned one.
+          this.log.warn('context hud retire delete failed (will unpin instead)', {
+            chat_id: chatId,
+            message_id: id,
+            error: err instanceof Error ? err.message : String(err),
+          })
+          await this.api.unpinChatMessage(chatId, id)
+        }
+      } catch (err) {
+        this.log.warn('context hud retire failed (ignored)', {
           chat_id: chatId,
           error: err instanceof Error ? err.message : String(err),
         })

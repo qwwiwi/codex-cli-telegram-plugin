@@ -25,6 +25,7 @@ function fakeHud(options: { bumpFails?: boolean; bumpHangs?: boolean } = {}) {
       })
     },
     async updateNow(chatId) { calls.push('edit:' + chatId) },
+    async retire(chatId) { calls.push('retire:' + chatId) },
   }
   return { hud, calls, release: () => { for (const release of releases.splice(0)) release() } }
 }
@@ -85,6 +86,7 @@ test('a failing HUD never blocks or breaks the reply', async () => {
   const throwing: HudCard = {
     bump() { throw new Error('sync failure') },
     updateNow() { throw new Error('sync failure') },
+    retire() { throw new Error('sync failure') },
   }
   const safe = new HudAnchor(throwing, OWNER)
   expect(() => safe.ownerMessage()).not.toThrow()
@@ -122,4 +124,45 @@ test('a second reply waiting on the same hanging card shares its cap instead of 
   const second = anchor.settled()
   await Promise.all([first, second])
   expect(Date.now() - started).toBeLessThan(300)
+})
+
+test('[R04] a reply waits for its own card even when Telegram needs longer than three seconds', async () => {
+  const { hud, calls, release } = fakeHud()
+  const anchor = new HudAnchor(hud, OWNER)
+  anchor.ownerMessage()
+  setTimeout(release, 3200)
+  await anchor.settled()
+  calls.push('reply')
+  expect(calls).toEqual(['bump:' + OWNER, 'hud-sent', 'reply'])
+}, 10_000)
+
+test('[R04] a card that hangs past the guard is retired once it lands, so it never sits below the answer', async () => {
+  const { hud, calls, release } = fakeHud()
+  const anchor = new HudAnchor(hud, OWNER, 20)
+  anchor.ownerMessage()
+  await anchor.settled()
+  calls.push('reply')
+  release()
+  await Bun.sleep(5)
+  // ContextHud serializes per chat: the retire queued at the guard runs right
+  // after the late card lands and deletes it.
+  expect(calls).toEqual(['bump:' + OWNER, 'retire:' + OWNER, 'reply', 'hud-sent'])
+})
+
+test('[R04] rapid owner messages never reuse an older card: a burst ends with a fresh move after the last message', async () => {
+  const { hud, calls, release } = fakeHud()
+  const anchor = new HudAnchor(hud, OWNER)
+  anchor.ownerMessage()
+  anchor.ownerMessage()
+  anchor.ownerMessage()
+  const reply = anchor.settled().then(() => { calls.push('reply') })
+  await Bun.sleep(5)
+  // One move in flight; the burst behind it collapses into one trailing move.
+  expect(calls).toEqual(['bump:' + OWNER])
+  release()
+  await Bun.sleep(5)
+  expect(calls).toEqual(['bump:' + OWNER, 'hud-sent', 'bump:' + OWNER])
+  release()
+  await reply
+  expect(calls).toEqual(['bump:' + OWNER, 'hud-sent', 'bump:' + OWNER, 'hud-sent', 'reply'])
 })

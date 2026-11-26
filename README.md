@@ -134,7 +134,7 @@ Approval modes:
 |---|---|---|
 | `KROT_CODEX_APPROVALS=1` (set by the installer) | sandbox `workspace-write`, approval policy `on-request`: Codex asks before actions outside the sandbox; you get a card with the exact command or diff | default for a personal agent |
 | `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | as above, but routine requests are decided by the bridge's policy and only risky or unclear ones reach you | when cards come too often |
-| `KROT_CODEX_APPROVALS` unset | sandbox `workspace-write`, policy `never`: no cards, actions outside the sandbox fail | read-and-write inside the workspace only |
+| `KROT_CODEX_APPROVALS` unset, or `KROT_CODEX_APPROVAL_MODE=never` | sandbox `workspace-write`, policy `never`: no approval cards of any kind (commands, files, MCP and GitHub connector calls); actions that need approval fail | read-and-write inside the workspace only |
 | `KROT_CODEX_SANDBOX=danger-full-access`, `KROT_CODEX_APPROVALS` unset | no sandbox, no cards: Codex can use the network and write anywhere the OS user can | only for a dedicated unprivileged OS user on a machine you can rebuild |
 
 `danger-full-access` cannot be combined with `KROT_CODEX_PROXY`.

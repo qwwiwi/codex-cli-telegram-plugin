@@ -32,6 +32,7 @@ import { gateTelegramMessage } from '../telegram/gate.js'
 import { TelegramPoller, tokenLock } from '../telegram/poller.js'
 import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
+import { resolveApprovalSetup, sessionApprovalOptions } from './approval-mode.js'
 import { removeOwnPinService } from './pin-service.js'
 import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
@@ -92,10 +93,12 @@ async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
   const env = RuntimeEnvSchema.parse(process.env)
   const config = loadConfig(process.env)
-  const riskyApprovals = env.KROT_CODEX_APPROVAL_MODE === 'risky'
-  if (riskyApprovals && process.env.KROT_CODEX_APPROVALS !== '1') {
-    throw new Error('KROT_CODEX_APPROVAL_MODE=risky requires KROT_CODEX_APPROVALS=1')
-  }
+  // Throws on KROT_CODEX_APPROVAL_MODE=risky without KROT_CODEX_APPROVALS=1.
+  const approvalSetup = resolveApprovalSetup({
+    KROT_CODEX_APPROVALS: process.env.KROT_CODEX_APPROVALS,
+    KROT_CODEX_APPROVAL_MODE: env.KROT_CODEX_APPROVAL_MODE,
+  })
+  const riskyApprovals = approvalSetup.risky
   const agentName = codexAgentName(process.env.KROT_CODEX_AGENT_NAME, config.memory.agent_label)
   const agentTitle = agentName === 'Codex' ? agentName : agentName + ' · Codex'
   const ownerId = config.allowed_user_ids[0]
@@ -191,7 +194,8 @@ async function main(): Promise<void> {
   }
   status.setLivenessProbe(() => work.busy)
   const cards = new CardCleanup(paths.root, String(ownerId), log)
-  const approvals = process.env.KROT_CODEX_APPROVALS === '1'
+  // Absent in approval mode never: no approval card of any kind can be sent.
+  const approvals = approvalSetup.cards
     ? new ApprovalCards(ownerId, telegram, secrets, config.permission_gate.timeout_ms, cards)
     : undefined
   const leases = new CodexLeases(paths, String(ownerId), log)
@@ -464,7 +468,7 @@ async function main(): Promise<void> {
           startNext()
         })
       },
-      ...(approvals ? { approve: (request, signal) => approvals.request(request, signal), riskyApprovals } : {}),
+      ...sessionApprovalOptions(approvalSetup, approvals),
       ...(env.KROT_CODEX_SANDBOX ? { sandbox: env.KROT_CODEX_SANDBOX } : {}),
       ask: (input, signal) => questions.ask(input, signal),
       chatAction: (key, args, current) => {
@@ -535,8 +539,8 @@ async function main(): Promise<void> {
       },
     })
     // Owner message -> HUD card -> reply: the card moves on accepted owner
-    // messages only, and replies wait (capped) for it to land first.
-    const hudAnchor = new HudAnchor(hud, ownerChat)
+    // messages only, and replies wait for it to land first (see hud-anchor.ts).
+    const hudAnchor = new HudAnchor(hud, ownerChat, undefined, log)
     const send = async (text: string): Promise<void> => {
       await hudAnchor.settled()
       await telegram.sendMessage(ownerChat, text, {})
@@ -1536,7 +1540,7 @@ async function main(): Promise<void> {
         if (outcome === 'full') {
           await send('Очередь заполнена. Отправь это сообщение позже.')
         } else if (outcome === 'accepted') {
-          // Keep the HUD card under the owner's latest message (debounced in the HUD).
+          // Keep the HUD card under the owner's latest message (bursts coalesce in HudAnchor).
           if (hudReady) hudAnchor.ownerMessage()
           if (message.media_group_id) bufferAlbum(message.media_group_id, message)
           else resumeInbox(message)

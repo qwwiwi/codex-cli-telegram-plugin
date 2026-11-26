@@ -262,7 +262,7 @@ All files are in `TELEGRAM_STATE_DIR` (default `$XDG_STATE_HOME/krotov-plugin`, 
 
 ## Approval and question cards
 
-**Approval requests.** App-server sends `item/commandExecution/requestApproval` or `item/fileChange/requestApproval` when Codex wants to run a command or change a file outside what the sandbox allows. This happens only with `approvalPolicy: on-request`, that is `KROT_CODEX_APPROVALS=1`. `CodexSession` passes the request to `ApprovalCards` (`codex/approvals.ts`).
+**Approval requests.** App-server sends `item/commandExecution/requestApproval` or `item/fileChange/requestApproval` when Codex wants to run a command or change a file outside what the sandbox allows. This happens only with `approvalPolicy: on-request`, that is `KROT_CODEX_APPROVALS=1` without `KROT_CODEX_APPROVAL_MODE=never`. `CodexSession` passes the request to `ApprovalCards` (`codex/approvals.ts`).
 
 - **The card.** The owner gets an HTML card with the working directory and the exact command or diff, and two buttons: «Allow» (`krot:approve:<id>:a`) and «Deny» (`krot:approve:<id>:d`).
 - **The answer.** The callback handler checks owner, private chat and message ID. The decision is returned to app-server as the result of its request. The card is edited to show the decision and loses its buttons.
@@ -382,7 +382,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `TELEGRAM_OPEN_QUESTION_REMINDER_MS` | delay before a reminder about an unanswered question; `0` turns reminders off |
 | `TELEGRAM_ALBUM_FLUSH_MS` | how long to wait for all parts of a photo album |
 | `GROQ_API_KEY` | Groq key for voice transcription |
-| `KROT_CODEX_APPROVAL_MODE` | `standard` (default) or `risky`; `risky` needs `KROT_CODEX_APPROVALS=1` |
+| `KROT_CODEX_APPROVAL_MODE` | `standard` (default), `risky` or `never`; `risky` needs `KROT_CODEX_APPROVALS=1`; `never` turns every approval card off even when `KROT_CODEX_APPROVALS=1` (`codex/approval-mode.ts`) |
 | `KROT_CODEX_SANDBOX` | `workspace-write` (default) or `danger-full-access` |
 | `TELEGRAM_WEBHOOK_HOST` | host of the inherited webhook config block; the Codex local endpoint always binds `127.0.0.1` |
 | `TELEGRAM_WEBHOOK_PORT` | port of the local HTTP endpoint for external tasks (with `TELEGRAM_WEBHOOK_TOKEN`) |
@@ -414,7 +414,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 
 | Variable | Where | Meaning |
 |---|---|---|
-| `KROT_CODEX_APPROVALS` | `codex/server.ts` | `1` turns on approval cards (`approvalPolicy: on-request`); otherwise `never` |
+| `KROT_CODEX_APPROVALS` | `codex/approval-mode.ts` | `1` turns on approval cards (`approvalPolicy: on-request`) unless `KROT_CODEX_APPROVAL_MODE=never`; otherwise `never` |
 | `KROT_CODEX_AGENT_NAME` | `codex/server.ts` | agent name in status, greetings and exports (default `Codex`) |
 | `KROT_CODEX_MODEL` | `codex/server.ts` | default Codex model; `/cc model` overrides it per conversation |
 | `KROT_CODEX_PROXY` | `codex/server.ts` | absolute path to a relay that connects to a separate app-server ([plugin/docs/root-backend.md](../plugin/docs/root-backend.md)) |
