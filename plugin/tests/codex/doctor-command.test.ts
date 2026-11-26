@@ -217,3 +217,39 @@ test('[R21] doctor still lists local edits when the fetch from GitHub fails', as
   expect(text).toContain('Не удалось получить')
   expect(text).toContain('notes.txt')
 })
+
+test('[R21] ten long local paths keep the chat report within 3500 characters and /doctor fix still hands the full list to Codex', async () => {
+  const { repo } = fixture()
+  const names: string[] = []
+  for (let index = 0; index < 10; index++) {
+    const folder = `dir-${index}-` + 'long-'.repeat(40)
+    mkdirSync(join(repo, folder))
+    const name = `file-${index}-` + 'name-'.repeat(40) + '.txt'
+    writeFileSync(join(repo, folder, name), 'draft\n')
+    names.push(folder + '/' + name)
+  }
+  git(repo, 'add', '.')
+  const sent: string[] = []
+  const turns: string[] = []
+  const command = new DoctorCommand({
+    collect: () => collectDoctorReport({
+      repo, env: {}, codexVersion, minimumCodexVersion: '0.200.0',
+      doctor: async () => Array.from({ length: 4 }, (_, index) => ({ status: 'error' as const, message: `Проверка ${index} не прошла.` })),
+    }),
+    // A mocked Telegram limit: a longer message is refused.
+    send: async text => {
+      if ([...text].length > 4096) throw new Error('Bad Request: message is too long')
+      sent.push(text)
+    },
+    repo: '/srv/bridge', selfRestart: false, secrets: [],
+  })
+  await command.handle('fix', async text => { turns.push(text) })
+  for (const text of sent) expect([...text].length).toBeLessThanOrEqual(3500)
+  // The long local-edits problem is cut, the old Codex CLI after it is only counted.
+  expect(sent.join('\n')).toContain('…\n… и ещё 1.')
+  expect(sent.join('\n')).not.toContain('0.200.0')
+  expect(sent.join('\n')).toContain('Передаю отчёт агенту')
+  expect(turns).toHaveLength(1)
+  for (const name of names) expect(turns[0]).toContain(name)
+  expect(turns[0]).toContain('0.200.0')
+})

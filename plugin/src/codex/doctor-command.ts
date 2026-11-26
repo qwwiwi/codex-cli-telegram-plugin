@@ -238,18 +238,59 @@ export async function collectDoctorReport(options: DoctorOptions): Promise<Docto
   return report
 }
 
-export function formatDoctorReport(report: DoctorReport): string {
+// The chat report stays well under Telegram's 4096-character message limit, with room for one closing line.
+export const chatReportChars = 3500
+// A problem cut shorter than this is left out and only counted.
+const shortestCut = 40
+
+const moreProblems = (count: number): string => `… и ещё ${count}.`
+
+// Keeps whole problems while they fit in `budget` characters (one newline each), cuts the first one that
+// does not and counts the rest as «и ещё N».
+function fitProblems(items: readonly string[], budget: number): string[] {
+  // Room for the closing «и ещё N» line is always held back.
+  const reserve = moreProblems(items.length).length + 1
+  const kept: string[] = []
+  let used = 0
+  for (const [index, item] of items.entries()) {
+    const room = budget - used - reserve - 1
+    if (item.length <= room) {
+      kept.push(item)
+      used += item.length + 1
+      continue
+    }
+    const cut = room >= shortestCut
+    if (cut) kept.push(item.slice(0, room - 1).replace(/[\uD800-\uDBFF]$/u, '') + '…')
+    const omitted = items.length - index - (cut ? 1 : 0)
+    if (omitted) kept.push(moreProblems(omitted))
+    return kept
+  }
+  return kept
+}
+
+/** The report text; with `maxChars` the problem list is bounded so the whole text fits in it. */
+export function formatDoctorReport(report: DoctorReport, maxChars = Number.POSITIVE_INFINITY): string {
   const facts = [
     report.commit ? `Версия моста: ${report.commit}` + (report.upstream ? ` (сравнение с ${report.upstream}).` : '.') : '',
     report.codexVersion ? `Codex CLI: ${report.codexVersion}.` : '',
   ].filter(Boolean)
   if (!report.problems.length) return ['🩺 Доктор: всё в порядке.', ...facts].join('\n')
-  return [
-    `🩺 Доктор нашёл проблемы: ${report.problems.length}.`, '',
-    ...report.problems.map((problem, index) =>
-      `${index + 1}. ${problem.text}` + (problem.fix ? `\n   Как исправить: ${problem.fix}` : '')),
-    ...(facts.length ? ['', ...facts] : []),
-  ].join('\n')
+  const head = [`🩺 Доктор нашёл проблемы: ${report.problems.length}.`, '']
+  const tail = facts.length ? ['', ...facts] : []
+  const items = report.problems.map((problem, index) =>
+    `${index + 1}. ${problem.text}` + (problem.fix ? `\n   Как исправить: ${problem.fix}` : ''))
+  const fixed = [...head, ...tail].join('\n').length + 1
+  return [...head, ...(Number.isFinite(maxChars) ? fitProblems(items, maxChars - fixed) : items), ...tail].join('\n')
+}
+
+function redactReport(report: DoctorReport, secrets: readonly string[]): DoctorReport {
+  return {
+    ...report,
+    problems: report.problems.map(problem => ({
+      text: redactSecrets(problem.text, secrets),
+      ...(problem.fix === undefined ? {} : { fix: redactSecrets(problem.fix, secrets) }),
+    })),
+  }
 }
 
 /** The owner turn /doctor fix hands to Codex. */
@@ -308,18 +349,22 @@ export class DoctorCommand {
         await this.hooks.send('Не удалось выполнить самопроверку. Запустите на сервере в папке plugin: bun run doctor.')
         return
       }
-      const text = redactSecrets(formatDoctorReport(report), this.hooks.secrets)
+      // Redacted before the chat report is bounded, so a cut never splits a secret out of the redactor's reach.
+      const safe = redactReport(report, this.hooks.secrets)
+      const chat = (closing: string): string =>
+        redactSecrets(formatDoctorReport(safe, chatReportChars - closing.length), this.hooks.secrets) + closing
       if (!report.problems.length) {
-        await this.hooks.send(text + (mode === 'fix' ? '\n\nИсправлять нечего.' : ''))
+        await this.hooks.send(chat(mode === 'fix' ? '\n\nИсправлять нечего.' : ''))
         return
       }
       if (mode !== 'fix') {
-        await this.hooks.send(text + '\n\nЧтобы агент исправил то, что можно исправить безопасно, отправьте /doctor fix.')
+        await this.hooks.send(chat('\n\nЧтобы агент исправил то, что можно исправить безопасно, отправьте /doctor fix.'))
         return
       }
-      await this.hooks.send(text + '\n\nПередаю отчёт агенту для исправления.')
+      // The repair turn does not depend on the chat report: a refused report still hands the full list to Codex.
+      await this.hooks.send(chat('\n\nПередаю отчёт агенту для исправления.')).catch(() => undefined)
       try {
-        await enqueueTurn(redactSecrets(doctorFixTurn(report, this.hooks.repo, this.hooks.selfRestart), this.hooks.secrets))
+        await enqueueTurn(redactSecrets(doctorFixTurn(safe, this.hooks.repo, this.hooks.selfRestart), this.hooks.secrets))
       } catch {
         await this.hooks.send('Не удалось передать отчёт агенту. Отправьте /doctor fix ещё раз.')
       }
