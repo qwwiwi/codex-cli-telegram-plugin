@@ -52,7 +52,7 @@ git clone https://github.com/qwwiwi/codex-cli-telegram-plugin && cd codex-cli-te
 
 The installer asks for the token (hidden input), prints a one-time code and asks you to send it to the bot; this proves which Telegram account is the owner. It writes a private `plugin/.env`, creates the workspace (default `~/krotov-workspace`) with a starter `AGENTS.md`, the state directory (default `~/.local/state/krotov-plugin`), runs `bun run doctor` and enables the user service `krotov-telegram.service`.
 
-**5. First message.** Send `/help` to the bot, then any question. The bot shows that it is working on the message; now and then the agent itself reacts to a message with an emoji that fits the dialogue (`KROT_ACK_REACTION=off`, which the installer writes; `eyes` puts 👀 on every message, as older installs do).
+**5. First message.** Send `/help` to the bot, then any question. The bot shows that it is working on the message; now and then the agent itself reacts to a message with an emoji that fits the dialogue (`KROT_ACK_REACTION=off`, which the installer writes and which also applies to an upgraded install without the variable; `KROT_ACK_REACTION=eyes` puts 👀 on every message, as older versions did).
 
 | `install.sh` flag | Meaning |
 |---|---|

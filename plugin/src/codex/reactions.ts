@@ -1,7 +1,7 @@
 // Emoji reactions in the owner's private chat.
 //
-//   KROT_ACK_REACTION=off    no automatic reaction on inbound owner messages (fresh install default)
-//   KROT_ACK_REACTION=eyes   the bridge puts 👀 on every inbound owner message (unset: legacy installs)
+//   KROT_ACK_REACTION=off    no automatic reaction on inbound owner messages (default, also when unset)
+//   KROT_ACK_REACTION=eyes   the bridge puts 👀 on every inbound owner message (set explicitly only)
 //   KROT_REACTION_PALETTE    comma-separated emoji the agent may react with on its own
 //                            (telegram_action react); each must be a Telegram reaction.
 //
@@ -60,9 +60,9 @@ export const reactionHints = {
   once: 'На этом сообщении уже стоит реакция: одна реакция на сообщение.',
 } as const
 
-/** The automatic inbound reaction mode. Unset keeps the legacy 👀 so existing installs do not change. */
+/** The automatic inbound reaction mode. Unset is off, so an upgraded install drops the 👀 too; only eyes keeps it. */
 export function ackReactionMode(env: { KROT_ACK_REACTION?: string | undefined }): AckReaction {
-  return env.KROT_ACK_REACTION === 'off' ? 'off' : 'eyes'
+  return env.KROT_ACK_REACTION === 'eyes' ? 'eyes' : 'off'
 }
 
 /** Puts the automatic reaction on an inbound owner message; returns false without a call when it is off. */

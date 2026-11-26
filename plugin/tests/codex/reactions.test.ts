@@ -27,19 +27,21 @@ function hint(result: { contentItems: [{ text: string }] }): string {
   return String(JSON.parse(result.contentItems[0].text).hint ?? '')
 }
 
-test('[R02] KROT_ACK_REACTION=off: an inbound owner message gets no automatic reaction', async () => {
+test('[R02] KROT_ACK_REACTION=off or unset: an inbound owner message gets no automatic reaction, also after an upgrade', async () => {
   const { api, reactions } = recordingApi()
   const mode = ackReactionMode({ KROT_ACK_REACTION: 'off' })
   expect(mode).toBe('off')
   expect(await ackInbound(api, '123', 12, mode)).toBe(false)
+  // An existing install upgraded without the variable in its plugin/.env switches the automatic 👀 off too.
+  expect(ackReactionMode({})).toBe('off')
+  expect(await ackInbound(api, '123', 13, ackReactionMode({}))).toBe(false)
   expect(reactions).toEqual([])
 })
 
-test('[R02] KROT_ACK_REACTION=eyes or unset keeps the legacy 👀 on every inbound owner message', async () => {
+test('[R02] an explicit KROT_ACK_REACTION=eyes keeps the 👀 on every inbound owner message', async () => {
   const { api, reactions } = recordingApi()
-  expect(ackReactionMode({})).toBe('eyes')
   expect(ackReactionMode({ KROT_ACK_REACTION: 'eyes' })).toBe('eyes')
-  expect(await ackInbound(api, '123', 12, ackReactionMode({}))).toBe(true)
+  expect(await ackInbound(api, '123', 12, ackReactionMode({ KROT_ACK_REACTION: 'eyes' }))).toBe(true)
   expect(reactions).toEqual([['123', 12, '👀']])
 })
 
