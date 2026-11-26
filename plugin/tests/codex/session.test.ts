@@ -329,3 +329,23 @@ test('risky mode silently accepts only a routine local command and keeps the ori
   expect(seen.map(request => request.kind)).toEqual(['command', 'command', 'network'])
   expect(seen[0]?.target).toContain('rm -r')
 })
+
+test('[R02] asks Codex for reasoning summaries on every owner turn only when thoughts are shown', async () => {
+  const starts = async (reasoningSummary: boolean) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-summary-'))
+    dirs.push(cwd)
+    const log = join(cwd, 'requests.jsonl')
+    const session = new CodexSession({
+      cwd: import.meta.dir, stateFile: join(cwd, 'thread.json'), env: { ...process.env, KROT_FAKE_LOG: log }, reasoningSummary,
+      command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'],
+    }, () => {})
+    sessions.push(session)
+    await session.initialize()
+    expect((await session.run('first')).status).toBe('completed')
+    expect((await session.run('second')).status).toBe('completed')
+    return readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { method: string; params: Record<string, unknown> })
+      .filter(entry => entry.method === 'turn/start').map(entry => entry.params.summary)
+  }
+  expect(await starts(true)).toEqual(['auto', 'auto'])
+  expect(await starts(false)).toEqual([undefined, undefined])
+})

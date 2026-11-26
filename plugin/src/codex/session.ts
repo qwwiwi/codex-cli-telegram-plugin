@@ -59,6 +59,8 @@ type Settings = {
   command?: readonly [string, ...string[]]
   model?: string
   selectedModel?: () => string | undefined
+  // Ask for reasoning summaries (turn/start `summary: "auto"`) so the working bubble can show them.
+  reasoningSummary?: boolean
   onThread?: (threadId: string) => void
   onProgress?: (kind: string) => void
   onActivity?: (event: CodexEvent, currentThread: string | null) => void
@@ -347,6 +349,7 @@ export class CodexSession {
         threadId,
         // A turn override stays for later turns; resending an unchanged model is noise.
         ...(model && model !== this.model ? { model } : {}),
+        ...(this.settings.reasoningSummary ? { summary: 'auto' } : {}),
         ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },

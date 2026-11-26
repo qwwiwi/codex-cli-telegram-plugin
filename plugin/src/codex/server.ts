@@ -343,6 +343,9 @@ async function main(): Promise<void> {
       env: codexEnv,
       ...(process.env.KROT_CODEX_MODEL ? { model: process.env.KROT_CODEX_MODEL } : {}),
       selectedModel: () => controls.model,
+      // The root relay admits a fixed turn/start key set without `summary`; there the
+      // server's own Codex config decides whether summaries stream.
+      reasoningSummary: !proxy && config.status.thoughts?.enabled === true,
       onWarning: message => log.warn(message),
       onThread: id => {
         try { controls.remember(id) } catch { log.warn('Could not remember the Codex conversation') }
