@@ -60,7 +60,7 @@ function fixture() {
 const healthy = async () => [{ status: 'ok' as const, message: 'Токен действителен и принадлежит указанному боту.' }]
 const codexVersion = async () => '0.130.0'
 
-test('[R17] doctor reports a clean installation that matches GitHub as all right', async () => {
+test('[R21] doctor reports a clean installation that matches GitHub as all right', async () => {
   const { repo } = fixture()
   const report = await collectDoctorReport({ repo, env: {}, doctor: healthy, codexVersion })
   expect(report.problems).toEqual([])
@@ -70,7 +70,7 @@ test('[R17] doctor reports a clean installation that matches GitHub as all right
   expect(text).toContain('0.130.0')
 })
 
-test('[R17] doctor counts the commits the installed bridge is behind GitHub', async () => {
+test('[R21] doctor counts the commits the installed bridge is behind GitHub', async () => {
   const { repo, seed } = fixture()
   for (const n of [1, 2, 3]) {
     writeFileSync(join(seed, `change-${n}.txt`), String(n))
@@ -86,7 +86,7 @@ test('[R17] doctor counts the commits the installed bridge is behind GitHub', as
   expect(text).toContain('./update.sh')
 })
 
-test('[R17] doctor lists local edits by file name only and hides secret paths', async () => {
+test('[R21] doctor lists local edits by file name only and hides secret paths', async () => {
   const { repo } = fixture()
   writeFileSync(join(repo, 'README.md'), 'PRIVATE_EDIT_CONTENT\n')
   writeFileSync(join(repo, 'notes.txt'), 'draft\n')
@@ -104,7 +104,7 @@ test('[R17] doctor lists local edits by file name only and hides secret paths', 
   expect(text).not.toContain('fake-secret-value')
 })
 
-test('[R17] a failed fetch from the configured remote is reported, not thrown, without the remote URL', async () => {
+test('[R21] a failed fetch from the configured remote is reported, not thrown, without the remote URL', async () => {
   const { repo } = fixture()
   git(repo, 'remote', 'add', 'mirror', 'https://user:hidden-credential@127.0.0.1:1/bridge.git')
   const report = await collectDoctorReport({
@@ -117,7 +117,7 @@ test('[R17] a failed fetch from the configured remote is reported, not thrown, w
   expect(text).not.toContain('127.0.0.1')
 })
 
-test('[R17] doctor lists failed self-checks, dependency drift and an old Codex CLI with their fixes', async () => {
+test('[R21] doctor lists failed self-checks, dependency drift and an old Codex CLI with their fixes', async () => {
   const { repo } = fixture()
   writeFileSync(join(repo, 'plugin', 'node_modules', 'zod', 'package.json'), '{"name":"zod","version":"3.20.0"}')
   const report = await collectDoctorReport({
@@ -132,11 +132,11 @@ test('[R17] doctor lists failed self-checks, dependency drift and an old Codex C
   expect(text).toContain('0.200.0')
 })
 
-test('[R17] the dependency check parses the real plugin/bun.lock format', () => {
+test('[R21] the dependency check parses the real plugin/bun.lock format', () => {
   expect(dependencyDrift(join(import.meta.dir, '..', '..'))?.text ?? '').not.toContain('Не удалось прочитать')
 })
 
-test('[R17] the doctor script runs as a child and its lines become checks', async () => {
+test('[R21] the doctor script runs as a child and its lines become checks', async () => {
   const root = mkdtempSync(join(tmpdir(), 'krot-doctor-script-'))
   roots.push(root)
   const script = join(root, 'doctor.ts')
@@ -156,7 +156,7 @@ const broken: DoctorReport = {
   commit: 'abc1234', upstream: 'public/main',
 }
 
-test('[R17] /doctor fix hands the report to Codex as an owner turn with safe-fix and no-restart rules', async () => {
+test('[R21] /doctor fix hands the report to Codex as an owner turn with safe-fix and no-restart rules', async () => {
   const sent: string[] = []
   const turns: string[] = []
   const command = new DoctorCommand({ collect: async () => broken, send: async text => { sent.push(text) }, repo: '/srv/bridge', selfRestart: true })
@@ -174,7 +174,7 @@ test('[R17] /doctor fix hands the report to Codex as an owner turn with safe-fix
   expect(turns).toHaveLength(1)
 })
 
-test('[R17] /doctor reports a failed check run instead of throwing', async () => {
+test('[R21] /doctor reports a failed check run instead of throwing', async () => {
   const sent: string[] = []
   const command = new DoctorCommand({
     collect: async () => { throw new Error('/home/owner/.secrets/token') }, send: async text => { sent.push(text) },

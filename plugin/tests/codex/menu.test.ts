@@ -25,37 +25,33 @@ function recordingApi() {
 
 const config = AppConfigSchema.parse({})
 
-test('[R07] start publishes the short menu in order and skips a listed command that is not registered', async () => {
+test('[R20] start publishes exactly the eight-entry short menu in order, /doctor once', async () => {
   const { log, lines } = recordingLog()
   const set = codexCommandSet(config, false, undefined, log)
-  expect(set.menu).toEqual([
+  const expected = [
     { command: 'new', description: 'Новая сессия' },
     { command: 'stop', description: 'Прервать задачу' },
     { command: 'status', description: 'Состояние и лимиты' },
     { command: 'goal', description: 'Длинная цель' },
     { command: 'compact', description: 'Сжать контекст' },
     { command: 'cc', description: 'Модель и сессии' },
+    { command: 'doctor', description: 'Самопроверка и сверка с GitHub' },
     { command: 'help', description: 'Все команды' },
-  ])
-  // /doctor is in the default list but not registered on this build: skipped with a log line.
-  expect(lines.some(line => line.msg.includes('not registered') && line.ctx?.command === 'doctor')).toBe(true)
+  ]
+  expect(set.menu).toEqual(expected)
+  // /doctor is registered on this build: nothing in the default list is skipped.
+  expect(lines.some(line => line.msg.includes('not registered'))).toBe(false)
+  // /help lists /doctor once, with its long description.
+  expect(set.help.filter(spec => spec.command === 'doctor').map(spec => spec.description))
+    .toEqual(['самопроверка и сравнение с GitHub; fix — передать агенту'])
 
   const { api, published, deleted } = recordingApi()
   await registerOwnerScopedCommands(api, set.menu, [42], log)
   expect(deleted).toEqual(['default', { type: 'all_private_chats' }])
-  expect(published).toEqual([{ commands: set.menu, scope: { type: 'chat', chat_id: 42 } }])
+  expect(published).toEqual([{ commands: expected, scope: { type: 'chat', chat_id: 42 } }])
 })
 
-test('[R07] /doctor joins the menu before /help once it is registered', () => {
-  const { log } = recordingLog()
-  const doctor = { command: 'doctor', description: 'проверить установку' }
-  const set = codexCommandSet(config, false, undefined, log, [doctor])
-  expect(set.menu.map(spec => spec.command))
-    .toEqual(['new', 'stop', 'status', 'goal', 'compact', 'cc', 'doctor', 'help'])
-  expect(set.menu.find(spec => spec.command === 'doctor')?.description).toBe('Самопроверка и сверка с GitHub')
-})
-
-test('[R07] a command hidden from the menu still dispatches and stays in /help', () => {
+test('[R20] a command hidden from the menu still dispatches and stays in /help', () => {
   const { log } = recordingLog()
   const set = codexCommandSet(config, false, undefined, log)
   for (const hidden of ['lease', 'mirror', 'keys', 'reset', 'pin']) {
@@ -70,7 +66,7 @@ test('[R07] a command hidden from the menu still dispatches and stays in /help',
   expect(set.accepts('nonexistent')).toBe(false)
 })
 
-test('[R07] KROT_MENU_COMMANDS overrides the default menu', () => {
+test('[R20] KROT_MENU_COMMANDS overrides the default menu', () => {
   const { log, lines } = recordingLog()
   const set = codexCommandSet(config, false, ' /lease, status,STOP,, bogus ,status', log)
   expect(set.menu).toEqual([
@@ -81,5 +77,5 @@ test('[R07] KROT_MENU_COMMANDS overrides the default menu', () => {
   expect(lines.some(line => line.ctx?.command === 'bogus')).toBe(true)
   // An empty value means "not set": the default menu.
   expect(codexCommandSet(config, false, ' , ', log).menu.map(spec => spec.command))
-    .toEqual(['new', 'stop', 'status', 'goal', 'compact', 'cc', 'help'])
+    .toEqual(['new', 'stop', 'status', 'goal', 'compact', 'cc', 'doctor', 'help'])
 })

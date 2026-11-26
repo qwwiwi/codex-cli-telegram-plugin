@@ -35,8 +35,8 @@ export interface CodexCommandSpec {
 
 // The Telegram «/» menu shows only the commands needed all the time; every
 // other command still works when typed and stays listed in /help.
-// KROT_MENU_COMMANDS (comma list) replaces this list. /doctor is listed ahead
-// of its registration: the menu skips it until a build registers it.
+// KROT_MENU_COMMANDS (comma list) replaces this list; a listed command the
+// build does not register is skipped with a log line.
 export const DEFAULT_MENU_COMMANDS: readonly string[] = ['new', 'stop', 'status', 'goal', 'compact', 'cc', 'doctor', 'help']
 
 // Short menu labels; a command without one keeps its /help description.
