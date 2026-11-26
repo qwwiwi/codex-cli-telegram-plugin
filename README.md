@@ -160,7 +160,7 @@ Settings live in `plugin/.env` (environment) and an optional `config.json` in th
 
 ## Update and uninstall
 
-Update (fast-forward from the upstream branch, tests and `doctor` run on a staged copy first):
+Update (fast-forward from the remote branch your clone tracks, tests and `doctor` run on a staged copy first):
 
 ```bash
 ./update.sh            # then restart when the bot is idle
@@ -222,3 +222,7 @@ Based on Krotov-plugin by Pavel Krotov ([github.com/PashaKrot](https://github.co
 - parallel answers while a task runs (`KROT_CODEX_PARALLEL`)
 
 Details and dates: [CHANGES.md](CHANGES.md). License: [Apache-2.0](LICENSE), notices: [NOTICE](NOTICE). Modifications by Dashi Eshiev (qwwiwi) and contributors. Issues and PRs welcome.
+
+## Contributors
+
+- [jasonqwwen](https://github.com/jasonqwwen)

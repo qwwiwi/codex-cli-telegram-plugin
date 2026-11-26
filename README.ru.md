@@ -203,7 +203,7 @@ systemctl --user restart krotov-telegram.service
 
 ## Обновление и удаление
 
-Обновление: скрипт подтягивает новую версию из ветки upstream, сначала прогоняет тесты и `doctor` на отдельной копии.
+Обновление: скрипт подтягивает новую версию из удалённой ветки, которую отслеживает ваша копия репозитория, сначала прогоняет тесты и `doctor` на отдельной копии.
 
 ```bash
 ./update.sh            # потом перезапустите, когда бот свободен
@@ -265,3 +265,7 @@ grep -h '"level":"error"' ~/.local/state/krotov-plugin/errors-*.jsonl | tail -n 
 - параллельные ответы во время работы над задачей (`KROT_CODEX_PARALLEL`).
 
 Подробности и даты — в [CHANGES.md](CHANGES.md). Лицензия — [Apache-2.0](LICENSE), уведомления — [NOTICE](NOTICE). Изменения: Dashi Eshiev (qwwiwi) и участники. Issues и PR приветствуются.
+
+## Участники
+
+- [jasonqwwen](https://github.com/jasonqwwen)
