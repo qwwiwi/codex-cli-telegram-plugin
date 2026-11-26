@@ -314,6 +314,15 @@ export function createRateLimitedTelegramApi(
   }
 
   const globalBucket = makeBucket(cfg.globalBurstCapacity, cfg.globalRefillPerSec, now())
+  // Shared flood-wait deadline: a 429 on any call (a widget, a fail-fast
+  // flood ban) holds every later bucket-consuming call of the bot until
+  // Telegram's retry_after has passed; a send before it would re-arm the wait.
+  let cooldownUntil = 0
+
+  function armCooldown(err: unknown, retryAfterS: number): void {
+    const seconds = Math.max(retryAfterS, Math.ceil(rawRetryAfter(err) ?? 0))
+    cooldownUntil = Math.max(cooldownUntil, now() + seconds * 1000)
+  }
   const chatState = new Map<string, ChatState>()
 
   function getChatState(chatId: string): ChatState {
@@ -380,7 +389,8 @@ export function createRateLimitedTelegramApi(
         kind === 'edit'
           ? windowWaitMs(state.editWindowTimes, cfg.perChatEditsMaxPerMinute, t)
           : 0
-      const w = Math.max(chatWait, globalWait, minuteWait, editWait)
+      const cooldownWait = Math.max(0, cooldownUntil - t)
+      const w = Math.max(chatWait, globalWait, minuteWait, editWait, cooldownWait)
       if (w === 0) {
         consume(state.bucket)
         consume(globalBucket)
@@ -439,6 +449,7 @@ export function createRateLimitedTelegramApi(
           throw err
         }
         lastErr = err
+        armCooldown(err, r.retryAfter)
         sendLog({
           method,
           chat_id: chatId,

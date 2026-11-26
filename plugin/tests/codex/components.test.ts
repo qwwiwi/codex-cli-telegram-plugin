@@ -275,3 +275,24 @@ test('[R12] a turn stopped while Telegram refuses the widget gets no text copy',
   expect(outcome.message_ids).toEqual([])
   expect(calls).toEqual(['widget'])
 })
+
+test('[R12] a flood wait from a widget holds every later send until its deadline', async () => {
+  let clock = 1_000_000
+  const sentAt: Array<[string, number]> = []
+  const chat = fakeTelegramChat()
+  const api = createRateLimitedTelegramApi({
+    ...chat.raw,
+    async sendWidget() {
+      throw Object.assign(new Error('Too Many Requests: retry after 30'), { error_code: 429, parameters: { retry_after: 30 } })
+    },
+    async sendMessage(chatId, text) { sentAt.push([`${chatId}:${text}`, clock]); return { message_id: 1 } },
+  }, createLogger('components-test'), {
+    jitterMaxMs: 0, now: () => clock, sleep: async ms => { clock += Math.max(ms, 1) },
+  })
+  const start = clock
+  await expect(api.sendWidget(OWNER, { html: '<main class="kpi"></main>', caption: 'kpi' })).rejects.toMatchObject({ error_code: 429 })
+  await api.sendMessage(OWNER, 'after', {})
+  await api.sendMessage('456', 'other chat', {})
+  expect(sentAt.map(([what]) => what)).toEqual([`${OWNER}:after`, '456:other chat'])
+  for (const [, at] of sentAt) expect(at - start).toBeGreaterThanOrEqual(30_000)
+})
