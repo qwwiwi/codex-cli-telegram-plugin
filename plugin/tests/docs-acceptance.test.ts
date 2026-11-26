@@ -99,3 +99,20 @@ test('[R19i] the install guide gives the inbound agent webhook settings with pla
   expect(env).toMatch(/^KROT_AGENT_WEBHOOK_ALLOW_IPS=192\.0\.2\.\d+(,192\.0\.2\.\d+)*$/m)
   expect(section).toContain('plugin/.env')
 })
+
+test('[R07][R09] both READMEs show a picture of how the bridge works, and the image files exist', () => {
+  for (const [readme, image] of [['README.md', 'docs/images/architecture.png'], ['README.ru.md', 'docs/images/architecture.ru.png']]) {
+    expect(read(readme!)).toContain(`<img src="${image}"`)
+    expect(existsSync(join(root, image!))).toBe(true)
+  }
+})
+
+test('[R11] the ideas for the next release are kept in ROADMAP.md with a done-when criterion each', () => {
+  const roadmap = read('ROADMAP.md')
+  expect(roadmap).toContain('## Done in v0.1.0')
+  const next = roadmap.slice(roadmap.indexOf('## Next'))
+  expect(next.startsWith('## Next')).toBe(true)
+  const ideas = next.match(/^- \*\*/gm)?.length ?? 0
+  expect(ideas).toBeGreaterThanOrEqual(1)
+  expect(next.match(/Done when:/g)?.length ?? 0).toBe(ideas)
+})

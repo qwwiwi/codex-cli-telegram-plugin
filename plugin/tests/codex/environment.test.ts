@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { codexEnvironment, exactSecrets } from '../../src/codex/environment.js'
 
-test('Codex receives only allowlisted environment, including tool credentials it needs', () => {
+test('[R19i] Codex receives only allowlisted environment, including tool credentials it needs', () => {
   for (const name of ['PATH', 'HOME', 'CODEX_HOME', 'GH_CONFIG_DIR', 'GBRAIN_BEARER']) {
     expect(codexEnvironment.test(name)).toBe(true)
   }

@@ -38,7 +38,7 @@ test('recovers a known target and can send an attachment as a quoted interim rep
   } finally { rmSync(root, { force: true, recursive: true }) }
 })
 
-test('agent can reply to the owner, edit its reply, and pin the same message', async () => {
+test('[R12] agent can reply to the owner, edit its reply, and pin the same message', async () => {
   const calls: unknown[][] = []
   const actions = new AgentChatActions({
     async sendMessage(chat, text, options) { calls.push(['send', chat, text, options]); return { message_id: 24 } },
@@ -108,7 +108,7 @@ test('reports the actual Telegram IDs and does not repeat a reply if feedback fa
   expect(receipts).toEqual([{ request_id: 'r1', action: 'reply', ok: true, message_ids: [24, 25] }])
 })
 
-test('remembers an agent reply sent through the rich renderer for subsequent edits', async () => {
+test('[R12] remembers an agent reply sent through the rich renderer for subsequent edits', async () => {
   const edited: unknown[] = []
   const actions = new AgentChatActions({
     async sendMessage() { throw new Error('Expected shared rich sender') },

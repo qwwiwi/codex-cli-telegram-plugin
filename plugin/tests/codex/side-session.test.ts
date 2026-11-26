@@ -36,7 +36,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-test('a side turn answers on its own thread while the main turn keeps running', async () => {
+test('[R02] a side turn answers on its own thread while the main turn keeps running', async () => {
   const { session, readThread } = fixture()
   await session.initialize()
   const main = session.run('wait')

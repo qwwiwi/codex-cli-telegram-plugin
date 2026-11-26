@@ -12,7 +12,7 @@ test('labels Codex limit windows by their length', () => {
   expect(limitWindowLabel(2880)).toBe('2д')
 })
 
-test('says the percentages are spent, weekly window first, with the weekly reset in Moscow time', () => {
+test('[R05] says the percentages are spent, weekly window first, with the weekly reset in Moscow time', () => {
   expect(formatCodexLimitsLine([
     { used: 12, minutes: 300, resetsAt: Date.UTC(2026, 10, 25, 23, 0) / 1000 },
     { used: 36, minutes: 10080, resetsAt: WEEK_RESET },

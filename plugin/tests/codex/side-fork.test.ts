@@ -50,7 +50,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-test('an owner side thread is an ephemeral fork of the main thread and a reply reuses it', async () => {
+test('[R14] an owner side thread is an ephemeral fork of the main thread and a reply reuses it', async () => {
   const { session, requests } = fixture()
   await session.initialize()
   await session.run('один')
@@ -147,7 +147,7 @@ test('a turn sends the model only when it differs from the thread model', async 
   expect(session.status.model).toBe('gpt-other')
 })
 
-test('the HUD shows the cache share of the last main request and omits it when unknown', async () => {
+test('[R14] the HUD shows the cache share of the last main request and omits it when unknown', async () => {
   const { session } = fixture()
   await session.initialize()
   await session.run('usage:cached')
