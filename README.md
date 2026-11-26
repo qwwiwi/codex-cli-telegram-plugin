@@ -119,6 +119,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 | `/react <emoji>` | put a reaction on the message you reply to |
 | `/edit <text>` | replace the text of a bot message you reply to |
 | `/get` | hand an attachment from the quoted message to Codex |
+| `/doctor` | self-check: runs `doctor`, fetches the GitHub repository (`KROT_UPDATE_REMOTE`, default `public` if present else `origin`; `KROT_UPDATE_BRANCH`, default `main`) and reports commits behind/ahead, local edits (file names only), `bun.lock` vs `node_modules` drift and the Codex CLI version; `/doctor fix` hands the report to Codex to fix what is safe, without restarting the bridge mid-turn |
 
 `/help`, `/status`, `/stop`, `/reset` and `/new` can be switched off in `config.json` (`commands` block). Unknown `/cc <name>` commands are read from `KROT_CODEX_COMMANDS_DIR` when it is set.
 

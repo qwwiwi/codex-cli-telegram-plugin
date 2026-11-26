@@ -18,6 +18,7 @@ const specs = [
   { command: 'react', description: 'поставить эмодзи на выбранное сообщение' },
   { command: 'edit', description: 'заменить текст выбранного ответа агента' },
   { command: 'get', description: 'передать агенту вложение из цитаты' },
+  { command: 'doctor', description: 'самопроверка и сравнение с GitHub; fix — передать агенту' },
 ] as const
 
 export function codexCommands(config: AppConfig, learningEnabled = false) {

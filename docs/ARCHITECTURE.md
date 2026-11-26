@@ -464,6 +464,8 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |
 | `KROT_CODEX_SELF_RESTART` | `codex/server.ts` | `1` allows an owner-requested restart (Linux, under systemd) |
 | `KROT_CODEX_COMMANDS_DIR` | `codex/server.ts` | folder with custom prompt commands for `/cc <name>` |
+| `KROT_UPDATE_REMOTE` | `codex/doctor-command.ts` | git remote `/doctor` fetches to compare the install with GitHub; default `public` if present, else `origin` |
+| `KROT_UPDATE_BRANCH` | `codex/doctor-command.ts` | branch of that remote `/doctor` compares with; default `main` |
 | `KROT_CODEX_LEARNING` | `codex/server.ts` | `1` turns on learning memory and `/memory` ([plugin/docs/learning.md](../plugin/docs/learning.md)) |
 | `KROT_CODEX_LEARNING_INTERVAL` | `codex/server.ts` | turns between background reviews (1 to 30, default 10) |
 | `KROT_CODEX_LEARNING_AUTO_SAVE` | `codex/server.ts` | `1` saves learning suggestions as approved without waiting for `/memory approve` |
