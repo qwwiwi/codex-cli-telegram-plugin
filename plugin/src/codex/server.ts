@@ -85,6 +85,7 @@ import { SideStatusCard, sideActivityLine, sideFirstStage, sideThinking } from '
 import { QueueNotices } from './queue-notice.js'
 import { hasMedia, prepareInbound, type MediaInput } from './media.js'
 import { CodexMirror } from './mirror.js'
+import { codexAppServerCommand } from './native-memories.js'
 import { CodexSession } from './session.js'
 import { hideQuestionMarker, questionFallback, QuestionCards, QUESTION_CALLBACK } from './questions.js'
 import { CodexWorkStatus } from './work-status.js'
@@ -524,7 +525,8 @@ async function main(): Promise<void> {
         void result.then(value => sideDeliveries.record(key, value), () => undefined)
         return result
       },
-      ...(proxy ? { command: ['/usr/bin/sudo', '-n', '--', proxy] } : {}),
+      command: proxy ? ['/usr/bin/sudo', '-n', '--', proxy]
+        : codexAppServerCommand(workspace, codexEnv, process.env.KROT_CODEX_MEMORIES_DEFAULT === '1'),
     }, () => {
       if (!stopping) process.exitCode = 1
       shutdown()

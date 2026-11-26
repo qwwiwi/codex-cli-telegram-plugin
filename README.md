@@ -63,7 +63,10 @@ The installer asks for the token (hidden input), prints a one-time code and asks
 | `--approval-mode never\|standard\|risky` | approval cards: `never` (default for a new install, autonomous, no cards), `standard` or `risky` (see [Security](#security-model)) |
 | `--non-interactive --token-file PATH` | no prompts; token from a private file |
 | `--owner-id ID` / `--pair-code CODE` | owner by numeric ID, or by a pre-sent `krotov-<uuid>` code |
+| `--no-memories` | skip the native Codex memories default on a new installation |
 | `--dry-run` | print the plan and exit |
+
+A new installation enables [native Codex memories](plugin/docs/install.md#native-codex-memories) for its local Codex backend when there is no explicit setting.
 
 Manual setup on Ubuntu or Debian: [plugin/docs/quickstart.md](plugin/docs/quickstart.md). Setup by an AI agent: [INSTALL-WITH-AGENT.md](INSTALL-WITH-AGENT.md). On macOS there is no installer and no systemd unit; set `plugin/.env` by hand and run `bun run start` in `plugin/`.
 

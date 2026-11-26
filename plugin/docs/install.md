@@ -81,6 +81,22 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   Codex lifecycle events are outside the activity feed.
 - From `plugin/`, run `bun install --frozen-lockfile`, `bun run doctor` and `bun run start`. In a deployment using a bundle, use the same environment variables.
 
+## Native Codex memories
+
+A fresh `./install.sh` sets `KROT_CODEX_MEMORIES_DEFAULT=1` in `plugin/.env`.
+When the bridge starts its local Codex App Server, it enables native Codex
+memories if no explicit `features.memories` setting is present. This leaves
+the user's Codex configuration file intact. The [optional bridge learning
+feature](learning.md) has its own settings.
+
+To skip this default on a new installation, pass `./install.sh --no-memories`.
+For an existing installation, set `KROT_CODEX_MEMORIES_DEFAULT=0` in
+`plugin/.env` and restart the bridge while it is idle. This uses whatever
+Codex itself is configured to do. To explicitly disable native memories,
+set `memories = false` under `[features]` in the Codex configuration.
+Existing environment files keep their settings on reinstall or update.
+A host-managed App Server continues to use its own configuration.
+
 ## Telegram controls
 
 - `/help` lists the enabled commands. `/status` shows session activity,

@@ -87,6 +87,8 @@ git clone https://github.com/qwwiwi/codex-cli-telegram-plugin && cd codex-cli-te
 | `--owner-id ID` / `--pair-code КОД` | владелец по числовому ID или по заранее отправленному коду `krotov-<uuid>` |
 | `--dry-run` | показать план и выйти |
 
+При новой установке мост включает [встроенную память Codex](plugin/docs/install.md#native-codex-memories), если она явно не настроена. Флаг `--no-memories` оставляет настройку самому Codex.
+
 Ручная установка на Ubuntu или Debian: [plugin/docs/quickstart.md](plugin/docs/quickstart.md). Установка силами ИИ-агента: [INSTALL-WITH-AGENT.md](INSTALL-WITH-AGENT.md). На macOS установщика и службы нет: заполните `plugin/.env` вручную и запустите `bun run start` в папке `plugin/`.
 
 ---

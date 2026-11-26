@@ -19,7 +19,7 @@ usage() {
   cat <<'HELP'
 Использование
   ./install.sh [--start] [--agent-name NAME] [--workspace PATH] [--state-dir PATH]
-               [--approval-mode never|standard|risky]
+               [--approval-mode never|standard|risky] [--no-memories]
   ./install.sh --non-interactive --token-file PATH [--owner-id ID | --pair-code CODE] [--start]
   ./install.sh --dry-run
 
@@ -30,6 +30,7 @@ usage() {
 --approval-mode never (по умолчанию для новой установки): агент работает автономно, без карточек подтверждения.
 --approval-mode standard включает карточки Codex для действий за пределами песочницы.
 --approval-mode risky пропускает обычную диагностику и оставляет карточки для действий с риском.
+--no-memories отключает настройку памяти Codex по умолчанию для новой установки.
 --start включает пользовательскую службу и автозапуск. Нужен вход в Codex через ChatGPT.
 HELP
 }
@@ -40,6 +41,7 @@ non_interactive=0
 token_file=''
 pair_code=''
 approval_mode=''
+memories_default=1
 while (( $# )); do
   case $1 in
     --owner-id|--token-file|--workspace|--state-dir|--agent-name|--pair-code|--approval-mode)
@@ -59,6 +61,7 @@ while (( $# )); do
       esac
       shift 2 ;;
     --start) start=1; shift ;;
+    --no-memories) memories_default=0; shift ;;
     --dry-run) dry_run=1; shift ;;
     --non-interactive) non_interactive=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -70,6 +73,11 @@ if (( dry_run )); then
   printf '%s\n' 'План: проверить зависимости и вход Codex, связать личку, установить зависимости проекта, запустить doctor и подготовить службу.'
   if [[ -n $approval_mode ]]; then printf 'Режим подтверждений: %s\n' "$approval_mode"
   else printf '%s\n' 'Режим подтверждений новой установки: never.'; fi
+  if (( memories_default )); then
+    printf '%s\n' 'Память Codex для новой установки: включена при отсутствии явной настройки.'
+  else
+    printf '%s\n' 'Память Codex для новой установки: используется настройка самого Codex.'
+  fi
   if (( start )); then printf '%s\n' 'После успешного doctor служба будет включена.'; fi
   exit 0
 fi
@@ -184,6 +192,7 @@ else
     printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "${approval_mode:-never}"
     # The working bubble streams the agent's redacted reasoning summaries; 0 turns it off.
     printf 'TELEGRAM_STATUS_THOUGHTS=1\n'
+    printf 'KROT_CODEX_MEMORIES_DEFAULT=%s\n' "$memories_default"
     # No automatic 👀 on every message: the agent reacts itself, rarely, from KROT_REACTION_PALETTE.
     printf 'KROT_ACK_REACTION=off\n'
   } > "$tmp_env"
