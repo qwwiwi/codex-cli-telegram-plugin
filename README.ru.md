@@ -229,6 +229,7 @@ systemctl --user daemon-reload
 ## Документация
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): устройство кода, путь сообщения, файлы состояния, карточки, HUD, все переменные (на английском)
+- [docs/codex-known-problems.md](docs/codex-known-problems.md): известные проблемы Codex CLI и что из них мост решает, решает частично или не решает (на английском)
 - [plugin/docs/quickstart.md](plugin/docs/quickstart.md): ручная установка на VPS
 - [plugin/docs/install.md](plugin/docs/install.md): развёртывание и команды Telegram (на английском)
 - [plugin/docs/root-backend.md](plugin/docs/root-backend.md): отдельный Codex App Server через локальное реле

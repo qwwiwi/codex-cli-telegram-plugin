@@ -116,3 +116,29 @@ test('[R11] the ideas for the next release are kept in ROADMAP.md with a done-wh
   expect(ideas).toBeGreaterThanOrEqual(1)
   expect(next.match(/Done when:/g)?.length ?? 0).toBe(ideas)
 })
+
+test('[R16] the known Codex CLI problems map exists, every row has a status and a reason, and the README links it', () => {
+  const path = 'docs/codex-known-problems.md'
+  expect(existsSync(join(root, path))).toBe(true)
+  const doc = read(path)
+  const lines = doc.split('\n')
+  const title = lines.findIndex(line => line.startsWith('# '))
+  expect(lines.slice(0, title + 4).some(line => /^> \*\*По-русски:\*\* /.test(line))).toBe(true)
+  const header = lines.findIndex(line => /^\| # \| Problem \| How this bridge handles it \| Status \| Why \|$/.test(line))
+  expect(header).toBeGreaterThan(-1)
+  const rows = lines.slice(header + 2).filter(line => /^\| \d+ \|/.test(line))
+  expect(rows.length).toBeGreaterThanOrEqual(15)
+  for (const row of rows) {
+    const cells = row.split(' | ')
+    expect(cells, row).toHaveLength(5)
+    expect(['solved', 'partly', 'not solved'], row).toContain(cells[3]!)
+    expect(cells[4]!.replace(/ \|$/, '').trim().length, row).toBeGreaterThan(10)
+  }
+  // Every file:line reference points at a line that exists in this repository.
+  for (const [, file, line] of doc.matchAll(/`([\w./-]+\.(?:ts|sh|py)):(\d+)`/g)) {
+    expect(existsSync(join(root, file!)), file).toBe(true)
+    expect(read(file!).split('\n').length, `${file}:${line}`).toBeGreaterThanOrEqual(Number(line))
+  }
+  expect(doc).not.toMatch(/https?:\/\//)
+  expect(read('README.md')).toContain('](docs/codex-known-problems.md)')
+})

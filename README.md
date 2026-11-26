@@ -188,6 +188,7 @@ Run `bun run doctor` in `plugin/` to check the environment at any time.
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): code map, message flow, state files, cards, HUD, all environment variables
+- [docs/codex-known-problems.md](docs/codex-known-problems.md): known Codex CLI problems and which of them this bridge solves, partly solves or leaves open
 - [plugin/docs/quickstart.md](plugin/docs/quickstart.md): manual installation on a VPS (Russian)
 - [plugin/docs/install.md](plugin/docs/install.md): deployment guide and Telegram commands
 - [plugin/docs/root-backend.md](plugin/docs/root-backend.md): separate Codex App Server through a local relay
