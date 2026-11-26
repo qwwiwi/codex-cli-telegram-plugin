@@ -40,6 +40,7 @@ import { CardCleanup } from './card-cleanup.js'
 import { extractAttachments, sendAttachment } from './attachments.js'
 import { formatReminderEnabled, ownerTurn } from './format-reminder.js'
 import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
+import { collectDoctorReport, DoctorCommand, runDoctorScript } from './doctor-command.js'
 import {
   directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
   ownerTaskBlocked, ownerTaskWithdrawn, publicProgress,
@@ -1130,13 +1131,27 @@ async function main(): Promise<void> {
       const directory = process.env.KROT_CODEX_COMMANDS_DIR
       const custom = directory ? legacyCommand(directory, name, args) : undefined
       if (!custom) return false
+      await enqueueOwnerTurn(custom, messageId)
+      return true
+    }
+
+    // A bridge-built owner turn: the negative ID marks it as not typed by the owner (no restart marker).
+    async function enqueueOwnerTurn(text: string, messageId: number): Promise<void> {
       await acceptInput({
-        message_id: -messageId, date: Math.floor(Date.now() / 1000), text: custom,
+        message_id: -messageId, date: Math.floor(Date.now() / 1000), text,
         chat: { id: Number(ownerChat), type: 'private', first_name: 'Telegram' },
         from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
       })
-      return true
     }
+
+    const bridgeRepo = join(import.meta.dir, '..', '..', '..')
+    const doctor = new DoctorCommand({
+      collect: () => collectDoctorReport({
+        repo: bridgeRepo, env: process.env,
+        doctor: () => runDoctorScript(join(import.meta.dir, '..', '..', 'scripts', 'doctor.ts'), process.env),
+      }),
+      send, repo: bridgeRepo, selfRestart: selfRestartEnabled,
+    })
 
     async function compact(): Promise<void> {
       if (task || codex.isRunning) {
@@ -1213,6 +1228,14 @@ async function main(): Promise<void> {
       }
       if (name === 'stop') return stop()
       if (name === 'compact') return compact()
+      if (name === 'doctor') {
+        // In the background: the checks take up to a minute and must not hold /stop and other updates.
+        void doctor.handle(args, async text => {
+          if (messageId === undefined) throw new Error('/doctor fix needs the owner message ID')
+          await enqueueOwnerTurn(text, messageId)
+        }).catch(() => log.warn('Could not finish /doctor'))
+        return
+      }
       if (name === 'cc') return handleCc(args, messageId)
       if (name === 'goal') return handleGoal(args)
       if (name === 'memory' && learning) {
