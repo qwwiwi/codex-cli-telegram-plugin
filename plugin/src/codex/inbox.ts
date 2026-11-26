@@ -268,14 +268,16 @@ export class CodexInbox {
   }
 }
 
-// The active record as an agent's: the reply and its delivery state stay,
-// everything that acts on the owner's behalf goes.
+// The active record as an agent's: the reply text and its delivery state stay,
+// everything that acts on the owner's behalf goes, workspace attachments too
+// (the running recovery likewise extracts them only for the owner).
 function withoutOwnerMetadata(active: Active): Active {
   const { work: _work, ...rest } = active
-  const outcome: Outcome = active.outcome.stage === 'ready'
-    ? { stage: 'ready', reply: active.outcome.reply,
-      ...(active.outcome.delivery ? { delivery: active.outcome.delivery } : {}) }
-    : active.outcome
+  if (active.outcome.stage !== 'ready') return { ...rest, outcome: active.outcome }
+  const { reply, delivery } = active.outcome
+  const textParts = Object.entries(delivery ?? {}).filter(([key]) => !key.startsWith('file:'))
+  const outcome: Outcome = { stage: 'ready', reply: { ...reply, files: [] },
+    ...(textParts.length ? { delivery: Object.fromEntries(textParts) } : {}) }
   return { ...rest, outcome }
 }
 

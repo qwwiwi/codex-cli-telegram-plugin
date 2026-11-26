@@ -129,7 +129,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     case 'thread/turns/list':
       if (params.threadId !== threadId) break
-      respond({ data: [{ items: [{ type: 'agentMessage', text: 'Example' }] }], nextCursor: null })
+      // One finished turn from before this process: a resumed thread's history.
+      respond({ data: [{ id: 'turn-0', status: 'completed', items: [{ type: 'agentMessage', text: 'Example' }] }], nextCursor: null })
       break
     case 'thread/read':
       if (resolveMcpDuringLookup?.threadId === params.threadId) {

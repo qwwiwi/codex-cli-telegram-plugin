@@ -125,6 +125,30 @@ test('a pre-provenance ready webhook record never continues a goal or restarts t
   expect(restart.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [] } })
 })
 
+test('a ready record without owner provenance recovers its text but never its workspace attachments', () => {
+  // Legacy file, owner-shaped message, a reply with a saved file half delivered.
+  const legacy = savedActive(room(), {
+    messages: [ownerMessage('Пришли отчёт')],
+    outcome: { stage: 'ready', reply: { text: 'Готово', files: ['secret-report.pdf'], replyTo: 7 },
+      delivery: { 'text:0': 'sent', 'file:0': 'sending' } },
+  }).active!
+  // deliverReply sends one attachment per reply file and counts every delivery marker.
+  expect(legacy.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [], replyTo: 7 },
+    delivery: { 'text:0': 'sent' } })
+  // Same for a current file that names an agent as the origin.
+  const agent = savedActive(room(), {
+    messages: [agentMessage('Verify the summary.')],
+    outcome: { stage: 'ready', reply: { text: 'Готово', files: ['secret-report.pdf'] }, delivery: { 'file:0': 'failed' } },
+  }, { '-7': agentProvenance('swarm') }).active!
+  expect(agent.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [] } })
+  // A saved owner provenance keeps the files and their markers.
+  const owner = savedActive(room(), {
+    messages: [ownerMessage('Пришли отчёт')],
+    outcome: { stage: 'ready', reply: { text: 'Готово', files: ['report.pdf'] }, delivery: { 'file:0': 'sending' } },
+  }, { 7: ownerProvenance }).active!
+  expect(owner.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: ['report.pdf'] }, delivery: { 'file:0': 'sending' } })
+})
+
 test('a running record without provenance recovers without owner metadata, fail closed', () => {
   // Legacy file, owner-shaped message: no saved provenance means not the owner's for recovery.
   const legacyInbox = savedActive(room(), {

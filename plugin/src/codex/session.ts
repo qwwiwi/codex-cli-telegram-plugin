@@ -598,7 +598,27 @@ export class CodexSession {
     this.model = typeof reply.model === 'string' ? reply.model : undefined
     if (id !== this.threadId) this.usage = undefined
     this.saveThread(id)
+    if (expected) await this.seedForkAnchor(id)
     return id
+  }
+
+  // A resumed thread finished its turns before this process saw any event, so
+  // the fork anchor comes from its history: the latest terminal turn. Best
+  // effort: with no answer an owner side starts a fresh thread, as before.
+  private async seedForkAnchor(threadId: string): Promise<void> {
+    if (!this.forkSides) return
+    try {
+      // The exact shape the root relay admits for thread/turns/list.
+      const result = await this.rpc.request('thread/turns/list', {
+        threadId, limit: 10, itemsView: 'full', sortDirection: 'desc',
+      }, 5000)
+      const turns = Array.isArray(result.data) ? result.data.map(object) : []
+      const last = turns.find(turn => typeof turn.id === 'string' && turn.id !== '' &&
+        (turn.status === 'completed' || turn.status === 'interrupted' || turn.status === 'failed'))
+      if (last && this.threadId === threadId) this.lastMainTurn = { threadId, id: last.id as string }
+    } catch {
+      this.settings.onWarning?.('Could not read the resumed Codex history; a side thread may start fresh')
+    }
   }
 
   private saveThread(id: string | null): void {

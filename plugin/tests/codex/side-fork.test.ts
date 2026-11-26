@@ -73,6 +73,21 @@ test('an owner side thread is an ephemeral fork of the main thread and a reply r
   await main
 })
 
+test('after a resume an owner side forks at the last finished turn of the resumed history', async () => {
+  const { session, requests } = fixture()
+  await session.initialize()
+  await session.resume('saved-thread')
+  const { main } = await mainBusy(session)
+  const side = await session.runSide('Какая погода?')
+  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId })
+  // Not a fresh thread: the fork keeps the resumed context up to its last finished turn.
+  expect(requests('thread/start')).toHaveLength(0)
+  expect(requests('thread/fork')).toHaveLength(1)
+  expect(requests('thread/fork')[0]!.params).toMatchObject({ threadId: 'saved-thread', ephemeral: true, lastTurnId: 'turn-0' })
+  await session.stop()
+  await main
+})
+
 test('an agent side thread never forks the owner main thread', async () => {
   const { session, requests } = fixture()
   await session.initialize()
