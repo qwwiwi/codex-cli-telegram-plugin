@@ -137,6 +137,11 @@ export async function runDoctor(
       checks.push({ status: 'error', message: 'Проверьте JSON и права чтения для TELEGRAM_CONFIG_FILE или config.json в папке состояния.' })
     }
   }
+  if (config) {
+    checks.push(config.status.thoughts?.enabled
+      ? { status: 'ok', message: 'Мысли агента в карточке работы: включены; секреты, токены и пути в них скрываются.' }
+      : { status: 'ok', message: 'Мысли агента в карточке работы: выключены. Включить: TELEGRAM_STATUS_THOUGHTS=1 в plugin/.env.' })
+  }
   const ownerId = env.TELEGRAM_ALLOWED_USER_IDS?.trim()
   report(Boolean(ownerId && /^[1-9]\d*$/.test(ownerId)
       && ownerId === env.TELEGRAM_ALLOWED_CHAT_IDS?.trim()

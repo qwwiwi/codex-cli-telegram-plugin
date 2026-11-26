@@ -182,6 +182,8 @@ else
     # An autonomous agent by default: no approval cards. KROT_CODEX_APPROVALS=1 stays,
     # so switching to standard or risky is one line.
     printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "${approval_mode:-never}"
+    # The working bubble streams the agent's redacted reasoning summaries; 0 turns it off.
+    printf 'TELEGRAM_STATUS_THOUGHTS=1\n'
   } > "$tmp_env"
   unset setup_token
   ln -- "$tmp_env" "$env_file" || setup_fail 'Не удалось сохранить plugin/.env. Проверь, не появился ли файл параллельно.'

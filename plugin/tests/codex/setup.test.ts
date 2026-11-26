@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { type ApprovalEnv, resolveApprovalSetup } from '../../src/codex/approval-mode.js'
+import { loadConfig } from '../../src/config.js'
 
 const source = resolve(import.meta.dir, '../../..')
 const temporary: string[] = []
@@ -106,6 +107,28 @@ test('[R01] a fresh install defaults to approval mode never, so the agent never 
   expect(saved).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' })
   expect(resolveApprovalSetup(saved)).toEqual({ cards: false, risky: false })
   expect(result.text).toContain('Режим подтверждений: never')
+})
+
+test('[R02] a fresh install shows the agent thoughts in the working bubble and an existing one keeps its choice', () => {
+  const { repo, env } = checkout()
+  const file = join(repo, 'plugin/.env')
+  const thoughts = () => {
+    const saved = Object.fromEntries(readFileSync(file, 'utf8').trim().split('\n').map(line => {
+      const at = line.indexOf('=')
+      return [line.slice(0, at), line.slice(at + 1).replace(/^"(.*)"$/, '$1')]
+    }))
+    return loadConfig({ ...saved, XDG_STATE_HOME: env.XDG_STATE_HOME }).status.thoughts?.enabled ?? false
+  }
+  const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(fresh.code, fresh.text).toBe(0)
+  expect(readFileSync(file, 'utf8')).toContain('TELEGRAM_STATUS_THOUGHTS=1\n')
+  expect(thoughts()).toBe(true)
+  // An install made before this setting has no line; a rerun leaves it as it was.
+  writeFileSync(file, readFileSync(file, 'utf8').replace('TELEGRAM_STATUS_THOUGHTS=1\n', ''), { mode: 0o600 })
+  const rerun = command(repo, env, 'bash', './install.sh', '--non-interactive', '--approval-mode', 'standard')
+  expect(rerun.code, rerun.text).toBe(0)
+  expect(readFileSync(file, 'utf8')).not.toContain('TELEGRAM_STATUS_THOUGHTS')
+  expect(thoughts()).toBe(false)
 })
 
 test('[R01] the installer offers never and keeps standard selectable, on a fresh and on an existing install', () => {

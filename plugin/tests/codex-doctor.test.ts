@@ -78,6 +78,23 @@ test('doctor requires an explicit owner and hides sensitive network errors', asy
   expect(JSON.stringify(checks)).not.toContain(token)
 })
 
+test('[R02] doctor shows whether the working bubble streams the agent thoughts', async () => {
+  const line = async (env: Record<string, string>) => {
+    const { checks } = await checkInstallation({ env })
+    const found = checks.filter(check => check.message.startsWith('Мысли агента'))
+    expect(found).toHaveLength(1)
+    expect(found[0]!.status).toBe('ok')
+    return found[0]!.message
+  }
+  const on = await line({ TELEGRAM_STATUS_THOUGHTS: '1' })
+  expect(on).toContain('включены')
+  expect(on).toContain('секреты')
+  const off = await line({})
+  expect(off).toContain('выключены')
+  expect(off).toContain('TELEGRAM_STATUS_THOUGHTS=1')
+  expect(await line({ TELEGRAM_STATUS_THOUGHTS: 'off' })).toContain('выключены')
+})
+
 test('[R01] doctor reports the active approval mode, including never', async () => {
   const mode = async (approvals: Record<string, string>) => {
     const { checks } = await checkInstallation({ env: approvals })

@@ -512,6 +512,14 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_ALLOWED_CHAT_IDS: z.string().optional(),
   TELEGRAM_WORKSPACE_ROOT: z.string().optional(),
   TELEGRAM_STATUS_INTERVAL_MS: z.coerce.number().int().positive().optional(),
+  // Streaming thoughts in the working bubble (status.thoughts.enabled). Same
+  // shape as TELEGRAM_HUD_ENABLED: 0/false/no/off forces it off, any other
+  // value on. Unset = config.json / schema default (off). A fresh install
+  // writes TELEGRAM_STATUS_THOUGHTS=1.
+  TELEGRAM_STATUS_THOUGHTS: z
+    .string()
+    .transform((v) => !/^(0|false|no|off)$/i.test(v.trim()))
+    .optional(),
   // Delay before the first open-question reminder. 0 switches the feature off
   // — one knob per channel.env, no second boolean to keep in sync.
   TELEGRAM_OPEN_QUESTION_REMINDER_MS: z.coerce.number().int().nonnegative().optional(),
@@ -728,6 +736,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const status = (merged.status && typeof merged.status === 'object' ? merged.status : {}) as Record<string, unknown>
   if (parsedEnv.TELEGRAM_STATUS_INTERVAL_MS !== undefined) {
     status.interval_ms = parsedEnv.TELEGRAM_STATUS_INTERVAL_MS
+  }
+  if (parsedEnv.TELEGRAM_STATUS_THOUGHTS !== undefined) {
+    const thoughts = status.thoughts && typeof status.thoughts === 'object' ? status.thoughts : {}
+    status.thoughts = { ...thoughts, enabled: parsedEnv.TELEGRAM_STATUS_THOUGHTS }
   }
   if (Object.keys(status).length > 0) merged.status = status
 
