@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { Bot } from 'grammy'
@@ -33,12 +33,13 @@ import { TelegramPoller, tokenLock } from '../telegram/poller.js'
 import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
 import { removeOwnPinService } from './pin-service.js'
+import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
 import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import {
-  automaticContinuation, directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
-  ownerStatusCheck, ownerTaskBlocked, ownerTaskContinuationInput, ownerTaskWithdrawn, publicProgress,
+  directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
+  ownerTaskBlocked, ownerTaskWithdrawn, publicProgress,
   takeContinuation, unfinishedOwnerTask, type ContinuationContext,
 } from './continuation.js'
 import { ControlState } from './control-state.js'
@@ -46,11 +47,17 @@ import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, format
   readClaudeArchive, sendConversation } from './conversation-export.js'
 import { CodexInbox, type InboxReply } from './inbox.js'
 import { startExternalTasks } from './external.js'
+import { agentWebhookSettings, routeAgentMessage, startAgentWebhook, type AgentDelivery,
+  type DeliverOutcome } from './agent-webhook.js'
+import { codexEnvironment, exactSecrets } from './environment.js'
+import { agentBody, agentProvenance, agentTurnInstructions, ownerProvenance, turnIntent,
+  type Provenance } from './provenance.js'
+import { recoverInterruptedWork } from './side-recovery.js'
 import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-delivery.js'
 import { deliverReplyPart, type PartStatus } from './reply-delivery.js'
 import {
   BridgeRestart, bridgeRestartDirectInstructions, bridgeRestartInstructions, bridgeRestartReply,
-  bridgeRestartVerificationInstructions, ownerRequestedBridgeRestart, ownerRequestedRestartVerification, restartOwnerText,
+  bridgeRestartVerificationInstructions, ownerRequestedBridgeRestart, restartOwnerText,
 } from './restart-bridge.js'
 import { BridgeRestartHandoff, isRestartVerificationMessage } from './restart-handoff.js'
 import { readHandoffContext } from './handoff-context.js'
@@ -62,6 +69,7 @@ import { LearningMemory } from './learning.js'
 import { requestStructured, reviewLearning } from './learning-review.js'
 import { legacyCommand } from './legacy-command.js'
 import { sideQuestion, sideReply, sideReplySchema } from './side-reply.js'
+import { busyNotice, parallelSettings, routeWhileBusy, SideRegistry, sideInstructions, taskTitle } from './parallel.js'
 import { hasMedia, prepareInbound, type MediaInput } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { CodexSession } from './session.js'
@@ -79,9 +87,6 @@ const autonomyInstructions = 'Для большой задачи составь 
   'Делегируй независимые части нативным субагентам Codex, если инструменты доступны и это помогает задаче. ' +
   'Продолжай работу после промежуточных результатов до проверенного итога или реального блокера. ' +
   'Подтверждения и границы среды остаются обязательными.'
-
-// Keep Telegram credentials and unrelated service environment out of Codex.
-const codexEnvironment = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TMPDIR|TEMP|TMP|CODEX_HOME|USERPROFILE|LOCALAPPDATA|APPDATA|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|GH_CONFIG_DIR)$/i
 
 async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
@@ -115,7 +120,8 @@ async function main(): Promise<void> {
   if (!tokenLock.acquire(paths)) throw new Error('A bot already owns this state directory')
 
   const policyToken = process.env.KROT_CODEX_POLICY_TOKEN
-  const secrets = [env.TELEGRAM_BOT_TOKEN, env.GROQ_API_KEY ?? '', env.TELEGRAM_WEBHOOK_TOKEN ?? '', policyToken ?? ''].filter(Boolean)
+  // Exact values of every credential the bridge holds or forwards to Codex (GBRAIN_BEARER).
+  const secrets = exactSecrets(process.env)
   const log = createLogger('krot-codex', { secrets })
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
   bot.use(richInboundMiddleware(undefined, () => log.warn('Could not normalize Telegram rich content')))
@@ -225,6 +231,7 @@ async function main(): Promise<void> {
   let session: CodexSession | undefined
   let task: Promise<void> | undefined
   let externalTasks: Awaited<ReturnType<typeof startExternalTasks>> | undefined
+  let agentWebhook: ReturnType<typeof startAgentWebhook> | undefined
   let externalQuestion = false
   const inbox = new CodexInbox(paths.root, ownerId)
   const albums = new AlbumBuffer<Message>({ flushMs: config.album.flush_ms })
@@ -245,6 +252,7 @@ async function main(): Promise<void> {
     approvals?.cancelAll()
     questions.suspend()
     externalTasks?.close()
+    void agentWebhook?.stop(true)
     session?.close()
     void poller.stop()
   }
@@ -264,7 +272,8 @@ async function main(): Promise<void> {
         getActiveToolName: () => undefined,
       },
     })
-    let recoveringInbox = !!inbox.active || !!inbox.uncertainFollowUp || inbox.size > 0 || Object.keys(inbox.recoveredAlbums).length > 0
+    let recoveringInbox = !!inbox.active || !!inbox.uncertainFollowUp || inbox.sideJobs.length > 0 || inbox.size > 0 ||
+      Object.keys(inbox.recoveredAlbums).length > 0
     let deliveryRetryAt = 0
     let recoveringGoal: string | undefined
     const controls = new ControlState(paths.root, config.tmux_mirror.enabled)
@@ -292,6 +301,10 @@ async function main(): Promise<void> {
     let goalStarting: Promise<void> | undefined
     let hudReady = false
     let plans: TodoItem[] = []
+    // Parallel side threads (KROT_CODEX_PARALLEL=1); off keeps the single-thread flow.
+    const parallel = parallelSettings(process.env)
+    const sides = new SideRegistry()
+    let mainStartedAt = 0
     let milestoneThread = ''
     let lastNativePlan: { turnId: string; pending: boolean } | undefined
     const selfRestartEnabled = process.platform === 'linux' && process.env.KROT_CODEX_SELF_RESTART === '1'
@@ -300,7 +313,7 @@ async function main(): Promise<void> {
       idle: () => !stopping && !task && !work.busy && !codex.isRunning && !goalActive && !externalQuestion &&
         !resetting && !recoveringInbox && !recoveringGoal && !deliveringGoal && !approvals?.isPending &&
         !questions.isPending && !inbox.active && inbox.size === 0 && !inbox.uncertainFollowUp &&
-        Object.keys(inbox.recoveredAlbums).length === 0,
+        Object.keys(inbox.recoveredAlbums).length === 0 && sides.size === 0,
       notify: () => telegram.sendMessage(ownerChat, 'Перезапускаюсь. Итоговый ответ доставлен.', {}),
       restart: () => {
         log.info('Restarting bridge after owner notification')
@@ -322,6 +335,7 @@ async function main(): Promise<void> {
       env: codexEnv,
       ...(process.env.KROT_CODEX_MODEL ? { model: process.env.KROT_CODEX_MODEL } : {}),
       selectedModel: () => controls.model,
+      onWarning: message => log.warn(message),
       onThread: id => {
         try { controls.remember(id) } catch { log.warn('Could not remember the Codex conversation') }
       },
@@ -377,14 +391,17 @@ async function main(): Promise<void> {
           if (controls.mirror && item.type === 'commandExecution' && typeof item.id === 'string') {
             mirror?.output(item.id, '', typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput : '')
           }
+          // A turn answering another agent never asks the owner questions or acts in the Telegram chat.
+          const untrusted = typeof event.params.turnId === 'string' && codex.isUntrustedTurn(thread, event.params.turnId)
           if (item.type === 'agentMessage' && item.delivery === 'async' &&
               Array.isArray(item.questions) && item.questions.length) {
+            if (untrusted) return
             void answerAsyncQuestion(thread, item.questions, stopEpoch)
               .catch(() => log.warn('Could not relay the async Codex question'))
             return
           }
           if (item.type === 'agentMessage' && item.phase === 'commentary' && typeof item.text === 'string') {
-            if (item.delivery !== 'async' && typeof item.id === 'string' && typeof event.params.turnId === 'string' &&
+            if (!untrusted && item.delivery !== 'async' && typeof item.id === 'string' && typeof event.params.turnId === 'string' &&
                 codex.steerableTurn === event.params.turnId) {
               const epoch = stopEpoch
               const turnId = event.params.turnId
@@ -442,7 +459,7 @@ async function main(): Promise<void> {
           }
         }).finally(() => {
           deliveringGoal = false
-          if (hudReady && !stopping) void hud.bump(ownerChat)
+          if (hudReady && !stopping) hudAnchor.refresh()
           reconcileNotifiedGoal(thread)
           startNext()
         })
@@ -517,7 +534,13 @@ async function main(): Promise<void> {
         deleteMessage: async (chatId, id) => { await bot.api.deleteMessage(chatId, id) },
       },
     })
-    const send = async (text: string): Promise<void> => { await telegram.sendMessage(ownerChat, text, {}) }
+    // Owner message -> HUD card -> reply: the card moves on accepted owner
+    // messages only, and replies wait (capped) for it to land first.
+    const hudAnchor = new HudAnchor(hud, ownerChat)
+    const send = async (text: string): Promise<void> => {
+      await hudAnchor.settled()
+      await telegram.sendMessage(ownerChat, text, {})
+    }
     let learningRetryAfter = 0
     function runLearning(force = false): void {
       if (!learning || stopping || !force && Date.now() < learningRetryAfter) return
@@ -544,9 +567,11 @@ async function main(): Promise<void> {
       } catch { log.warn('Could not write agent memory') }
     }
 
-    async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number): Promise<void> {
+    async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number,
+      onSent?: (id: number) => void): Promise<void> {
       text = normalizeChatReply(text)
       if (!text) return
+      await hudAnchor.settled()
       const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
       const question = questionConfig.enabled ? detectOpenQuestion(redactSecrets(text, secrets)) : undefined
       async function recordQuestion(messageId: number): Promise<void> {
@@ -606,6 +631,7 @@ async function main(): Promise<void> {
       }
       if (rich && 'message_id' in rich) {
         agentChat.remember(rich.message_id, true, true, true)
+        onSent?.(rich.message_id)
         await recordQuestion(rich.message_id)
         return
       }
@@ -618,6 +644,7 @@ async function main(): Promise<void> {
         try {
           const sent = await telegram.sendMessage(ownerChat, part, options)
           agentChat.remember(sent.message_id, true, true)
+          onSent?.(sent.message_id)
           if (index === 0) await recordQuestion(sent.message_id)
         } catch (error) {
           const flood = parse429(error)
@@ -628,6 +655,7 @@ async function main(): Promise<void> {
             if (!isTelegramHtmlParseError(error)) throw error
             const sent = await telegram.sendMessage(ownerChat, part, index === 0 ? quote : {})
             agentChat.remember(sent.message_id, true, true)
+            onSent?.(sent.message_id)
             if (index === 0) await recordQuestion(sent.message_id)
           }
         }
@@ -1105,7 +1133,7 @@ async function main(): Promise<void> {
         task = undefined
         work.finish()
         finishMirror('Сжатие завершено')
-        if (!stopping) void hud.bump(ownerChat)
+        if (!stopping) hudAnchor.refresh()
         startNext()
       })
     }
@@ -1127,7 +1155,11 @@ async function main(): Promise<void> {
         await codex.setGoal(controls.goalThread, 'paused')
         setGoalActive(false)
       }
-      return cancelMedia ? (cancelMedia(), true) : codex.stop()
+      const sideStopped = sides.size > 0 && await codex.stopSide().catch(() => {
+        log.warn('Could not stop a parallel Codex turn')
+        return true
+      })
+      return (cancelMedia ? (cancelMedia(), true) : await codex.stop()) || sideStopped
     }
 
     async function stop(): Promise<void> {
@@ -1349,6 +1381,124 @@ async function main(): Promise<void> {
       return true
     }
 
+    function mainSummary() {
+      const first = inbox.active?.messages[0]
+      const title = first ? taskTitle(agentBody(first.text) ?? first.caption) : goalActive ? 'цель агента' : 'текущая задача'
+      const step = plans.find(item => item.status === 'in_progress')?.content ?? plans.at(-1)?.content
+      return {
+        title: redactSecrets(title, secrets),
+        ...(step ? { step } : {}),
+        elapsedMs: mainStartedAt ? Date.now() - mainStartedAt : 0,
+      }
+    }
+
+    function sideDone(): void {
+      if (stopping) return
+      if (!task && !goalActive && !codex.isRunning && codex.sideRunning === 0) approvals?.cancelAll()
+      if (hudReady) hudAnchor.refresh()
+      startNext()
+      if (selfRestartEnabled) void bridgeRestart.check()
+    }
+
+    // Starts a side turn for one message; false leaves it to the usual path.
+    // The record stays in the inbox until the side turn finished (see side-recovery.ts).
+    function launchSide(message: Message, reuse: string | undefined, provenance: Provenance): boolean {
+      const outcome = inbox.beginFollowUp(message, provenance)
+      if (outcome === 'duplicate') return true
+      if (outcome !== 'accepted') return false
+      if (hudReady) hudAnchor.ownerMessage()
+      const id = message.message_id
+      const epoch = stopEpoch
+      const agent = provenance.origin === 'agent'
+      sides.begin(id, redactSecrets(taskTitle(agentBody(message.text) ?? message.caption), secrets), reuse)
+      const settleSide = () => {
+        try { inbox.finishSide(id) } catch { log.warn('Could not clear a finished parallel turn') }
+      }
+      void (async () => {
+        let started = false
+        // `thread` set: Codex accepted the turn, keep it as a side job; unset: drop the follow-up.
+        const release = (thread?: string) => {
+          if (started) return
+          started = true
+          if (inbox.uncertainFollowUp?.message_id === id) {
+            if (thread) inbox.startSide(id, thread)
+            else inbox.finishFollowUp(id, false)
+          }
+          startNext()
+        }
+        try {
+          const input = await prepareMessages([message])
+          if (stopping || inbox.uncertainFollowUp?.message_id !== id) return
+          if (epoch !== stopEpoch) {
+            // The owner stopped work while the attachment was being prepared.
+            release()
+            return
+          }
+          if (input.kind === 'error') {
+            release()
+            await send(input.text)
+            return
+          }
+          const prompt = agent
+            ? [sideInstructions(mainSummary(), provenance), input.text]
+            : [sideInstructions(mainSummary(), provenance), agentChatInstructions, chatContext([message]), input.text]
+          const result = await codex.runSide(prompt.filter(Boolean).join('\n\n'), agent ? [] : input.images, reuse, thread => {
+            sides.attach(id, thread)
+            release(thread)
+          }, { untrusted: agent })
+          if (stopping) return
+          // Stopped while the side thread was still opening: Codex never took the turn.
+          if (!started) release()
+          if (result.status === 'completed' && result.text.trim()) {
+            // A finished answer is delivered even if the main task was stopped meanwhile.
+            await sendFinalText(redactSecrets(hideLeaseCompletions(result.text), secrets), false, id > 0 ? id : undefined, undefined,
+              sent => sides.remember(sent, result.threadId))
+            settleSide()
+            log.info('Codex side reply delivered')
+          } else if (epoch === stopEpoch) {
+            await send(result.status === 'interrupted' ? 'Параллельная задача остановлена.'
+              : 'Параллельный поток не вернул ответ. Отправь сообщение ещё раз.')
+          }
+        } catch {
+          log.warn('Could not finish a parallel Codex turn')
+          if (stopping) return
+          if (!started && inbox.uncertainFollowUp?.message_id === id) {
+            // Codex never took it: queue it for the main thread as before.
+            started = true
+            inbox.finishFollowUp(id, true)
+            resumeInbox(message)
+          } else if (epoch === stopEpoch) {
+            await send('Не удалось завершить параллельную задачу.').catch(() => undefined)
+          }
+        } finally {
+          // On shutdown the side job stays saved for recovery after the restart.
+          if (!stopping) settleSide()
+          sides.end(id)
+          sideDone()
+        }
+      })().catch(() => log.warn('Could not finish a parallel Codex turn'))
+      return true
+    }
+
+    // Owner Telegram input only.
+    async function queueWhileBusy(message: Message): Promise<void> {
+      try {
+        const outcome = inbox.receive(message, ownerProvenance)
+        if (outcome === 'full') {
+          await send('Очередь заполнена. Отправь это сообщение позже.')
+          return
+        }
+        if (outcome !== 'accepted') return
+        if (hudReady) hudAnchor.ownerMessage()
+        startNext()
+        if (inbox.active?.messages[0]?.message_id !== message.message_id) {
+          await send(busyNotice(mainSummary(), sides.titles, parallel.maxParallel))
+        }
+      } catch {
+        await send('Не удалось сохранить сообщение. Отправь его ещё раз.')
+      }
+    }
+
     async function steerClaimed(messages: Message[], turnId: string): Promise<void> {
       const id = messages[0]!.message_id
       const epoch = stopEpoch
@@ -1379,14 +1529,15 @@ async function main(): Promise<void> {
       } else resumeInbox(messages[0])
     }
 
+    // Owner input only: Telegram updates, owner commands and owner answers to question cards.
     async function acceptInput(message: Message): Promise<void> {
       try {
-        const outcome = inbox.receive(message)
+        const outcome = inbox.receive(message, ownerProvenance)
         if (outcome === 'full') {
           await send('Очередь заполнена. Отправь это сообщение позже.')
         } else if (outcome === 'accepted') {
           // Keep the HUD card under the owner's latest message (debounced in the HUD).
-          if (hudReady) void hud.bump(ownerChat)
+          if (hudReady) hudAnchor.ownerMessage()
           if (message.media_group_id) bufferAlbum(message.media_group_id, message)
           else resumeInbox(message)
         }
@@ -1477,21 +1628,39 @@ async function main(): Promise<void> {
         return
       }
       const turnId = codex.steerableTurn
+      if (parallel.enabled && !action && !ctx.message.media_group_id && (task || goalActive || codex.isRunning) &&
+          (text || hasMedia(ctx.message) || hasRichBody(ctx.message) || unhandledContentKeys(ctx.message).length)) {
+        const decision = routeWhileBusy({ text: text ?? ctx.message.caption, replyTo: ctx.message.reply_to_message?.message_id },
+          { keywords: parallel.keywords, maxParallel: parallel.maxParallel, sides })
+        if (decision.route === 'queue') {
+          await queueWhileBusy(ctx.message)
+          return
+        }
+        if (decision.route === 'side') {
+          try {
+            if (launchSide(ctx.message, decision.thread, ownerProvenance)) return
+          } catch { log.warn('Could not persist the Telegram message for a parallel turn') }
+        }
+      }
       if (!action && text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
           (task || goalActive || codex.isRunning) && process.env.KROT_CODEX_SIDE_REPLY === '1' &&
           (!turnId || /^(?:отдельный|быстрый) вопрос:/iu.test(text)) && sideQuestion(text)) {
         try {
-          const outcome = inbox.beginFollowUp(ctx.message)
+          const outcome = inbox.beginFollowUp(ctx.message, ownerProvenance)
           if (outcome === 'duplicate') return
+          if (outcome === 'accepted' && hudReady) hudAnchor.ownerMessage()
           if (outcome === 'accepted' && launchSideReply(ctx.message, stopEpoch)) return
         } catch { log.warn('Could not persist the Telegram side question') }
       }
       if (!action && !ctx.message.media_group_id && turnId &&
           (text || hasMedia(ctx.message) || hasRichBody(ctx.message) || unhandledContentKeys(ctx.message).length)) {
         try {
-          const outcome = inbox.beginFollowUp(ctx.message)
+          const outcome = inbox.beginFollowUp(ctx.message, ownerProvenance)
           if (outcome === 'duplicate') return
-          if (outcome === 'accepted') return await steerClaimed([ctx.message], turnId)
+          if (outcome === 'accepted') {
+            if (hudReady) hudAnchor.ownerMessage()
+            return await steerClaimed([ctx.message], turnId)
+          }
         } catch { log.warn('Could not persist the Telegram follow-up') }
       }
       if (ctx.message.media_group_id || text || hasMedia(ctx.message) || hasRichBody(ctx.message) ||
@@ -1525,6 +1694,8 @@ async function main(): Promise<void> {
     }
 
     async function deliverReply(reply: InboxReply, messageId: number): Promise<boolean> {
+      // A file-only reply skips sendFinalText's wait, so wait here as well.
+      await hudAnchor.settled()
       await sendFinalText(reply.text, reply.files.length > 0, reply.replyTo, messageId)
       for (const [index, file] of reply.files.entries()) {
         const key = 'file:' + index
@@ -1582,6 +1753,28 @@ async function main(): Promise<void> {
       return !stopping && epoch === stopEpoch ? interim : undefined
     }
 
+    // A message from another agent: one restricted turn (workspace-write, no approvals) and a plain reply
+    // to the owner. No owner-intent classifiers, pending owner task, goal continuation, lease, learning,
+    // memory, bridge restart, question cards, chat actions or attachments.
+    async function runAgentTurn(first: Message, text: string, agent: string, epoch: number): Promise<void> {
+      const id = first.message_id
+      inbox.start(id)
+      const result = await codex.run([agentTurnInstructions(agent), text].join('\n\n'), [], turnId => {
+        try { inbox.assignTurn(id, turnId) } catch { log.warn('Could not persist the Codex turn ID') }
+      }, { untrusted: true })
+      if (stopping) return
+      if (result.status !== 'completed' || !result.text.trim()) {
+        await send(result.status === 'interrupted' ? 'Задача от агента ' + agent + ' остановлена.'
+          : 'Codex не вернул ответ на сообщение агента ' + agent + '.')
+        inbox.finish(id)
+        return
+      }
+      const reply = hideQuestionMarker(hideContinuationMarker(hideLeaseCompletions(result.text)))
+      inbox.complete(id, { text: redactSecrets('Ответ на сообщение агента ' + agent + ':\n\n' + reply, secrets), files: [] })
+      await finishOrdinaryReply(epoch)
+      log.info('Codex answered an agent message', { agent })
+    }
+
     function rememberBlocker(message: Message, objective: string | undefined, report: string, epoch: number): void {
       if (message.message_id > 0 && objective && ownerExecutionTask(objective) &&
           objective.length <= 4000 && ownerTaskBlocked(report) && !stopping && epoch === stopEpoch) {
@@ -1592,8 +1785,13 @@ async function main(): Promise<void> {
     async function finishOrdinaryReply(epoch: number, recovering = false): Promise<void> {
       const active = inbox.active
       if (active?.outcome.stage !== 'ready') return
-      const { reply, continueGoal, restartBridge, restartVerification } = active.outcome
       const id = active.messages[0]!.message_id
+      // Continuation and restart act for the owner: never for an agent's or an unknown record.
+      const fromOwner = inbox.provenance(id).origin === 'owner'
+      const { reply } = active.outcome
+      const continueGoal = fromOwner && active.outcome.continueGoal === true
+      const restartBridge = fromOwner && active.outcome.restartBridge === true
+      const restartVerification = fromOwner && active.outcome.restartVerification === true
       let delivered: boolean
       try {
         delivered = await deliverReply(reply, id)
@@ -1641,9 +1839,9 @@ async function main(): Promise<void> {
         if (selfRestartEnabled) void bridgeRestart.check()
         return
       }
-      const chatId = ownerChat
       const epoch = stopEpoch
       work.begin(first.message_id > 0 ? first.message_id : undefined)
+      mainStartedAt = Date.now()
       task = (async () => {
         let progressResult = 'Работа завершена'
         if (controls.mirror) {
@@ -1672,20 +1870,22 @@ async function main(): Promise<void> {
             inbox.finish(first.message_id)
             return
           }
+          const sender = inbox.provenance(first.message_id)
+          if (sender.origin === 'agent') {
+            await runAgentTurn(first, input.text, sender.agent, epoch)
+            return
+          }
           const editTarget = first.text && first.reply_to_message && !first.forward_origin &&
             requestedChatAction(first.text, agentName) === 'edit' ? first.reply_to_message : undefined
           const ownerText = !editTarget && !first.forward_origin ? (first.text ?? first.caption)?.trim() : undefined
-          const taskText = verification ? undefined : directOwnerTask(first, input.ownerTranscript, !!editTarget)
-          const restartTaskText = restartOwnerText(first, input.ownerTranscript)
-          const mayRestartBridge = selfRestartEnabled && ownerRequestedBridgeRestart(restartTaskText, !proxy)
-          const verificationEligible = !!restartHandoff && mayRestartBridge && ownerRequestedRestartVerification(restartTaskText)
-          if (ownerTaskWithdrawn(taskText) || ownerExecutionTask(taskText)) {
-            controls.setPendingOwnerTask(codex.currentThread)
-          }
-          const pending = controls.pendingOwnerTask
-          const sameTaskStatus = pending && pending.thread === codex.currentThread && ownerStatusCheck(taskText) ? pending : undefined
-          const objective = sameTaskStatus?.objective ?? (ownerTaskContinuationInput(taskText) ? taskText : undefined)
-          const continuation = objective ? automaticContinuation(objective, sameTaskStatus ? taskText : undefined) : undefined
+          const intent = turnIntent(sender, {
+            message: first, transcript: input.ownerTranscript, editing: !!editTarget, verification,
+            selfRestart: selfRestartEnabled, directBackend: !proxy, restartHandoff: !!restartHandoff,
+            thread: codex.currentThread, pending: controls.pendingOwnerTask,
+          })
+          const { taskText, mayRestartBridge, verificationEligible, continuation } = intent
+          if (intent.clearPendingOwnerTask) controls.setPendingOwnerTask(codex.currentThread)
+          const sameTaskStatus = intent.statusCheck
           const leaseCompletion = ownerText && first.message_id > 0 ? leases.completion() : undefined
           const question = questionFallback()
           const began = Date.now()
@@ -1792,12 +1992,13 @@ async function main(): Promise<void> {
           progressResult = 'Работа завершилась с ошибкой'
           if (!stopping && inbox.active?.outcome.stage !== 'ready') await send('Не удалось завершить задачу Codex.')
         } finally {
-          if (!goalActive) approvals?.cancelAll()
+          // A running side turn may be waiting on its own approval card.
+          if (!goalActive && codex.sideRunning === 0) approvals?.cancelAll()
           cancelMedia = undefined
           work.finish()
           finishMirror(progressResult)
-          // Turn done: move the HUD card below the reply.
-          if (!stopping) void hud.bump(chatId)
+          // Turn done: refresh the HUD card in place; it already sits above the reply.
+          if (!stopping) hudAnchor.refresh()
         }
       })().catch(() => log.warn('Could not deliver the turn status')).finally(() => {
         task = undefined
@@ -1837,12 +2038,19 @@ async function main(): Promise<void> {
       const epoch = stopEpoch
       try {
         inbox.retryClaim()
-        const followUp = inbox.uncertainFollowUp
-        if (followUp) {
-          await telegram.sendMessage(ownerChat, 'После перезапуска не удалось подтвердить, дошло ли это уточнение до Codex.',
-            { reply_to_message_id: followUp.message_id })
-          inbox.finishFollowUp(followUp.message_id)
-        }
+        // Never quotes a synthetic id; a refused notice does not block clearing the record.
+        await recoverInterruptedWork(inbox, {
+          send: async notice => {
+            await withoutDeletedQuote(id => telegram.sendMessage(ownerChat, notice.text,
+              id === undefined ? {} : { reply_to_message_id: id }), notice.replyTo)
+          },
+          // Exact-value redaction of known secrets: the agent name and body are untrusted text.
+          deadLetter: record => {
+            writeDeadLetter(paths, 'webhook', { type: 'agent-message-lost', ...record,
+              agent: redactSecrets(record.agent, secrets), text: redactSecrets(record.text, secrets) })
+          },
+          log,
+        })
         const active = inbox.active
         if (active?.outcome.stage === 'ready') {
           await finishOrdinaryReply(epoch, true)
@@ -1855,27 +2063,32 @@ async function main(): Promise<void> {
             if (typeof answer === 'string') {
               for (const message of active.messages) acknowledge(message)
               const targetId = active.messages[0]?.reply_to_message?.message_id
-              const context = active.work?.continuation
-              const mayRestart = selfRestartEnabled && active.work?.mayRestartBridge === true
-              const mayVerify = !!restartHandoff && active.work?.verificationEligible === true
+              const original = active.messages[0]!
+              // Every saved owner capability below needs a saved owner origin; no origin means an agent.
+              const fromOwner = inbox.provenance(original.message_id).origin === 'owner'
+              const work = fromOwner ? active.work : undefined
+              const context = work?.continuation
+              const mayRestart = selfRestartEnabled && work?.mayRestartBridge === true
+              const mayVerify = !!restartHandoff && work?.verificationEligible === true
               const requestedRestart = bridgeRestartReply(answer, mayRestart, false, mayVerify).requested
               const interim = requestedRestart ? undefined : await continuationReply(context, answer, epoch)
-              const original = active.messages[0]!
-              const ownerTaskText = isRestartVerificationMessage(original.message_id) ? undefined
-                : active.work?.voiceTaskText ?? directOwnerTask(original)
-              if (interim === undefined && !context?.statusQuestion) {
+              const ownerTaskText = !fromOwner || isRestartVerificationMessage(original.message_id) ? undefined
+                : work?.voiceTaskText ?? directOwnerTask(original)
+              if (fromOwner && interim === undefined && !context?.statusQuestion) {
                 rememberBlocker(original, ownerTaskText, answer, epoch)
               }
-              const completed = interim === undefined && active.work?.lease
-                ? await leases.completion(active.work.lease).complete(answer) : hideLeaseCompletions(interim ?? answer)
+              const completed = interim === undefined && work?.lease
+                ? await leases.completion(work.lease).complete(answer) : hideLeaseCompletions(interim ?? answer)
               const restart = bridgeRestartReply(completed, mayRestart, interim !== undefined, mayVerify)
-              const extracted = extractAttachments(hideQuestionMarker(hideContinuationMarker(restart.text)))
+              const visible = hideQuestionMarker(hideContinuationMarker(restart.text))
+              // An agent turn never sends workspace files.
+              const extracted = fromOwner ? extractAttachments(visible) : { text: visible, files: [] }
               const reply = { ...extracted, text: leases.finalReply(extracted.text, resolveAskGuardMode(config, log)),
                 ...(targetId === undefined ? {} : { replyTo: targetId }) }
               inbox.complete(original.message_id, { ...reply, text: redactSecrets(reply.text, secrets) },
                 interim !== undefined, restart.requested && epoch === stopEpoch, restart.verify)
               await finishOrdinaryReply(epoch, true)
-              if (!active.work?.continuation && hideContinuationMarker(answer) !== answer) {
+              if (!context && hideContinuationMarker(answer) !== answer) {
                 await send('Сохранил промежуточный ответ. Автоматическое продолжение этой задачи не удалось восстановить.')
               }
             } else {
@@ -1900,7 +2113,7 @@ async function main(): Promise<void> {
           text: 'Задание от авторизованной локальной службы.\n\n' + message,
           chat: { id: ownerId, type: 'private', first_name: 'Telegram' },
           from: { id: ownerId, is_bot: false, first_name: 'Telegram' },
-        })
+        }, ownerProvenance)
         if (outcome === 'accepted') startNext()
         return outcome
       }, approvals && policyToken && /^[a-z0-9_-]{32,128}$/i.test(policyToken) && policyToken !== env.TELEGRAM_WEBHOOK_TOKEN
@@ -1935,6 +2148,53 @@ async function main(): Promise<void> {
           return true
         },
       })
+    }
+    // Inbound inter-agent webhook (KROT_AGENT_WEBHOOK_LISTEN); off keeps no listener.
+    function deliverAgentMessage(delivery: AgentDelivery): DeliverOutcome {
+      if (stopping) return 'stopping'
+      const key = delivery.deliveryId ?? randomUUID()
+      const id = -1 - createHash('sha256').update('krot-agent:' + key).digest().readUIntBE(0, 6)
+      const message: Message = {
+        message_id: id, date: Math.floor(Date.now() / 1000), text: delivery.input,
+        chat: { id: Number(ownerChat), type: 'private', first_name: 'Telegram' },
+        from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
+      }
+      const provenance = agentProvenance(delivery.agentId)
+      const notify = () => { void send(redactSecrets(delivery.notice, secrets)).catch(() => log.warn('Could not notify the owner about an agent message')) }
+      const busy = !!task || goalActive || codex.isRunning
+      const route = routeAgentMessage(delivery.input, { busy, parallel, sides })
+      // Same paths as an owner message (side thread or queue), but never a steer into the main turn.
+      if (route.route === 'side') {
+        try {
+          if (launchSide(message, route.thread, provenance)) {
+            notify()
+            return 'accepted'
+          }
+        } catch { log.warn('Could not persist the agent message for a parallel turn') }
+      }
+      const outcome = inbox.receive(message, provenance)
+      if (outcome !== 'accepted') return outcome
+      notify()
+      if (hudReady) hudAnchor.ownerMessage()
+      if (busy && parallel.enabled) {
+        startNext()
+        if (inbox.active?.messages[0]?.message_id !== id) {
+          void send(busyNotice(mainSummary(), sides.titles, parallel.maxParallel)).catch(() => undefined)
+        }
+      } else resumeInbox(message)
+      return 'accepted'
+    }
+    const agentWebhookConfig = agentWebhookSettings(process.env)
+    if (agentWebhookConfig.kind === 'invalid') {
+      log.error('Agent webhook not started', { reason: agentWebhookConfig.reason })
+    } else if (agentWebhookConfig.kind === 'on') {
+      const { hostname, port } = agentWebhookConfig.settings
+      try {
+        agentWebhook = startAgentWebhook(agentWebhookConfig.settings, deliverAgentMessage, log)
+        log.info('Agent webhook listening', { hostname, port })
+      } catch (error) {
+        log.error('Agent webhook could not listen', { hostname, port, error: error instanceof Error ? error.message : String(error) })
+      }
     }
     if (recoveringInbox) void resumeRecoveredInbox()
     startNext()

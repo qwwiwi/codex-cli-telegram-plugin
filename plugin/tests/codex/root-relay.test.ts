@@ -1,6 +1,9 @@
 import { expect, test } from 'bun:test'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { agentChatTool } from '../../src/codex/chat-actions.js'
+import { CodexSession } from '../../src/codex/session.js'
 
 const relay = join(import.meta.dir, '../../scripts/codex-root-relay.py')
 const localConfig = `
@@ -90,6 +93,12 @@ resume = dict(params, threadId='thread')
 del resume['dynamicTools']
 assert not allowed_request({'method': 'thread/resume', 'params': resume}, opened, config)
 assert allowed_request({'method': 'thread/resume', 'params': dict(resume, excludeTurns=True)}, opened, config)
+# A side thread forks the main thread ephemerally to reuse its prompt cache.
+fork = dict(resume, excludeTurns=True)
+assert allowed_request({'method': 'thread/fork', 'params': dict(fork, ephemeral=True)}, opened, config)
+assert not allowed_request({'method': 'thread/fork', 'params': dict(fork, ephemeral=False)}, opened, config)
+assert not allowed_request({'method': 'thread/start', 'params': dict(params, ephemeral=True)}, opened, config)
+assert not allowed_request({'method': 'thread/fork', 'params': dict(fork, ephemeral=True, threadId='other')}, opened, config)
 
 call = {
     'threadId': 'thread', 'turnId': 'turn', 'callId': 'call', 'namespace': None,
@@ -459,4 +468,88 @@ assert allowed({'method':'thread/goal/set', 'params':{'threadId':'thread','statu
 `, relay], { stderr: 'pipe' })
   expect(check.stderr.toString()).toBe('')
   expect(check.exitCode).toBe(0)
+})
+
+test('root relay admits an agent turn and the owner restore only in the restricted workspace shape', () => {
+  const check = Bun.spawnSync(['python3', '-B', '-c', `
+import runpy
+import sys
+${localConfig}
+
+allowed = runpy.run_path(sys.argv[1])['allowed_request']
+opened = {'thread'}
+text = [{'type': 'text', 'text': 'Verify the summary.', 'text_elements': []}]
+
+def policy(**changes):
+    value = {'type': 'workspaceWrite', 'writableRoots': [config.workspace], 'networkAccess': True,
+             'excludeTmpdirEnvVar': False, 'excludeSlashTmp': False}
+    value.update(changes)
+    return value
+
+def turn(**params):
+    return allowed({'method': 'turn/start', 'params': {'threadId': 'thread', 'input': text, **params}}, opened, config)
+
+assert turn(approvalPolicy='never', sandboxPolicy=policy()), 'agent turn'
+assert turn(approvalPolicy='never', sandboxPolicy=policy(writableRoots=[config.workspace + '/sub'])), 'sub root'
+assert turn(approvalPolicy='on-request', sandboxPolicy=policy()), 'owner restore'
+assert not turn(approvalPolicy='never'), 'policy alone'
+assert not turn(sandboxPolicy=policy()), 'sandbox alone'
+assert not turn(approvalPolicy='never', sandboxPolicy={'type': 'dangerFullAccess'}), 'full access'
+assert not turn(approvalPolicy='on-request', sandboxPolicy={'type': 'dangerFullAccess'}), 'owner full access'
+assert not turn(approvalPolicy='on-failure', sandboxPolicy=policy()), 'other approval'
+assert not turn(approvalPolicy='never', sandboxPolicy=policy(writableRoots=['/'])), 'root'
+assert not turn(approvalPolicy='never', sandboxPolicy=policy(writableRoots=['/srv/test-backend/workspace-other'])), 'sibling'
+assert not turn(approvalPolicy='never', sandboxPolicy=policy(writableRoots=[config.workspace + '/../x'])), 'dotdot'
+assert not turn(approvalPolicy='never', sandboxPolicy=policy(writableRoots=[config.workspace, '/etc'])), 'extra root'
+assert not turn(approvalPolicy='never', sandboxPolicy=policy(writableRoots='/srv')), 'not a list'
+assert not turn(approvalPolicy='never', sandboxPolicy=policy(extra=True)), 'extra key'
+assert not turn(approvalPolicy='never', sandboxPolicy=policy(networkAccess='enabled')), 'network type'
+partial = policy()
+del partial['excludeSlashTmp']
+assert not turn(approvalPolicy='never', sandboxPolicy=partial), 'partial'
+fork = {'cwd': config.workspace, 'approvalPolicy': 'on-request', 'sandbox': 'workspace-write', 'threadId': 'thread',
+        'excludeTurns': True, 'ephemeral': True}
+assert allowed({'method': 'thread/fork', 'params': dict(fork, lastTurnId='turn-1')}, opened, config), 'fork lastTurnId'
+assert not allowed({'method': 'thread/fork', 'params': dict(fork, lastTurnId=7)}, opened, config), 'fork bad lastTurnId'
+`, relay], { stderr: 'pipe' })
+  expect(check.stderr.toString()).toBe('')
+  expect(check.exitCode).toBe(0)
+})
+
+test('root relay admits the turn/start the bridge sends for an agent turn and the owner turn after it', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'krot-relay-turns-'))
+  const log = join(workspace, 'requests.jsonl')
+  const session = new CodexSession({
+    cwd: workspace, stateFile: join(workspace, 'thread.json'), env: { ...process.env, KROT_FAKE_LOG: log },
+    command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'],
+    // The relay opens every thread with approvals on; the owner restore must match it.
+    approve: async () => 'decline',
+  }, () => {})
+  try {
+    await session.initialize()
+    expect((await session.run('agent', [], undefined, { untrusted: true })).status).toBe('completed')
+    expect((await session.run('owner')).status).toBe('completed')
+    const turns = (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [])
+      .map(line => JSON.parse(line) as { method: string; params: Record<string, unknown> })
+      .filter(entry => entry.method === 'turn/start').map(entry => entry.params)
+    expect(turns.map(turn => turn.approvalPolicy)).toEqual(['never', 'on-request'])
+    const check = Bun.spawnSync(['python3', '-B', '-c', `
+import json
+import runpy
+import sys
+${localConfig}
+
+allowed = runpy.run_path(sys.argv[1])['allowed_request']
+config.workspace = sys.argv[2]
+turns = json.load(sys.stdin)
+opened = {turn['threadId'] for turn in turns}
+for turn in turns:
+    assert allowed({'method': 'turn/start', 'params': turn}, opened, config), turn
+`, relay, workspace], { stdin: Buffer.from(JSON.stringify(turns)), stderr: 'pipe' })
+    expect(check.stderr.toString()).toBe('')
+    expect(check.exitCode).toBe(0)
+  } finally {
+    session.close()
+    rmSync(workspace, { recursive: true, force: true })
+  }
 })

@@ -1,0 +1,13 @@
+Codex CLI Telegram Plugin
+Copyright 2026 Dashi Eshiev (qwwiwi) and contributors
+
+This product is a modified version of Krotov-plugin,
+original work by Pavel Krotov (https://github.com/PashaKrot),
+licensed under the Apache License, Version 2.0.
+
+Modifications by Dashi Eshiev (qwwiwi) and contributors, 2026.
+The list of modifications is in CHANGES.md.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this software except in compliance with the License.
+A copy of the License is in the LICENSE file.

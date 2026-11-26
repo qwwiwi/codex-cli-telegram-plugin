@@ -184,7 +184,7 @@ function modeLabel(permissionMode: string): string {
  * PURE — no I/O, no clock — so it is trivially unit-testable against fixed inputs.
  */
 export function renderHud(
-  usage: { usedTokens: number } | null,
+  usage: { usedTokens: number; cachePercent?: number } | null,
   windowTokens: number,
   model?: string,
   work?: HudWorkView,
@@ -223,7 +223,11 @@ export function renderHud(
   const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round(pct / 10)))
   const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
 
-  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowK}k)${tail}`
+  // Prompt-cache share of the last request, only when Codex reported it.
+  const cache = usage.cachePercent
+  const cacheText = typeof cache === 'number' && Number.isFinite(cache)
+    ? ` · кеш ${Math.max(0, Math.min(100, Math.round(cache)))}%` : ''
+  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowK}k)${cacheText}${tail}`
   return { text, keyboard }
 }
 
@@ -314,6 +318,10 @@ export class ContextHud {
   // bump() debounce per chat — a burst of inbound messages collapses to one
   // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
   private readonly lastBumpAt = new Map<string, number>()
+  // Chats whose bump retired the old card but could not send its replacement.
+  // A later updateNow must not create the card below the reply; the next bump
+  // (the next owner message) puts it back in place.
+  private readonly bumpFailed = new Set<string>()
   // FIX-9 (both reviews): per-chat serialization. A concurrent SessionStart +
   // Stop (both firing before the first send persists an id) would each see an
   // empty cache and sendFresh → TWO pinned HUDs. Chaining every HUD operation
@@ -435,7 +443,8 @@ export class ContextHud {
   }
 
   // Re-anchor the pinned card at the BOTTOM of the chat (the server fires this
-  // after an owner message is accepted and when a turn completes). Deletes the
+  // only when an owner message is accepted, so the card sits between that
+  // message and the agent's reply; turn end only refreshes it). Deletes the
   // old message — which also removes its pin, so the one-pin invariant holds —
   // and sends+pins a fresh one. When Telegram refuses the delete (bots cannot
   // delete own messages older than 48h) we fall back to unpinChatMessage so two
@@ -493,7 +502,8 @@ export class ContextHud {
           }
         }
         // sendFresh persists the new id (overwriting the stale one) and pins.
-        await this.sendFresh(chatId, text, keyboard)
+        if (await this.sendFresh(chatId, text, keyboard) === undefined) this.bumpFailed.add(chatId)
+        else this.bumpFailed.delete(chatId)
       } catch (err) {
         this.log.warn('context hud bump failed (ignored)', {
           chat_id: chatId,
@@ -510,6 +520,8 @@ export class ContextHud {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     return this.runSerialized(chatId, async () => {
       try {
+        if (this.bumpFailed.has(chatId) && this.messageIds.get(chatId) === undefined &&
+            this.loadPersisted(chatId) === undefined) return
         const { text, keyboard } = await this.renderCurrent(chatId)
         const ensured = await this.ensureMessage(chatId, text, keyboard)
         // No message and send failed → swallow. Freshly created → already current.

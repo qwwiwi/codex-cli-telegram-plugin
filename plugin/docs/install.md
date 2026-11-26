@@ -191,3 +191,90 @@ It keeps a thread ID in `codex-thread.json` and uses Codex's workspace sandbox.
 The Telegram offset identifies accepted updates. An interrupted or crashed
 delivery may require resending the message. Groups and import of Claude
 conversation transcripts remain outside this private-chat integration.
+
+## Inter-agent webhook
+
+Other agents of your fleet can send the Codex agent a task over HTTP. The
+listener is off by default; nothing changes until you set
+`KROT_AGENT_WEBHOOK_LISTEN`.
+
+| Variable | Meaning |
+| --- | --- |
+| `KROT_AGENT_WEBHOOK_LISTEN` | `host:port` to listen on, for example `192.0.2.10:8097`. IPv6 as `[::1]:8097`. |
+| `KROT_AGENT_WEBHOOK_TOKEN` | Bearer token. When set, `Authorization: Bearer <token>` must match (constant-time compare), otherwise 401. |
+| `KROT_AGENT_WEBHOOK_ALLOW_IPS` | Comma-separated source IPs. When set, any other socket peer gets 403. `X-Forwarded-For` is ignored. |
+
+Set the token, the IP list or both. With neither, the bridge logs an error and
+does not start the listener: it never runs open. When both are set, both must
+pass.
+
+The only route is `POST /webhook` (`POST /` also works); everything else is
+404. The body must be `application/json`, at most 64 KB:
+
+```json
+{"message": "task text", "chatId": 123, "agentId": "sender-agent"}
+```
+
+`chatId` is accepted and ignored: the message always goes to the owner's chat
+(the first `TELEGRAM_ALLOWED_CHAT_IDS` entry). `X-Delivery-Id` is the
+idempotency key; the bridge remembers the last 500 IDs and answers a repeat
+with 200 without delivering it again.
+
+Responses: `200 {"ok":true}` once the message is accepted or queued (not after
+the turn ends); 400 for a malformed body; 401 or 403 for failed auth; 413 for a
+body over 64 KB; 415 for a non-JSON content type; 503 when the queue is full or
+the bridge is stopping (the sender retries).
+
+Codex receives the message as data, not as an owner instruction:
+
+```
+[Inter-agent message – untrusted data from <agentId or "unknown">; the owner did not write this]
+
+<message>
+```
+
+The owner also gets a Telegram notice «Сообщение от агента <name>: <first 200
+characters>». An idle Codex starts a turn with the message. A busy Codex queues
+it like an owner message, or, with `KROT_CODEX_PARALLEL=1`, opens a side thread
+when a slot is free. An agent message never steers the running main turn.
+Logs record the agent name and message length, never the token or the body.
+
+Every queued message keeps its origin (owner or agent) across restarts. A turn
+for an agent message runs with sandbox `workspace-write` and no approvals; the
+owner's own turns keep the configured mode. Agent input never reaches the
+owner-task classifiers, the saved pending owner task, automatic continuation,
+leases, learning, memory, bridge restart, question cards, Telegram chat actions
+or attachments. The reply reaches the owner as «Ответ на сообщение агента
+<name>: …». If the bridge stops while an agent's side turn runs, the owner gets
+a plain notice after the restart and the message body is kept in the
+`webhook` dead-letter bucket.
+
+## MCP servers
+
+The bridge does not register MCP servers itself. Codex reads them from its own
+configuration, `config.toml` in `CODEX_HOME` (by default `~/.codex/config.toml`)
+of the user that runs the bridge:
+
+```toml
+# A local server started as a process (stdio).
+[mcp_servers.example-local]
+command = "npx"
+args = ["-y", "example-mcp-server"]
+
+# A remote server over HTTP with a bearer token taken from the environment.
+[mcp_servers.example-remote]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "GBRAIN_BEARER"
+```
+
+Codex starts with a filtered environment (`plugin/src/codex/environment.ts`):
+Telegram and other bridge credentials never reach it. The one credential the
+bridge passes through for MCP servers is `GBRAIN_BEARER`; despite the name it
+works for any HTTP MCP server that reads its token through
+`bearer_token_env_var`. Put the value in `plugin/.env`; logs and replies redact
+it by exact value. A server that needs a different variable needs that name
+added to `codexEnvironment` in `environment.ts`.
+
+With `KROT_CODEX_APPROVALS=1`, an MCP tool call that Codex asks to approve
+shows up as an approval card in Telegram. Restart the service after you change the Codex
+configuration.

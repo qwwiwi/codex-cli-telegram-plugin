@@ -5,6 +5,7 @@ import { atomicWriteInRoot } from '../autonomy/store.js'
 import type { ContinuationContext } from './continuation.js'
 import type { LeaseTicket } from './lease.js'
 import type { PartStatus } from './reply-delivery.js'
+import { agentFramePrefix, agentProvenance, isProvenance, ownerProvenance, type Provenance } from './provenance.js'
 
 const filename = 'codex-inbox.json'
 const limit = 16
@@ -15,8 +16,13 @@ type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string } |
   { stage: 'ready'; reply: InboxReply; continueGoal?: true; restartBridge?: true; restartVerification?: true;
     delivery?: Record<string, PartStatus> }
 type Active = { messages: Message[]; outcome: Outcome; work?: Work }
+// A side turn Codex accepted (turn/start answered); kept until the side turn finishes.
+// `unconfirmed`: a follow-up held by recovery because its dead letter could not be written.
+export type SideJob = { messages: Message[]; thread?: string; unconfirmed?: true }
 type Pending = { ready: Message[][]; albums: Record<string, Message[]>; accepted: number[]; active?: Active;
-  followUp?: Message[]; followUpIndex?: number }
+  followUp?: Message[]; followUpIndex?: number; sides?: Record<string, SideJob>;
+  // Who wrote each held message, keyed by message id. Missing means "not the owner".
+  origins?: Record<string, Provenance> }
 
 export class CodexInbox {
   private state: Pending = { ready: [], albums: {}, accepted: [] }
@@ -29,10 +35,30 @@ export class CodexInbox {
       const { followUp, ...pending } = saved
       const state: Pending = { ...pending, ...(followUp ? { followUp: Array.isArray(followUp) ? followUp : [followUp] } : {}) }
       if (!Array.isArray(state.ready) || !Array.isArray(state.accepted) || !state.albums ||
-          ![...state.ready, ...Object.values(state.albums), ...(state.active ? [state.active.messages] : []),
-            ...(state.followUp ? [state.followUp] : [])].every(group =>
+          (state.sides !== undefined && (typeof state.sides !== 'object' || state.sides === null ||
+            !Object.values(state.sides).every(side => side.thread === undefined || typeof side.thread === 'string'))) ||
+          (state.origins !== undefined && (typeof state.origins !== 'object' || state.origins === null ||
+            !Object.values(state.origins).every(isProvenance))) ||
+          !groups(state).every(group =>
             Array.isArray(group) && group.length > 0 && group.length <= 10 && group.every(msg => this.isOwner(msg)))) {
         throw new Error('Invalid Codex inbox')
+      }
+      // A file saved before provenance existed: only the webhook framed its input this way.
+      const legacy = !state.origins
+      if (!state.origins) {
+        state.origins = Object.fromEntries(groups(state).flat().map(msg => [String(msg.message_id),
+          msg.message_id < 0 && (msg.text ?? '').startsWith(agentFramePrefix) ? agentProvenance('unknown') : ownerProvenance]))
+      }
+      // Recovery acts on the active record's continuation, restart, lease,
+      // task text and attachments for the owner. Only a saved owner provenance
+      // earns them; a legacy record in flight has none and is treated as an
+      // agent's (fail closed). A merely claimed record is re-run from the queue.
+      const first = state.active?.messages[0]
+      if (legacy && first && state.active?.outcome.stage !== 'claimed') {
+        state.origins[String(first.message_id)] = agentProvenance('unknown')
+      }
+      if (state.active && (!first || state.origins[String(first.message_id)]?.origin !== 'owner')) {
+        state.active = withoutOwnerMetadata(state.active)
       }
       this.state = state
     } catch (error) {
@@ -56,13 +82,44 @@ export class CodexInbox {
     return this.state.followUp?.[0]
   }
 
-  beginFollowUp(message: Message): 'accepted' | 'duplicate' | 'full' {
+  /** Side turns Codex accepted before the bridge stopped. */
+  get sideJobs(): Array<SideJob & { id: number }> {
+    return Object.entries(this.state.sides ?? {}).map(([id, side]) => ({ id: Number(id), ...side }))
+  }
+
+  /** Who wrote a held message; an id the inbox does not hold is never the owner's. */
+  provenance(id: number): Provenance {
+    return this.state.origins?.[String(id)] ?? agentProvenance('unknown')
+  }
+
+  beginFollowUp(message: Message, provenance: Provenance): 'accepted' | 'duplicate' | 'full' {
     if (!this.isOwner(message)) throw new Error('Codex inbox owner mismatch')
     if (this.state.accepted.includes(message.message_id)) return 'duplicate'
     if (this.state.followUp || this.state.ready.length + Object.keys(this.state.albums).length >= limit) return 'full'
     this.save({ ...this.state, accepted: [...this.state.accepted.slice(-299), message.message_id],
-      followUp: [message], followUpIndex: this.state.ready.length })
+      followUp: [message], followUpIndex: this.state.ready.length, origins: this.withOrigin(message, provenance) })
     return 'accepted'
+  }
+
+  /** Codex accepted the side turn of the uncertain follow-up: keep it as a side job until it finishes. */
+  startSide(id: number, thread: string): void {
+    const { followUp, followUpIndex: _index, ...pending } = this.state
+    if (followUp?.[0]?.message_id !== id) return
+    this.save({ ...pending, sides: { ...pending.sides, [String(id)]: { messages: followUp, thread } } })
+  }
+
+  /** Moves the uncertain follow-up out of the queue's way, keeping its record as a side job. */
+  holdFollowUp(id: number): void {
+    const { followUp, followUpIndex: _index, ...pending } = this.state
+    if (followUp?.[0]?.message_id !== id) return
+    this.save({ ...pending, sides: { ...pending.sides, [String(id)]: { messages: followUp, unconfirmed: true } } })
+  }
+
+  finishSide(id: number): void {
+    const sides = { ...this.state.sides }
+    if (!Object.hasOwn(sides, String(id))) return
+    delete sides[String(id)]
+    this.save({ ...this.state, sides })
   }
 
   finishFollowUp(id: number, enqueue = false): void {
@@ -74,7 +131,7 @@ export class CodexInbox {
     }
   }
 
-  receive(message: Message, prioritize = false): 'accepted' | 'duplicate' | 'full' {
+  receive(message: Message, provenance: Provenance, prioritize = false): 'accepted' | 'duplicate' | 'full' {
     if (!this.isOwner(message)) throw new Error('Codex inbox owner mismatch')
     if (this.state.accepted.includes(message.message_id)) return 'duplicate'
     const group = message.media_group_id
@@ -82,14 +139,15 @@ export class CodexInbox {
     const count = this.state.ready.length + Object.keys(this.state.albums).length + Number(!!this.state.followUp)
     if (count >= limit && (!group || !Object.hasOwn(this.state.albums, group))) return 'full'
     const accepted = [...this.state.accepted.slice(-299), message.message_id]
+    const origins = this.withOrigin(message, provenance)
     if (group) {
       const existing = Object.hasOwn(this.state.albums, group) ? this.state.albums[group]! : []
       if (existing.length >= 10) return 'full'
-      this.save({ ...this.state, accepted, albums: { ...this.state.albums, [group]: [...existing, message] } })
+      this.save({ ...this.state, accepted, origins, albums: { ...this.state.albums, [group]: [...existing, message] } })
     } else {
       const ready = prioritize ? [[message], ...this.state.ready] : [...this.state.ready, [message]]
       const followUpIndex = this.state.followUpIndex
-      this.save({ ...this.state, accepted, ready,
+      this.save({ ...this.state, accepted, ready, origins,
         ...(prioritize && followUpIndex !== undefined ? { followUpIndex: followUpIndex + 1 } : {}) })
     }
     return 'accepted'
@@ -197,8 +255,33 @@ export class CodexInbox {
       message.from?.id === this.ownerId && !message.from.is_bot && Number.isSafeInteger(message.message_id)
   }
 
+  private withOrigin(message: Message, provenance: Provenance): Record<string, Provenance> {
+    return { ...this.state.origins, [String(message.message_id)]: provenance }
+  }
+
   private save(state: Pending): void {
+    // Keep origins only for messages the inbox still holds.
+    const held = new Set(groups(state).flat().map(msg => String(msg.message_id)))
+    state = { ...state, origins: Object.fromEntries(Object.entries(state.origins ?? {}).filter(([id]) => held.has(id))) }
     atomicWriteInRoot({ root: this.root }, filename, JSON.stringify(state) + '\n')
     this.state = state
   }
+}
+
+// The active record as an agent's: the reply text and its delivery state stay,
+// everything that acts on the owner's behalf goes, workspace attachments too
+// (the running recovery likewise extracts them only for the owner).
+function withoutOwnerMetadata(active: Active): Active {
+  const { work: _work, ...rest } = active
+  if (active.outcome.stage !== 'ready') return { ...rest, outcome: active.outcome }
+  const { reply, delivery } = active.outcome
+  const textParts = Object.entries(delivery ?? {}).filter(([key]) => !key.startsWith('file:'))
+  const outcome: Outcome = { stage: 'ready', reply: { ...reply, files: [] },
+    ...(textParts.length ? { delivery: Object.fromEntries(textParts) } : {}) }
+  return { ...rest, outcome }
+}
+
+function groups(state: Pending): Message[][] {
+  return [...state.ready, ...Object.values(state.albums), ...(state.active ? [state.active.messages] : []),
+    ...(state.followUp ? [state.followUp] : []), ...Object.values(state.sides ?? {}).map(side => side.messages)]
 }

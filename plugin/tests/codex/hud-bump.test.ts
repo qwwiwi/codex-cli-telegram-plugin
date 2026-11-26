@@ -143,3 +143,27 @@ test('a card the owner already deleted is replaced by a fresh one at the bottom'
   expect(messages.get(bottom)).toStartWith('HUD ')
   expect(persisted()).toBe(bottom)
 })
+
+test('F4: a replacement that failed to send is not recreated below the reply by the turn-end refresh', async () => {
+  const failures: { send?: boolean } = {}
+  const { hud, messages, calls, owner } = fixture(failures)
+  setSystemTime(new Date(1_000_000))
+  await hud.updateNow(OWNER)
+  owner('owner message')
+  failures.send = true
+  await hud.bump(OWNER)
+  failures.send = false
+  owner('agent reply')
+  calls.length = 0
+
+  await hud.updateNow(OWNER)
+
+  expect(calls).not.toContain('send')
+  expect([...messages.values()].at(-1)).toBe('agent reply')
+
+  // The next owner message bumps a fresh card into place again.
+  setSystemTime(new Date(1_000_000 + 60_000))
+  owner('next owner message')
+  await hud.bump(OWNER)
+  expect([...messages.values()].at(-1)).toStartWith('HUD ')
+})

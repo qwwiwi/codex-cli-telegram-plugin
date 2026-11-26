@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { Message } from 'grammy/types'
 import { executeChatAction, requestedChatAction } from '../../src/codex/chat-actions.js'
 import { CodexInbox } from '../../src/codex/inbox.js'
+import { ownerProvenance } from '../../src/codex/provenance.js'
 import { automaticContinuation } from '../../src/codex/continuation.js'
 
 const owner = { id: 100, is_bot: false as const, first_name: 'Owner' }
@@ -19,7 +20,7 @@ test('preserves verified continuation across a restart before and after sending 
   try {
     const continuation = automaticContinuation('finish the task')
     let inbox = new CodexInbox(root, owner.id)
-    inbox.receive(message(7))
+    inbox.receive(message(7), ownerProvenance)
     inbox.take()
     inbox.start(7, { continuation: continuation.context })
     inbox.assignTurn(7, 'turn-7')
@@ -37,8 +38,8 @@ test('cancelling continuation survives restart without discarding queued work', 
   const root = mkdtempSync(join(tmpdir(), 'krot-cancel-handoff-'))
   try {
     let inbox = new CodexInbox(root, owner.id)
-    inbox.receive(message(7))
-    inbox.receive(message(8))
+    inbox.receive(message(7), ownerProvenance)
+    inbox.receive(message(8), ownerProvenance)
     inbox.take()
     inbox.start(7, { continuation: automaticContinuation('finish').context })
     inbox.complete(7, { text: 'Progress', files: [] }, true)
@@ -54,11 +55,11 @@ test('recovers queued work and album fragments after restart without duplicating
   const root = mkdtempSync(join(tmpdir(), 'krot-durable-inbox-'))
   try {
     let inbox = new CodexInbox(root, owner.id)
-    expect(inbox.receive(message(1, { text: 'first' }))).toBe('accepted')
-    inbox.receive(message(3, { media_group_id: '123' }))
+    expect(inbox.receive(message(1, { text: 'first' }), ownerProvenance)).toBe('accepted')
+    inbox.receive(message(3, { media_group_id: '123' }), ownerProvenance)
     inbox = new CodexInbox(root, owner.id)
-    expect(inbox.receive(message(3, { media_group_id: '123' }))).toBe('duplicate')
-    inbox.receive(message(2, { media_group_id: '123' }))
+    expect(inbox.receive(message(3, { media_group_id: '123' }), ownerProvenance)).toBe('duplicate')
+    inbox.receive(message(2, { media_group_id: '123' }), ownerProvenance)
     expect(inbox.sealAlbum('123')).toBe(true)
     expect(inbox.take()?.map(m => m.message_id)).toEqual([1])
     inbox = new CodexInbox(root, owner.id)
@@ -68,7 +69,7 @@ test('recovers queued work and album fragments after restart without duplicating
     expect(inbox.take()?.map(m => m.message_id)).toEqual([2, 3])
     inbox.finish(2)
     expect(inbox.take()).toBeUndefined()
-    expect(() => inbox.receive(message(4, { from: bot }))).toThrow('owner mismatch')
+    expect(() => inbox.receive(message(4, { from: bot }), ownerProvenance)).toThrow('owner mismatch')
   } finally { rmSync(root, { force: true, recursive: true }) }
 })
 
@@ -76,8 +77,8 @@ test('moves a whole album atomically to the active follow-up and restores its or
   const root = mkdtempSync(join(tmpdir(), 'krot-durable-album-'))
   try {
     let inbox = new CodexInbox(root, owner.id)
-    inbox.receive(message(13, { media_group_id: 'photo-group' }))
-    inbox.receive(message(12, { media_group_id: 'photo-group' }))
+    inbox.receive(message(13, { media_group_id: 'photo-group' }), ownerProvenance)
+    inbox.receive(message(12, { media_group_id: 'photo-group' }), ownerProvenance)
     expect(inbox.claimAlbumFollowUp('photo-group')?.map(m => m.message_id)).toEqual([12, 13])
     inbox = new CodexInbox(root, owner.id)
     expect(inbox.uncertainFollowUp?.message_id).toBe(12)
@@ -91,7 +92,7 @@ test('preserves the claimed request, the assigned turn and the undelivered resul
   const root = mkdtempSync(join(tmpdir(), 'krot-durable-inbox-'))
   try {
     let inbox = new CodexInbox(root, owner.id)
-    inbox.receive(message(9, { text: 'request' }))
+    inbox.receive(message(9, { text: 'request' }), ownerProvenance)
     inbox.take()
     inbox.start(9)
     inbox.assignTurn(9, 'turn-9')
@@ -109,9 +110,9 @@ test('reserves the follow-up queue slot and retains its order after fallback or 
   const root = mkdtempSync(join(tmpdir(), 'krot-follow-up-order-'))
   try {
     let inbox = new CodexInbox(root, owner.id)
-    inbox.beginFollowUp(message(5))
-    for (let id = 6; id < 21; id++) expect(inbox.receive(message(id))).toBe('accepted')
-    expect(inbox.receive(message(21))).toBe('full')
+    inbox.beginFollowUp(message(5), ownerProvenance)
+    for (let id = 6; id < 21; id++) expect(inbox.receive(message(id), ownerProvenance)).toBe('accepted')
+    expect(inbox.receive(message(21), ownerProvenance)).toBe('full')
     inbox = new CodexInbox(root, owner.id)
     inbox.finishFollowUp(5, true)
     expect(inbox.size).toBe(16)

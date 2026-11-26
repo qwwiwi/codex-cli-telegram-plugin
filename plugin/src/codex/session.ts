@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { resolve as resolvePath } from 'node:path'
 import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rpc.js'
 import { sameFilePatch, type NativeFileChange } from './file-approval.js'
 import { agentChatTool, type AgentChatActions } from './chat-actions.js'
@@ -20,6 +21,31 @@ export type ApprovalRequest = {
 // Codex sandbox modes the bridge may request. 'danger-full-access' is meant only
 // for a dedicated unprivileged OS user; with approvals off it means no cards.
 export type CodexSandboxMode = 'workspace-write' | 'danger-full-access'
+
+// Per-turn sandbox override of the Codex app-server (v2 TurnStartParams.sandboxPolicy,
+// schema of `codex app-server generate-ts`). Every field is required: a partial
+// object is rejected by the server, so it must also fail tsc here.
+// The bridge never sends externalSandbox; its NetworkAccess enum values are not
+// pinned here: <<PLACEHOLDER: NetworkAccess literal values from the generated schema>>.
+export type CodexNetworkAccess = string
+export type CodexSandboxPolicy =
+  | { type: 'dangerFullAccess' }
+  | { type: 'readOnly'; networkAccess: boolean }
+  | { type: 'externalSandbox'; networkAccess: CodexNetworkAccess }
+  | {
+    type: 'workspaceWrite'
+    writableRoots: string[]
+    networkAccess: boolean
+    excludeTmpdirEnvVar: boolean
+    excludeSlashTmp: boolean
+  }
+
+// Per-turn options. An untrusted turn answers input the owner did not write
+// (another agent): it runs in workspace-write without approvals and never
+// reaches owner approval cards, owner questions or Telegram chat actions.
+export interface TurnOptions {
+  untrusted?: boolean
+}
 
 export type PolicyApprovalRequest = ApprovalRequest & {
   kind: 'command' | 'file'
@@ -43,13 +69,16 @@ type Settings = {
   sandbox?: CodexSandboxMode
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
   chatAction?: (key: string, args: unknown, current: () => boolean) => ReturnType<AgentChatActions['call']>
+  // Operational notes without user content, e.g. a fallback the bridge took.
+  onWarning?: (message: string) => void
 }
 
 type Result = { status: 'completed' | 'interrupted' | 'failed'; text: string }
 type SessionStatus = {
   hasThread: boolean
   model: string | undefined
-  usage: { usedTokens: number; windowTokens: number } | undefined
+  // cachePercent: share of the last main request's input read from the prompt cache.
+  usage: { usedTokens: number; windowTokens: number; cachePercent?: number } | undefined
 }
 
 type Execution = {
@@ -60,6 +89,7 @@ type Execution = {
 
 type Turn = Execution & {
   stop: boolean
+  untrusted?: true
   lastText: string
   finalText?: string
   children: Map<string, Execution>
@@ -75,6 +105,13 @@ function recordFileChange(execution: Execution, item: Record<string, unknown>): 
       ? [{ path: change.path, diff: change.diff, kind: object(change.kind) }] : []
   })
   if (changes.length === item.changes.length) execution.fileChanges.set(item.id, changes)
+}
+
+// Cached input is part of input in Codex token usage; missing or odd numbers give no share.
+function cacheShare(input: unknown, cached: unknown): number | undefined {
+  if (typeof input !== 'number' || !Number.isFinite(input) || input <= 0 ||
+      typeof cached !== 'number' || !Number.isFinite(cached) || cached < 0) return
+  return Math.min(100, Math.round(cached / input * 100))
 }
 
 function sameShellCommand(native: string, hook: string): boolean {
@@ -108,6 +145,19 @@ export class CodexSession {
   private lastActivity = Date.now()
   private active: Turn | undefined
   private goalTurn: Turn | undefined
+  // Parallel side turns, keyed by their own thread. Side threads never become
+  // the main conversation and are never treated as children of a main turn.
+  private readonly sides = new Map<string, Turn>()
+  // Known side threads and the model each one runs on (undefined: not known).
+  private readonly sideThreads = new Map<string, string | undefined>()
+  // Owner sides fork the main thread until the App Server refuses a fork once.
+  private forkSides = true
+  // Last main-thread turn that finished; a fork during a running turn stops there.
+  private lastMainTurn: { threadId: string; id: string } | undefined
+  // Side turns whose thread is still opening; stopSide() reaches them too.
+  private readonly startingSides = new Set<{ stop: boolean }>()
+  // Threads whose last turn ran restricted; Codex keeps turn overrides for later turns.
+  private readonly restrictedThreads = new Set<string>()
 
   constructor(private readonly settings: Settings, onClose: () => void) {
     try {
@@ -123,6 +173,7 @@ export class CodexSession {
 
     this.rpc = new CodexRpc(settings.cwd, settings.env, event => this.receive(event), () => {
       this.active?.finish({ status: 'failed', text: '' })
+      for (const side of this.sides.values()) side.finish({ status: 'failed', text: '' })
       onClose()
     }, settings.command, request => this.requestApproval(request))
   }
@@ -286,12 +337,16 @@ export class CodexSession {
     this.model = undefined
   }
 
-  async run(text: string, imagePaths: readonly string[] = [], onStarted?: (turnId: string) => void): Promise<Result> {
+  async run(text: string, imagePaths: readonly string[] = [], onStarted?: (turnId: string) => void,
+    options: TurnOptions = {}): Promise<Result> {
     return this.withTurn(async (threadId, turn) => {
+      if (options.untrusted) turn.untrusted = true
       const model = this.settings.selectedModel?.() ?? this.settings.model
       const response = await this.rpc.request('turn/start', {
         threadId,
-        ...(model ? { model } : {}),
+        // A turn override stays for later turns; resending an unchanged model is noise.
+        ...(model && model !== this.model ? { model } : {}),
+        ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
           ...imagePaths.map(path => ({ type: 'localImage', path })),
@@ -303,6 +358,148 @@ export class CodexSession {
       if (model) this.model = model
       if (!turn.id) this.setTurnId(turn, id)
     })
+  }
+
+  get sideRunning(): number {
+    return this.sides.size + this.startingSides.size
+  }
+
+  /** True when the running turn with this id answers untrusted (agent) input. */
+  isUntrustedTurn(threadId: string, turnId: string): boolean {
+    return this.runningTurns().some(turn => turn.threadId === threadId && turn.id === turnId && turn.untrusted === true)
+  }
+
+  // Turn overrides: an untrusted turn is restricted; the next trusted turn on
+  // that thread restores the configured mode. Other turns send nothing extra.
+  private turnPermissions(threadId: string, untrusted: boolean):
+    { approvalPolicy?: 'on-request' | 'never'; sandboxPolicy?: CodexSandboxPolicy } {
+    if (untrusted) {
+      this.restrictedThreads.add(threadId)
+      return { approvalPolicy: 'never', sandboxPolicy: this.workspaceWritePolicy() }
+    }
+    if (!this.restrictedThreads.delete(threadId)) return {}
+    const { approvalPolicy, sandbox } = this.permissions()
+    return {
+      approvalPolicy,
+      sandboxPolicy: sandbox === 'danger-full-access' ? { type: 'dangerFullAccess' } : this.workspaceWritePolicy(),
+    }
+  }
+
+  // Writes only inside the bridge workspace; network stays on because agent
+  // tasks need git, gh and remote MCP servers. Temp directories keep their default access.
+  private workspaceWritePolicy(): CodexSandboxPolicy {
+    return {
+      type: 'workspaceWrite',
+      writableRoots: [resolvePath(this.settings.cwd)],
+      networkAccess: true,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    }
+  }
+
+  // Runs one turn on a side thread next to the main conversation. `reuse`
+  // continues an earlier side thread; otherwise an owner side forks the main
+  // thread and an untrusted (agent) side starts a fresh one.
+  // `onStarted` fires once Codex accepted the turn.
+  async runSide(text: string, imagePaths: readonly string[] = [], reuse?: string,
+    onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string }> {
+    if (reuse !== undefined && (!this.sideThreads.has(reuse) || this.sides.has(reuse))) {
+      throw new Error('This side thread is not available')
+    }
+    const model = this.settings.selectedModel?.() ?? this.settings.model
+    // Registered before thread/start so a stop during start-up is never missed.
+    const starting = { stop: false }
+    this.startingSides.add(starting)
+    let threadId: string
+    try {
+      threadId = reuse ?? await this.openSideThread(model, !!options.untrusted)
+    } finally {
+      this.startingSides.delete(starting)
+    }
+    if (starting.stop) return { status: 'interrupted', text: '', threadId }
+    let finish!: Turn['finish']
+    const completed = new Promise<Result>(resolve => { finish = resolve })
+    const turn: Turn = {
+      threadId, stop: false, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
+      ...(options.untrusted ? { untrusted: true as const } : {}),
+    }
+    this.sides.set(threadId, turn)
+    try {
+      const sendModel = !!model && model !== this.sideThreads.get(threadId)
+      const response = await this.rpc.request('turn/start', {
+        threadId,
+        ...(sendModel ? { model } : {}),
+        ...this.turnPermissions(threadId, !!options.untrusted),
+        input: [
+          { type: 'text', text, text_elements: [] },
+          ...imagePaths.map(path => ({ type: 'localImage', path })),
+        ],
+      })
+      const id = object(response.turn).id
+      if (typeof id !== 'string') throw new Error('Codex did not return a side turn ID')
+      if (sendModel && this.sideThreads.has(threadId)) this.sideThreads.set(threadId, model)
+      if (!turn.id) this.setTurnId(turn, id)
+      onStarted?.(threadId)
+      return { ...await completed, threadId }
+    } finally {
+      if (this.sides.get(threadId) === turn) this.sides.delete(threadId)
+    }
+  }
+
+  // Interrupts every running side turn; true when there was one.
+  async stopSide(): Promise<boolean> {
+    const starting = [...this.startingSides].filter(side => !side.stop)
+    for (const side of starting) side.stop = true
+    const turns = [...this.sides.values()].filter(turn => !turn.stop)
+    for (const turn of turns) turn.stop = true
+    await Promise.all(turns.filter(turn => turn.id).map(turn =>
+      this.rpc.request('turn/interrupt', { threadId: turn.threadId, turnId: turn.id })))
+    return turns.length + starting.length > 0
+  }
+
+  private async openSideThread(model: string | undefined, untrusted: boolean): Promise<string> {
+    // Deliberately not openThread: the main thread, its model and usage stay as they are.
+    const fork = untrusted ? undefined : await this.forkMainThread()
+    const reply = fork ?? await this.rpc.request('thread/start', {
+      cwd: this.settings.cwd,
+      ...this.permissions(),
+      ...(model ? { model } : {}),
+      ...(this.settings.chatAction ? { dynamicTools: [agentChatTool] } : {}),
+    })
+    const id = object(reply.thread).id
+    if (typeof id !== 'string' || !id || id === this.threadId) throw new Error('Codex did not return a side thread ID')
+    this.sideThreads.set(id, typeof reply.model === 'string' ? reply.model : fork ? undefined : model)
+    if (this.sideThreads.size > 64) {
+      for (const old of this.sideThreads.keys()) {
+        if (!this.sides.has(old)) { this.sideThreads.delete(old); break }
+      }
+    }
+    return id
+  }
+
+  // An ephemeral fork of the main thread shares its prompt prefix and, per the
+  // Codex source, its prompt-cache key. Undefined: start a fresh thread instead.
+  private async forkMainThread(): Promise<Record<string, unknown> | undefined> {
+    const main = this.threadId
+    if (!this.forkSides || !main || this.needsResume) return
+    // A running main turn is half-finished: fork up to the last finished turn
+    // (ThreadForkParams.lastTurnId) or, with none known, start a fresh thread.
+    const running = this.isRunning
+    const lastTurnId = this.lastMainTurn?.threadId === main ? this.lastMainTurn.id : undefined
+    if (running && !lastTurnId) return
+    try {
+      const reply = await this.rpc.request('thread/fork', {
+        threadId: main, cwd: this.settings.cwd, excludeTurns: true, ephemeral: true, ...this.permissions(),
+        ...(running ? { lastTurnId } : {}),
+      })
+      const id = object(reply.thread).id
+      if (typeof id === 'string' && id && id !== main) return reply
+    } catch {
+      // Refused (older App Server, root relay): handled below like a bad reply.
+    }
+    this.forkSides = false
+    this.settings.onWarning?.('Codex refused thread/fork for a side thread; side threads use thread/start from now on')
+    return undefined
   }
 
   async compact(): Promise<Result['status']> {
@@ -401,7 +598,27 @@ export class CodexSession {
     this.model = typeof reply.model === 'string' ? reply.model : undefined
     if (id !== this.threadId) this.usage = undefined
     this.saveThread(id)
+    if (expected) await this.seedForkAnchor(id)
     return id
+  }
+
+  // A resumed thread finished its turns before this process saw any event, so
+  // the fork anchor comes from its history: the latest terminal turn. Best
+  // effort: with no answer an owner side starts a fresh thread, as before.
+  private async seedForkAnchor(threadId: string): Promise<void> {
+    if (!this.forkSides) return
+    try {
+      // The exact shape the root relay admits for thread/turns/list.
+      const result = await this.rpc.request('thread/turns/list', {
+        threadId, limit: 10, itemsView: 'full', sortDirection: 'desc',
+      }, 5000)
+      const turns = Array.isArray(result.data) ? result.data.map(object) : []
+      const last = turns.find(turn => typeof turn.id === 'string' && turn.id !== '' &&
+        (turn.status === 'completed' || turn.status === 'interrupted' || turn.status === 'failed'))
+      if (last && this.threadId === threadId) this.lastMainTurn = { threadId, id: last.id as string }
+    } catch {
+      this.settings.onWarning?.('Could not read the resumed Codex history; a side thread may start fresh')
+    }
   }
 
   private saveThread(id: string | null): void {
@@ -434,14 +651,25 @@ export class CodexSession {
     }
     if (method === 'thread/tokenUsage/updated' && params.threadId === this.threadId) {
       const usage = object(params.tokenUsage)
-      const usedTokens = object(usage.last).totalTokens
+      const last = object(usage.last)
+      const usedTokens = last.totalTokens
       const windowTokens = usage.modelContextWindow
       if (typeof usedTokens === 'number' && Number.isFinite(usedTokens) && usedTokens >= 0
           && typeof windowTokens === 'number' && Number.isFinite(windowTokens) && windowTokens > 0) {
-        this.usage = { usedTokens, windowTokens }
+        const cachePercent = cacheShare(last.inputTokens, last.cachedInputTokens)
+        this.usage = { usedTokens, windowTokens, ...(cachePercent === undefined ? {} : { cachePercent }) }
       }
     }
     const observedId = typeof params.turnId === 'string' ? params.turnId : object(params.turn).id
+    if (method === 'turn/completed' && typeof observedId === 'string' && typeof params.threadId === 'string' &&
+        params.threadId === this.threadId) {
+      this.lastMainTurn = { threadId: params.threadId, id: observedId }
+    }
+    if (typeof params.threadId === 'string' && this.sideThreads.has(params.threadId)) {
+      const side = this.sides.get(params.threadId)
+      if (side) this.receiveTurnEvent(side, method, params, false)
+      return
+    }
     if (method === 'turn/started' && typeof observedId === 'string' && typeof params.threadId === 'string' &&
         params.threadId === this.threadId && this.settings.mayRunGoal?.(params.threadId) &&
         (!this.active || !!this.active.id && this.active.id !== observedId)) {
@@ -470,14 +698,18 @@ export class CodexSession {
       }
     }
     if (!active || params.threadId !== active.threadId) return
+    this.receiveTurnEvent(active, method, params, true)
+  }
+
+  private receiveTurnEvent(active: Turn, method: string, params: Record<string, unknown>, progress: boolean): void {
     if (method === 'turn/started') {
       const id = object(params.turn).id
       if (!active.id && typeof id === 'string') this.setTurnId(active, id)
-      this.settings.onProgress?.('turn')
+      if (progress) this.settings.onProgress?.('turn')
     } else if (method === 'item/started') {
       if (active.id && params.turnId !== active.id) return
       const item = object(params.item)
-      if (typeof item.type === 'string') this.settings.onProgress?.(item.type)
+      if (progress && typeof item.type === 'string') this.settings.onProgress?.(item.type)
       recordFileChange(active, item)
     } else if (method === 'item/completed') {
       if (active.id && params.turnId !== active.id) return
@@ -501,7 +733,7 @@ export class CodexSession {
   }
 
   private runningTurns(): Turn[] {
-    return [this.active, this.goalTurn].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
+    return [this.active, this.goalTurn, ...this.sides.values()].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
   }
 
   private async approveInTurn(
@@ -538,7 +770,11 @@ export class CodexSession {
       .flatMap(owner => [owner, ...owner.children.values()].filter(execution => execution.id === operation.turnId)
         .map(execution => ({ owner, execution })))
     const scope = matches.length === 1 ? matches[0] : await this.approvalExecution(operation.threadId, operation.turnId)
-    if (!scope) return approve(request)
+    if (!scope) {
+      const untrusted = this.runningTurns().some(turn => turn.untrusted && turn.threadId === operation.threadId)
+      return untrusted ? 'decline' : approve(request)
+    }
+    if (scope.owner.untrusted) return 'decline'
     const { owner, execution } = scope
     const canRecordReceipt = owner.threadId === operation.threadId
     const decision = await this.approveInTurn(execution, canRecordReceipt ? {
@@ -581,14 +817,15 @@ export class CodexSession {
       const { threadId, turnId, callId, namespace, tool, arguments: args } = params
       const run = this.settings.chatAction
       const turn = this.runningTurns().find(turn => turn.threadId === threadId && turn.id === turnId)
-      if (!run || !turn || namespace !== null || tool !== agentChatTool.name ||
+      if (!run || !turn || turn.untrusted || namespace !== null || tool !== agentChatTool.name ||
           typeof callId !== 'string' || !/^[\w.:-]{1,128}$/u.test(callId)) return
       return this.withServerRequest(id, turn.threadId, signal =>
         run(JSON.stringify([threadId, turnId, callId]), args, () => !signal.aborted && this.runningTurns().includes(turn)))
     }
     if (method === 'item/tool/requestUserInput') {
       const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active
-      if (!current || current.stop || current.threadId !== params.threadId || current.id !== params.turnId) return { answers: {} }
+      if (!current || current.stop || current.untrusted || current.threadId !== params.threadId ||
+          current.id !== params.turnId) return { answers: {} }
       const ask = this.settings.ask
       return { answers: ask
         ? await this.withServerRequest(id, current.threadId, signal => ask(params.questions, signal))
@@ -600,7 +837,7 @@ export class CodexSession {
       if (!request || !approve) return { action: 'cancel' }
       const decision = await this.withServerRequest(id, request.threadId, async signal => {
         const scope = await this.approvalExecution(request.threadId, request.turnId)
-        if (signal.aborted || !scope) return 'cancel'
+        if (signal.aborted || !scope || scope.owner.untrusted) return 'cancel'
         const { owner, execution } = scope
         const decision = await this.approveInTurn(execution, request.operation, approve, signal)
         if (signal.aborted || !this.runningTurns().includes(owner) ||
@@ -637,7 +874,7 @@ export class CodexSession {
     } else if (commandRequest && !network && params.approvalId != null) return { decision: 'decline' }
     if (!commandRequest && params.grantRoot) return { decision: 'decline' }
     const scope = await this.approvalExecution(params.threadId, params.turnId)
-    if (!scope) return { decision: 'decline' }
+    if (!scope || scope.owner.untrusted) return { decision: 'decline' }
     const { owner, execution } = scope
     const changes = commandRequest ? undefined : execution.fileChanges.get(params.itemId)
     const target = destination

@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 const emit = (message: object) => process.stdout.write(JSON.stringify(message) + '\n')
@@ -8,10 +9,17 @@ let pendingApproval = ''
 let childTurn = ''
 let resolveMcpDuringLookup: { requestId: string; threadId: string; turnId: string } | undefined
 let repeatedApproval: { prefix: string; results: Map<string, string> } | undefined
+// Threads started while the main turn waits are side threads; they keep the main thread intact.
+const sideThreads = new Set<string>()
+let mainWaiting = false
+let sideTurnNumber = 0
+let pendingSideApproval: { id: string; threadId: string; turnId: string } | undefined
 const goalState: { current: { objective: string; status: string; origin: string } | null } = { current: null }
 
 for await (const line of createInterface({ input: process.stdin })) {
   const { id, method, params, result } = JSON.parse(line)
+  // KROT_FAKE_LOG: tests read back every client request (one JSON line each).
+  if (method && process.env.KROT_FAKE_LOG) appendFileSync(process.env.KROT_FAKE_LOG, JSON.stringify({ method, params }) + '\n')
   if (!method && repeatedApproval && typeof id === 'string' && id.startsWith(repeatedApproval.prefix)) {
     const { prefix, results } = repeatedApproval
     results.set(id, result?.decision ?? 'unsupported')
@@ -30,6 +38,15 @@ for await (const line of createInterface({ input: process.stdin })) {
       } })
       repeatedApproval = undefined
     }
+    continue
+  }
+  if (!method && pendingSideApproval && id === pendingSideApproval.id) {
+    const { threadId: side, turnId } = pendingSideApproval
+    pendingSideApproval = undefined
+    emit({ method: 'item/completed', params: {
+      threadId: side, turnId, item: { type: 'agentMessage', phase: 'final_answer', text: 'side ' + JSON.parse(line).result?.decision },
+    } })
+    emit({ method: 'turn/completed', params: { threadId: side, turn: { id: turnId, status: 'completed' } } })
     continue
   }
   if (!method && id === pendingApproval) {
@@ -83,12 +100,37 @@ for await (const line of createInterface({ input: process.stdin })) {
         emit({ id, error: { code: -32602, message: 'Unexpected sandbox policy' } })
         break
       }
+      if (mainWaiting && !params.threadId) {
+        const side = crypto.randomUUID()
+        sideThreads.add(side)
+        respond({ thread: { id: side }, model: 'side-model' })
+        break
+      }
       threadId = params.threadId ?? crypto.randomUUID()
       respond({ thread: { id: threadId }, model: 'gpt-test' })
       break
+    case 'thread/fork': {
+      // KROT_FAKE_NO_FORK: an App Server (or relay) that refuses forks.
+      if (process.env.KROT_FAKE_NO_FORK === '1' || params.threadId !== threadId || params.excludeTurns !== true) {
+        emit({ id, error: { code: -32601, message: 'Fork refused' } })
+        break
+      }
+      // While the main turn runs, a fork must stop at a finished turn (lastTurnId).
+      if (mainWaiting && (typeof params.lastTurnId !== 'string' || !params.lastTurnId.startsWith('turn-') ||
+          params.lastTurnId === activeTurn)) {
+        emit({ id, error: { code: -32602, message: 'Fork would copy the running turn' } })
+        break
+      }
+      const side = crypto.randomUUID()
+      if (mainWaiting) sideThreads.add(side)
+      else threadId = side
+      respond({ thread: { id: side, ephemeral: params.ephemeral === true, forkedFromId: params.threadId }, model: 'gpt-test' })
+      break
+    }
     case 'thread/turns/list':
       if (params.threadId !== threadId) break
-      respond({ data: [{ items: [{ type: 'agentMessage', text: 'Example' }] }], nextCursor: null })
+      // One finished turn from before this process: a resumed thread's history.
+      respond({ data: [{ id: 'turn-0', status: 'completed', items: [{ type: 'agentMessage', text: 'Example' }] }], nextCursor: null })
       break
     case 'thread/read':
       if (resolveMcpDuringLookup?.threadId === params.threadId) {
@@ -133,7 +175,32 @@ for await (const line of createInterface({ input: process.stdin })) {
       emit({ method: 'turn/completed', params: { threadId, turn: { id: activeTurn, status: 'completed' } } })
       break
     case 'turn/start': {
+      if (sideThreads.has(params.threadId)) {
+        const side = params.threadId
+        const turnId = 'side-turn-' + ++sideTurnNumber
+        const text = params.input[0].text
+        // A side turn reports as a fresh thread would: started, usage, then its answer.
+        emit({ method: 'turn/started', params: { threadId: side, turn: { id: turnId } } })
+        emit({ method: 'thread/tokenUsage/updated', params: {
+          threadId: side, turnId, tokenUsage: { last: { totalTokens: 99 }, modelContextWindow: 100 },
+        } })
+        emit({ method: 'item/started', params: { threadId: side, turnId, item: { id: 'side-cmd', type: 'commandExecution', command: 'ls' } } })
+        respond({ turn: { id: turnId } })
+        if (text.endsWith('side-approval')) {
+          pendingSideApproval = { id: 'side-approval-' + sideTurnNumber, threadId: side, turnId }
+          emit({ id: pendingSideApproval.id, method: 'item/commandExecution/requestApproval', params: {
+            threadId: side, turnId, itemId: 'side-item', command: 'printf side', cwd: '/workspace',
+          } })
+        } else if (!text.endsWith('side-wait')) {
+          emit({ method: 'item/completed', params: {
+            threadId: side, turnId, item: { type: 'agentMessage', phase: 'final_answer', text: 'side: ' + text },
+          } })
+          emit({ method: 'turn/completed', params: { threadId: side, turn: { id: turnId, status: 'completed' } } })
+        }
+        break
+      }
       activeTurn = 'turn-' + ++turnNumber
+      mainWaiting = params.input[0].text === 'wait'
       if (params.outputSchema) {
         emit({ method: 'item/completed', params: {
           threadId, turnId: activeTurn, item: { type: 'agentMessage', text: '{"entries":[]}' },
@@ -238,6 +305,14 @@ for await (const line of createInterface({ input: process.stdin })) {
         } })
         break
       } else if (params.input[0].text !== 'wait') {
+        if (params.input[0].text.startsWith('usage:')) {
+          // 'usage:cached' reports cache counters, 'usage:plain' omits them.
+          const cached = params.input[0].text === 'usage:cached'
+          emit({ method: 'thread/tokenUsage/updated', params: { threadId, turnId: activeTurn, tokenUsage: {
+            last: { totalTokens: 5000, ...(cached ? { inputTokens: 4000, cachedInputTokens: 3280 } : {}) },
+            modelContextWindow: 100000,
+          } } })
+        }
         // Exercise the race where notifications arrive before the RPC reply.
         emit({ method: 'item/completed', params: {
           threadId: 'other-thread', turnId: activeTurn,
@@ -268,7 +343,13 @@ for await (const line of createInterface({ input: process.stdin })) {
       } })
       break
     case 'turn/interrupt':
+      if (sideThreads.has(params.threadId)) {
+        respond({})
+        emit({ method: 'turn/completed', params: { threadId: params.threadId, turn: { id: params.turnId, status: 'interrupted' } } })
+        break
+      }
       if (params.turnId !== activeTurn || params.threadId !== threadId) break
+      mainWaiting = false
       respond({})
       emit({ method: 'turn/completed', params: {
         threadId, turn: { id: activeTurn, status: 'interrupted' },
