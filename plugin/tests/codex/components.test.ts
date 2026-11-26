@@ -5,7 +5,9 @@ import { join } from 'node:path'
 
 import type { SendWidgetParams } from '../../src/channel/tools.js'
 import { AgentChatActions } from '../../src/codex/chat-actions.js'
-import { AgentComponents, COMPONENT_NAMES, componentInstructions, componentTools, finalAfterComponents } from '../../src/codex/components.js'
+import {
+  AgentComponents, COMPONENT_NAMES, componentFallbackText, componentInstructions, componentTools, finalAfterComponents,
+} from '../../src/codex/components.js'
 import { createLogger } from '../../src/log.js'
 import { WidgetPreSendError } from '../../src/safety/pre-send-error.js'
 import { redactSecrets } from '../../src/safety/redact.js'
@@ -420,6 +422,29 @@ test('[R12][R13] after a text fallback the owner gets exactly one message: a rep
     expect(chat.texts()[1]).toContain('Выполнено задач')
   }
   expect(componentInstructions).toContain('пустым финальным ответом')
+})
+
+test('[R12][R13] a widget fallback whose text an interim reply of the same turn already delivered reuses that message', async () => {
+  const chat = fakeTelegramChat()
+  const components = new AgentComponents({ ...chat.raw, async sendWidget() { throw refusal(TELEGRAM_CODE) } }, OWNER)
+  const actions = new AgentChatActions(chat.raw, OWNER, { components })
+  const data = { title: 'Демо', label: 'Выполнено задач', value: 75 }
+  const same = componentFallbackText('progress', data, undefined, text => redactSecrets(text))
+  let firstTurn = true
+  const [reply, widget] = await Promise.all([
+    actions.call(JSON.stringify(['thread', 'turn-1', 'reply-1']), { action: 'reply', text: same }, () => firstTurn),
+    actions.component(JSON.stringify(['thread', 'turn-1', 'call-1']), 'send_component', { component: 'progress', data }, () => firstTurn),
+  ])
+  expect(parsed(reply)).toMatchObject({ ok: true })
+  const replyId = (parsed(reply).message_ids as number[])[0]
+  expect(chat.texts()).toEqual([same])
+  expect(parsed(widget)).toMatchObject({ ok: true, delivery: 'text', message_ids: [replyId] })
+  expect(actions.componentDelivery(['turn-1'])).toBe('text')
+  // A reply of a turn that is over, or one with a different text, is not reused.
+  firstTurn = false
+  await actions.call(JSON.stringify(['thread', 'turn-2', 'reply-2']), { action: 'reply', text: 'Другое' }, () => true)
+  await actions.component(JSON.stringify(['thread', 'turn-2', 'call-2']), 'send_component', { component: 'progress', data }, () => true)
+  expect(chat.texts()).toEqual([same, 'Другое', same])
 })
 
 test('[R12][R13] after a text fallback a distinct short final, such as a rollback result, still reaches the owner', async () => {

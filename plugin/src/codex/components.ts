@@ -81,7 +81,10 @@ export const componentInstructions =
   'не отправляй их повторно и не сообщай о сбое: заверши ход пустым финальным ответом. Если статус доставки неизвестен, ' +
   'не отправляй данные повторно. update_component принимает только message_id из send_component или update_component.'
 
-const sameText = (text: string): string => text.replace(/\s+/g, ' ').trim()
+// Chat texts compared with whitespace collapsed: a repeat differing only in spacing is the same message.
+export const sameText = (text: string): string => text.replace(/\s+/g, ' ').trim()
+
+type Delivered = (text: string) => number | undefined
 
 // What the bridge does with the visible final answer of a turn that sent a component (`delivery`: the turn's
 // component outcome, `text` when any of them fell back to plain text; `delivered`: the fallback texts that reached
@@ -252,18 +255,19 @@ export class AgentComponents {
     private readonly options: ComponentOptions = {}) {}
 
   // Runs one component tool call. Never throws; `known` says whether a reply target is a known chat message,
-  // `current` whether the turn may still act (checked again after the wait for the HUD card).
+  // `current` whether the turn may still act (checked again after the wait for the HUD card), `delivered` the ID of a
+  // confirmed message of this turn that already carries a given text (a fallback reuses it instead of a second copy).
   async run(tool: string, raw: unknown, known: (id: number) => boolean,
-    current: () => boolean = () => true): Promise<ComponentOutcome> {
+    current: () => boolean = () => true, delivered: Delivered = () => undefined): Promise<ComponentOutcome> {
     try {
-      return await this.dispatch(tool, object(raw), known, current)
+      return await this.dispatch(tool, object(raw), known, current, delivered)
     } catch (error) {
       return { ok: false, message_ids: [], hint: `Telegram не выполнил действие: ${errorText(error)}` }
     }
   }
 
   private async dispatch(tool: string, args: Record<string, unknown>, known: (id: number) => boolean,
-    current: () => boolean): Promise<ComponentOutcome> {
+    current: () => boolean, delivered: Delivered): Promise<ComponentOutcome> {
     const invalid: ComponentOutcome = { ok: false, message_ids: [], hint: 'Некорректные параметры компонента.' }
     const allowed = componentTools.find(entry => entry.name === tool)
     if (!allowed || Object.keys(args).some(key => !Object.hasOwn(allowed.inputSchema.properties, key)) ||
@@ -277,7 +281,7 @@ export class AgentComponents {
       const target = args.target
       if ((caption !== undefined && (typeof caption !== 'string' || caption.length === 0 || caption.length > 1024)) ||
           (target !== undefined && (!isMessageId(target) || !known(target)))) return invalid
-      const out = await this.deliver(component, data, caption, target, current)
+      const out = await this.deliver(component, data, caption, target, current, delivered)
       return this.outcome(out)
     }
     const old = args.message_id
@@ -285,7 +289,7 @@ export class AgentComponents {
       return { ok: false, message_ids: [], hint: 'message_id не является компонентом, отправленным в этом запуске моста. ' +
         'Ничего не отправлено и не удалено; отправь новый компонент через send_component.' }
     }
-    const out = await this.deliver(component, data, undefined, undefined, current)
+    const out = await this.deliver(component, data, undefined, undefined, current, delivered)
     const result = this.outcome(out)
     if (out.kind === 'widget') {
       try {
@@ -329,7 +333,7 @@ export class AgentComponents {
   // plain-text version of the same data. The widget send is one attempt; an
   // ambiguous failure gets no text copy (it could double-post).
   private async deliver(component: ComponentName, data: Record<string, unknown>, caption: string | undefined,
-    target: number | undefined, current: () => boolean): Promise<Delivery> {
+    target: number | undefined, current: () => boolean, delivered: Delivered): Promise<Delivery> {
     const redact = this.options.redact ?? ((text: string): string => redactSecrets(text))
     await this.options.beforeSend?.()
     if (!current()) return { kind: 'failed', reason: 'Ход остановлен, компонент не отправлен.' }
@@ -373,6 +377,9 @@ export class AgentComponents {
     // The widget request may have taken long enough for the owner to stop the turn.
     if (!current()) return { kind: 'failed', reason: `Виджет не показан (${reason}), ход остановлен, текстовая версия не отправлена.` }
     const text = componentFallbackText(component, data, caption, redact)
+    // An interim reply of this turn already put the same text in the chat: that message is the fallback.
+    const reused = delivered(text)
+    if (reused !== undefined) return { kind: 'text', messageId: reused, reason, text }
     const send =(threadUnder: number | undefined): Promise<{ message_id: number }> => {
       const opts: SendMessageOpts = threadUnder === undefined ? {} : { reply_to_message_id: threadUnder }
       return this.api.sendMessage(this.ownerChat, text, opts)

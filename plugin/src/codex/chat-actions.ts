@@ -4,7 +4,7 @@ import type { Message } from 'grammy/types'
 import { atomicWriteInRoot } from '../autonomy/store.js'
 import type { DownloadResult, TelegramApi } from '../channel/tools.js'
 import { stripAgentAddress } from './commands.js'
-import { componentInstructions, componentTools, type AgentComponents } from './components.js'
+import { componentInstructions, componentTools, sameText, type AgentComponents } from './components.js'
 import { normalizeChatReply } from './continuation.js'
 import { DEFAULT_REACTION_PALETTE, reactionHints, telegramReaction } from './reactions.js'
 import { object } from './rpc.js'
@@ -77,6 +77,7 @@ const agentActionPrefix = '@@TELEGRAM_ACTION '
 const agentActions = ['reply', 'edit', 'pin', 'unpin', 'react', 'download', 'revoke_mandate', 'resolve_question'] as const
 type AgentAction = typeof agentActions[number]
 const targetLimit = 1000
+const confirmedReplyLimit = 20
 const targetState = 'codex-chat-targets.json'
 
 // The palette itself is configurable, so it reaches the model through reactionInstructions, not this fixed schema.
@@ -163,6 +164,8 @@ export class AgentChatActions {
   private readonly sendReceipts = new Map<string, { result: Promise<ToolResult>; current: () => boolean }>()
   // Codex turn ID -> what its components delivered; read when the turn's final answer is handled.
   private readonly componentTurns = new Map<string, { delivery: 'widget' | 'text'; texts: string[] }>()
+  // Interim replies Telegram confirmed, while their turn runs: a component fallback with the same text reuses one.
+  private readonly confirmedReplies: Array<{ text: string; id: number; current: () => boolean }> = []
   private pending = Promise.resolve()
   lastReply: number | undefined
 
@@ -252,7 +255,10 @@ export class AgentChatActions {
     if (previous) return previous
     const result = this.pending.then(async (): Promise<ToolResult> => {
       if (!current()) return refused('Действие Telegram недоступно для этого хода.')
-      const outcome = await components.run(tool, raw, id => this.targets.has(id), current)
+      const outcome = await components.run(tool, raw, id => this.targets.has(id), current, text => {
+        const wanted = sameText(text)
+        return this.confirmedReplies.find(reply => reply.current() && sameText(reply.text) === wanted)?.id
+      })
       // A component message is a known target for this run: the model may pin or react to it.
       for (const id of outcome.message_ids) this.remember(id, false, false, false, true)
       const { fallbackText, ...visible } = outcome
@@ -354,6 +360,11 @@ export class AgentChatActions {
             (await this.api.sendMessage(this.ownerChat, text, id === undefined ? {} : { reply_to_message_id: id })).message_id
           details.message_ids.push(sentId)
           this.remember(sentId, true, true, rendered?.rich)
+          for (let index = this.confirmedReplies.length - 1; index >= 0; index--) {
+            if (!this.confirmedReplies[index]!.current()) this.confirmedReplies.splice(index, 1)
+          }
+          this.confirmedReplies.push({ text, id: sentId, current })
+          if (this.confirmedReplies.length > confirmedReplyLimit) this.confirmedReplies.shift()
         }
         if (sendFile) for (const path of paths) {
           if (!current()) return false
