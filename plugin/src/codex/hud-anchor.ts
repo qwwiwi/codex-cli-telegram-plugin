@@ -47,6 +47,18 @@ export class HudAnchor {
   async settled(): Promise<void> {
     const pending = this.pending
     if (pending === undefined) return
+    // Concurrent waiters of the same move share one capped wait.
+    let wait = this.waits.get(pending)
+    if (!wait) {
+      wait = this.capped(pending)
+      this.waits.set(pending, wait)
+    }
+    await wait
+  }
+
+  private readonly waits = new WeakMap<Promise<void>, Promise<void>>()
+
+  private async capped(pending: Promise<void>): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined
     let expired = false
     const cap = new Promise<void>(resolve => {

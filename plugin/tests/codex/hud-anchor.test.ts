@@ -110,3 +110,16 @@ test('without an owner message the reply does not wait for the HUD', async () =>
   await anchor.settled()
   expect(Date.now() - started).toBeLessThan(100)
 })
+
+test('a second reply waiting on the same hanging card shares its cap instead of starting a new one', async () => {
+  const { hud } = fakeHud({ bumpHangs: true })
+  const anchor = new HudAnchor(hud, OWNER, 200)
+  anchor.ownerMessage()
+  const started = Date.now()
+  const first = anchor.settled()
+  await Bun.sleep(150)
+  // A concurrent waiter: the card was asked to move once, so it gets one cap in total.
+  const second = anchor.settled()
+  await Promise.all([first, second])
+  expect(Date.now() - started).toBeLessThan(300)
+})
