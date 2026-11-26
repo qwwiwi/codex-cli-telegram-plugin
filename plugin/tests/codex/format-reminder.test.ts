@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test'
 import { attachmentInstructions } from '../../src/codex/attachments.js'
 import { formatConversation } from '../../src/codex/conversation-export.js'
-import { formatReminder, formatReminderEnabled, ownerTurn } from '../../src/codex/format-reminder.js'
+import {
+  formatReminder, formatReminderEnabled, ownerTurn, questionFollowUpTurn, sideOwnerTurn,
+} from '../../src/codex/format-reminder.js'
 import { splitLongBlock } from '../../src/format/paragraphs.js'
 
 const occurrences = (text: string, part: string): number => text.split(part).length - 1
@@ -29,6 +31,20 @@ test('[R02] KROT_FORMAT_REMINDER=off leaves the reminder out of the turn', () =>
   const turn = ownerTurn(false, ['Вопрос'])
   expect(turn).toBe(attachmentInstructions + '\n\nВопрос')
   expect(turn).not.toContain(formatReminder)
+})
+
+test('[R02] question follow-ups and parallel owner turns carry the format reminder once, and none when it is off', () => {
+  const followUp = questionFollowUpTurn(true, 'Мандаты: нет', [{ id: 'q1', answer: 'Да' }])
+  expect(followUp.startsWith(attachmentInstructions + '\n\n' + formatReminder + '\n\n')).toBe(true)
+  expect(occurrences(followUp, formatReminder)).toBe(1)
+  expect(followUp).toEndWith('Ответы владельца на твой вопрос из карточки Telegram:\n[{"id":"q1","answer":"Да"}]')
+  expect(questionFollowUpTurn(true, '', [])).not.toContain('\n\n\n')
+  const side = sideOwnerTurn(true, ['Параллельная задача', '', 'Вопрос владельца'])
+  expect(side).toBe(formatReminder + '\n\nПараллельная задача\n\nВопрос владельца')
+  // A side reply is delivered without files: no attachment rule in its turn.
+  expect(side).not.toContain(attachmentInstructions)
+  expect(questionFollowUpTurn(false, 'Мандаты: нет', ['Да'])).not.toContain(formatReminder)
+  expect(sideOwnerTurn(false, ['Вопрос'])).toBe('Вопрос')
 })
 
 test('[R02] KROT_FORMAT_REMINDER is on unless set to off and rejects other values', () => {

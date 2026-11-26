@@ -38,7 +38,7 @@ import { removeOwnPinService } from './pin-service.js'
 import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
 import { extractAttachments, sendAttachment } from './attachments.js'
-import { formatReminderEnabled, ownerTurn } from './format-reminder.js'
+import { formatReminderEnabled, ownerTurn, questionFollowUpTurn, sideOwnerTurn } from './format-reminder.js'
 import { codexAgentName, codexCommandSet, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import { collectDoctorReport, DoctorCommand, runDoctorScript } from './doctor-command.js'
 import {
@@ -1493,9 +1493,10 @@ async function main(): Promise<void> {
             return
           }
           const prompt = agent
-            ? [sideInstructions(mainSummary(), provenance), input.text]
-            : [sideInstructions(mainSummary(), provenance), agentChatInstructions, chatContext([message]), input.text]
-          const result = await codex.runSide(prompt.filter(Boolean).join('\n\n'), agent ? [] : input.images, reuse, thread => {
+            ? [sideInstructions(mainSummary(), provenance), input.text].filter(Boolean).join('\n\n')
+            : sideOwnerTurn(formatReminderOn,
+              [sideInstructions(mainSummary(), provenance), agentChatInstructions, chatContext([message]), input.text])
+          const result = await codex.runSide(prompt, agent ? [] : input.images, reuse, thread => {
             sides.attach(id, thread)
             release(thread)
           }, { untrusted: agent })
@@ -1999,8 +2000,7 @@ async function main(): Promise<void> {
               }
               return
             }
-            result = await codex.run(leases.instructions() +
-              '\n\nОтветы владельца на твой вопрос из карточки Telegram:\n' + JSON.stringify(answers), [], saveTurn)
+            result = await codex.run(questionFollowUpTurn(formatReminderOn, leases.instructions(), answers), [], saveTurn)
           }
           await agentChat.flush()
           if (stopping) return

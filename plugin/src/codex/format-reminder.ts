@@ -21,3 +21,14 @@ export function formatReminderEnabled(value: string | undefined): boolean {
 export function ownerTurn(reminder: boolean, parts: readonly string[]): string {
   return [attachmentInstructions, ...(reminder ? [formatReminder] : []), ...parts].join('\n\n')
 }
+
+/** The main-thread turn that carries the owner's answers from a question card: an owner turn too. */
+export function questionFollowUpTurn(reminder: boolean, instructions: string, answers: unknown): string {
+  return ownerTurn(reminder, [instructions, 'Ответы владельца на твой вопрос из карточки Telegram:\n' + JSON.stringify(answers)]
+    .filter(Boolean))
+}
+
+/** A parallel (side) owner turn. Its reply is delivered without files, so it carries no attachment rule. */
+export function sideOwnerTurn(reminder: boolean, parts: readonly string[]): string {
+  return [...(reminder ? [formatReminder] : []), ...parts.filter(Boolean)].join('\n\n')
+}
