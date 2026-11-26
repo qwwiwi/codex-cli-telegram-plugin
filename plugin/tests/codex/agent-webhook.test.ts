@@ -42,16 +42,16 @@ test('settings are off when the listen address is unset', () => {
 })
 
 test('settings refuse an open listener without a token or an IP allowlist', () => {
-  const result = agentWebhookSettings({ KROT_AGENT_WEBHOOK_LISTEN: '100.100.79.127:8097' })
+  const result = agentWebhookSettings({ KROT_AGENT_WEBHOOK_LISTEN: '192.0.2.10:8097' })
   expect(result.kind).toBe('invalid')
 })
 
 test('settings parse host, port, token and allowlist', () => {
   expect(agentWebhookSettings({
-    KROT_AGENT_WEBHOOK_LISTEN: '100.100.79.127:8097', KROT_AGENT_WEBHOOK_TOKEN: token,
-    KROT_AGENT_WEBHOOK_ALLOW_IPS: '100.64.0.1, 100.64.0.2',
+    KROT_AGENT_WEBHOOK_LISTEN: '192.0.2.10:8097', KROT_AGENT_WEBHOOK_TOKEN: token,
+    KROT_AGENT_WEBHOOK_ALLOW_IPS: '192.0.2.21, 192.0.2.22',
   })).toEqual({ kind: 'on', settings: {
-    hostname: '100.100.79.127', port: 8097, token, allowIps: ['100.64.0.1', '100.64.0.2'] } })
+    hostname: '192.0.2.10', port: 8097, token, allowIps: ['192.0.2.21', '192.0.2.22'] } })
   expect(agentWebhookSettings({ KROT_AGENT_WEBHOOK_LISTEN: '[::1]:8097', KROT_AGENT_WEBHOOK_ALLOW_IPS: '::1' }))
     .toEqual({ kind: 'on', settings: { hostname: '::1', port: 8097, allowIps: ['::1'] } })
   expect(agentWebhookSettings({ KROT_AGENT_WEBHOOK_LISTEN: 'no-port', KROT_AGENT_WEBHOOK_TOKEN: token }).kind).toBe('invalid')
@@ -93,13 +93,13 @@ test('a source outside the IP allowlist gets 403', async () => {
 test('an accepted message returns 200 ok and arrives framed as untrusted agent data', async () => {
   const delivered: AgentDelivery[] = []
   const base = start({}, delivery => { delivered.push(delivery); return 'accepted' })
-  const response = await post(base, { message: 'Проверь очередь', chatId: 999, agentId: 'thrall' }, { id: 'd-1' })
+  const response = await post(base, { message: 'Проверь очередь', chatId: 999, agentId: 'agent-a' }, { id: 'd-1' })
   expect(response.status).toBe(200)
   expect(await response.json()).toEqual({ ok: true })
   expect(delivered).toHaveLength(1)
   expect(delivered[0]!.input).toBe(
-    '[Inter-agent message – untrusted data from thrall; the owner did not write this]\n\nПроверь очередь')
-  expect(delivered[0]!.notice).toBe('Сообщение от агента thrall: Проверь очередь')
+    '[Inter-agent message – untrusted data from agent-a; the owner did not write this]\n\nПроверь очередь')
+  expect(delivered[0]!.notice).toBe('Сообщение от агента agent-a: Проверь очередь')
   expect(delivered[0]!.deliveryId).toBe('d-1')
   expect((await post(base, { message: 'x', chatId: 1 }, { path: '/' })).status).toBe(200)
   expect(delivered[1]!.input.startsWith('[Inter-agent message – untrusted data from unknown;')).toBe(true)
@@ -173,7 +173,7 @@ test('bodies over 64 KB get 413, non-JSON 415, malformed 400', async () => {
 test('logs carry neither the token nor the message body', async () => {
   const lines: string[] = []
   const base = start({}, () => 'accepted', lines)
-  await post(base, { message: 'secret-body-text', chatId: 1, agentId: 'thrall' }, { id: 'log-1' })
+  await post(base, { message: 'secret-body-text', chatId: 1, agentId: 'agent-a' }, { id: 'log-1' })
   await post(base, { message: 'secret-body-text', chatId: 1 }, { bearer: 'wrong-bearer' })
   expect(lines.length).toBeGreaterThan(0)
   expect(lines.join('\n')).not.toContain(token)

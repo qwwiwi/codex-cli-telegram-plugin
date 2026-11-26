@@ -386,7 +386,7 @@ export class CodexSession {
   }
 
   // Writes only inside the bridge workspace; network stays on because agent
-  // tasks need git, gh and gbrain. Temp directories keep their default access.
+  // tasks need git, gh and remote MCP servers. Temp directories keep their default access.
   private workspaceWritePolicy(): CodexSandboxPolicy {
     return {
       type: 'workspaceWrite',

@@ -32,7 +32,7 @@ export interface AppendHotInput {
   // Local-tz timestamp formatted as 'YYYY-MM-DD HH:MM'. Caller owns
   // formatting so a fake clock in tests stays deterministic.
   ts: string
-  // Human-friendly capitalised agent name, e.g. 'Silvana'. Rendered as
+  // Human-friendly capitalised agent name, e.g. 'Aria'. Rendered as
   // `**${agentLabel}:** ...`.
   agentLabel: string
   sourceTag: string

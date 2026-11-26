@@ -1,5 +1,5 @@
-// Inbound inter-agent webhook: other agents of the fleet (the gbrain swarm
-// worker) POST a task here and it becomes a Codex input in the owner's chat.
+// Inbound inter-agent webhook: other agents of the fleet (for example a
+// swarm worker) POST a task here and it becomes a Codex input in the owner's chat.
 //
 // Off unless KROT_AGENT_WEBHOOK_LISTEN is set. Never runs open: a bearer
 // token (KROT_AGENT_WEBHOOK_TOKEN), a source IP allowlist
