@@ -2,36 +2,71 @@
 // reply: owner message -> HUD card -> reply. The card is moved to the bottom of
 // the chat (ContextHud.bump) only when an owner message is accepted; turn
 // progress and turn end only refresh it in place (ContextHud.updateNow). Reply
-// senders await `settled()` so a reply never lands above the card of its own
-// input.
+// senders await `settled()`, which resolves once the card of the latest owner
+// message landed (or Telegram refused it), so a reply never goes out above the
+// card of its own turn and never under a card of an older turn.
+//
+// Bursts: an owner message that arrives while a move is in flight does not
+// start a second concurrent move and is not dropped either; the in-flight move
+// is followed by exactly one more move, so the card always ends up under the
+// newest owner message.
+//
+// Hangs: Telegram normally answers in well under a second, and a failed call
+// resolves the move at once (the answer still goes out; ContextHud logs the
+// failure). Only a call that hangs past the guard lets the answer go first.
+// The move is then over: its card send is cancelled (a queued send never
+// leaves; one in flight stops holding the chat's send queue, so the answer is
+// not stuck behind it), an owner message that arrived during it gets no
+// trailing move (that card would land below the answer), and the card is
+// retired (ContextHud.retire, serialized behind the late move) so it never
+// stays below the answer. The next owner message starts a fresh move.
 //
 // Best-effort like every HUD operation: nothing here throws or rejects into the
-// reply path, and a slow or hung Telegram call delays a reply by at most the cap.
+// reply path.
 
 export interface HudCard {
-  bump(chatId: string): Promise<void>
+  // `signal` aborts when the hang guard gives up on this move.
+  bump(chatId: string, signal?: AbortSignal): Promise<void>
   updateNow(chatId: string): Promise<void>
+  retire(chatId: string): Promise<void>
 }
 
-// Upper bound a reply waits for the card of its input to land.
-const SETTLE_CAP_MS = 3000
+export interface HudAnchorLog {
+  warn(msg: string, ctx?: Record<string, unknown>): void
+}
+
+// Upper bound a reply waits for a hung card. Not a race against normal
+// Telegram latency: a late card is retired, never left below the answer.
+const HANG_GUARD_MS = 30_000
+
+// One move of the card: one bump, plus one more per burst behind it.
+interface Move {
+  done: Promise<void>
+  // An owner message arrived while this move was in flight.
+  again: boolean
+  // Aborted when the hang guard expired: the move is invalid from then on.
+  cancel: AbortController
+}
 
 export class HudAnchor {
-  private pending: Promise<void> | undefined
+  private current: Move | undefined
 
   constructor(
     private readonly hud: HudCard,
     private readonly chatId: string,
-    private readonly capMs = SETTLE_CAP_MS,
+    private readonly guardMs = HANG_GUARD_MS,
+    private readonly log?: HudAnchorLog,
   ) {}
 
-  /** An owner message was accepted: move the card to the bottom of the chat now. */
+  /** An owner message was accepted: move the card under it. */
   ownerMessage(): void {
-    const bump = attempt(() => this.hud.bump(this.chatId))
-    this.pending = bump
-    void bump.then(() => {
-      if (this.pending === bump) this.pending = undefined
-    })
+    if (this.current !== undefined) {
+      this.current.again = true
+      return
+    }
+    const move: Move = { done: Promise.resolve(), again: false, cancel: new AbortController() }
+    this.current = move
+    move.done = this.run(move)
   }
 
   /** Turn progress or turn end: refresh the numbers in place, never move the card. */
@@ -40,35 +75,58 @@ export class HudAnchor {
   }
 
   /**
-   * Resolves once the latest move landed (or after the cap). Never rejects.
-   * One cap per move: once a wait for it timed out, later waits (the second
-   * wait of the same reply) return at once instead of adding another cap.
+   * Resolves once the card of the latest owner message landed or failed. Never
+   * rejects. One guard per move: once a wait for it expired, later waits (the
+   * second wait of the same reply) return at once instead of adding another.
    */
   async settled(): Promise<void> {
-    const pending = this.pending
-    if (pending === undefined) return
-    // Concurrent waiters of the same move share one capped wait.
-    let wait = this.waits.get(pending)
+    const move = this.current
+    if (move === undefined) return
+    // Concurrent waiters of the same move share one guarded wait.
+    let wait = this.waits.get(move)
     if (!wait) {
-      wait = this.capped(pending)
-      this.waits.set(pending, wait)
+      wait = this.guarded(move)
+      this.waits.set(move, wait)
     }
     await wait
   }
 
-  private readonly waits = new WeakMap<Promise<void>, Promise<void>>()
+  private readonly waits = new WeakMap<Move, Promise<void>>()
 
-  private async capped(pending: Promise<void>): Promise<void> {
+  private async run(move: Move): Promise<void> {
+    try {
+      do {
+        move.again = false
+        await attempt(() => this.hud.bump(this.chatId, move.cancel.signal))
+        // An expired move sends nothing more: its answer may already be out.
+      } while (move.again && !move.cancel.signal.aborted)
+    } finally {
+      // Cleared in the same step that saw no burst, so no owner message is lost.
+      if (this.current === move) this.current = undefined
+    }
+  }
+
+  private async guarded(move: Move): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined
     let expired = false
-    const cap = new Promise<void>(resolve => {
-      timer = setTimeout(() => { expired = true; resolve() }, this.capMs)
+    const guard = new Promise<void>(resolve => {
+      timer = setTimeout(() => { expired = true; resolve() }, this.guardMs)
     })
     try {
-      await Promise.race([pending, cap])
+      await Promise.race([move.done, guard])
     } finally {
       clearTimeout(timer)
-      if (expired && this.pending === pending) this.pending = undefined
+      if (expired) {
+        // The next owner message starts a fresh move with its own guard.
+        if (this.current === move) this.current = undefined
+        // Free the chat's send queue for the answer and drop the trailing move.
+        move.cancel.abort()
+        this.log?.warn('context hud card did not land in time; the reply goes out without it', {
+          chat_id: this.chatId,
+          guard_ms: this.guardMs,
+        })
+        void attempt(() => this.hud.retire(this.chatId))
+      }
     }
   }
 }

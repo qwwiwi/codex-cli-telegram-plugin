@@ -73,31 +73,85 @@ test('bump moves the HUD card to the bottom of the chat and persists the new id'
   expect(persisted()).toBe(bottom)
 })
 
-test('a burst of bumps causes one delete+resend; later bumps in the window only refresh in place', async () => {
+test('[R04] a second owner message right after the first still moves the card below it', async () => {
   const { hud, messages, calls, owner, persisted } = fixture()
   setSystemTime(new Date(1_000_000))
   await hud.updateNow(OWNER)
-  owner('part 1')
+  owner('message 1')
+  await hud.bump(OWNER)
+  const first = persisted()
+  owner('message 2')
+  setSystemTime(new Date(1_000_200))
   calls.length = 0
 
   await hud.bump(OWNER)
-  const moved = persisted()
-  owner('part 2')
-  setSystemTime(new Date(1_000_500))
+
+  const bottom = [...messages.keys()].at(-1)!
+  expect(bottom).not.toBe(first)
+  expect(messages.has(first)).toBe(false)
+  expect(messages.get(bottom)).toStartWith('HUD ')
+  expect(calls).toEqual(['delete:' + first, 'send', 'pin:' + bottom])
+})
+
+test('[R04] retire removes a card that landed below the answer and the turn-end refresh does not recreate it', async () => {
+  const { hud, messages, calls, owner, persisted } = fixture()
+  setSystemTime(new Date(1_000_000))
+  owner('owner message')
   await hud.bump(OWNER)
+  const late = persisted()
+  // The late card landed after the answer went out.
+  messages.delete(late)
+  owner('agent reply')
+  messages.set(late, 'HUD late')
+  calls.length = 0
+
+  await hud.retire(OWNER)
+  await hud.updateNow(OWNER)
+
+  expect(messages.has(late)).toBe(false)
+  expect(calls).toEqual(['delete:' + late])
+  expect([...messages.values()].at(-1)).toBe('agent reply')
+
+  // The next owner message brings a fresh card back into place.
+  owner('next owner message')
+  await hud.bump(OWNER)
+  expect([...messages.values()].at(-1)).toStartWith('HUD ')
+})
+
+test('[R04] a retired card whose delete failed is deleted by the next HUD move instead of staying in the chat', async () => {
+  const failures = { delete: false }
+  const { hud, messages, calls, owner, persisted } = fixture(failures)
+  setSystemTime(new Date(1_000_000))
+  owner('owner message')
+  await hud.bump(OWNER)
+  const late = persisted()
+  owner('agent reply')
+  failures.delete = true
+  await hud.retire(OWNER)
+  // Telegram refused the delete: the card is still visible.
+  expect(messages.has(late)).toBe(true)
+
+  failures.delete = false
+  owner('next owner message')
+  calls.length = 0
   await hud.bump(OWNER)
 
-  expect(calls.filter(c => c === 'send')).toHaveLength(1)
-  expect(calls.filter(c => c.startsWith('delete:'))).toHaveLength(1)
-  expect(persisted()).toBe(moved)
-  // The in-window bump still refreshes the card's content.
-  expect(calls).toContain('edit:' + moved)
+  expect(messages.has(late)).toBe(false)
+  expect(calls).toContain('delete:' + late)
+  expect([...messages.values()].at(-1)).toStartWith('HUD ')
+})
 
-  // After the debounce window the next bump moves it again.
-  setSystemTime(new Date(1_002_000))
+test('[R04] cleanup of a retired card that cannot be deleted stops after a bounded number of tries', async () => {
+  const { hud, calls, owner, persisted } = fixture({ delete: true })
+  setSystemTime(new Date(1_000_000))
   await hud.bump(OWNER)
-  expect([...messages.keys()].at(-1)).toBe(persisted())
-  expect(persisted()).not.toBe(moved)
+  const late = persisted()
+  owner('agent reply')
+  await hud.retire(OWNER)
+  for (let i = 0; i < 5; i++) await hud.retire(OWNER)
+
+  // One try at retirement plus two cleanup retries, then it gives up.
+  expect(calls.filter(call => call === 'delete:' + late)).toHaveLength(3)
 })
 
 test('a refused delete falls back to unpin and still sends a fresh card at the bottom', async () => {

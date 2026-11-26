@@ -118,6 +118,8 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   without sending the reply. `off` disables the check. Tool approvals and
   question cards follow their existing rules.
 - `/cc model [name]` lists and selects models available to the account.
+  Without a name it shows one button per model (the current one marked ✓); after a tap
+  it offers the reasoning efforts that model supports (not behind the root relay).
   Use `/cc model default` for `KROT_CODEX_MODEL` or the catalog default.
   The selected model applies to subsequent turns without losing the conversation.
 - `/cc resume [number or ID]` lists or switches between up to ten
@@ -208,6 +210,20 @@ Set the token, the IP list or both. With neither, the bridge logs an error and
 does not start the listener: it never runs open. When both are set, both must
 pass.
 
+Put the settings in `plugin/.env` and restart the service. Example with
+placeholder values (`192.0.2.0/24` is a documentation range; use the address
+of your bridge's network interface and of each sending agent, and a long random
+token shared only with those agents):
+
+```dotenv
+KROT_AGENT_WEBHOOK_LISTEN=192.0.2.10:8097
+KROT_AGENT_WEBHOOK_TOKEN=<long random token>
+KROT_AGENT_WEBHOOK_ALLOW_IPS=192.0.2.21,192.0.2.22
+```
+
+A sending agent then calls `POST http://192.0.2.10:8097/webhook` with
+`Authorization: Bearer <long random token>`.
+
 The only route is `POST /webhook` (`POST /` also works); everything else is
 404. The body must be `application/json`, at most 64 KB:
 
@@ -278,3 +294,41 @@ added to `codexEnvironment` in `environment.ts`.
 With `KROT_CODEX_APPROVALS=1`, an MCP tool call that Codex asks to approve
 shows up as an approval card in Telegram. Restart the service after you change the Codex
 configuration.
+
+## Codex subagents
+
+Codex can split a task between subagents: inside one turn it spawns child
+threads, waits for their results and closes them. This is a Codex feature
+(`multi_agent_v2`); the bridge does not start subagents itself. Turn it on in
+the Codex configuration of the user that runs the bridge (`config.toml` in
+`CODEX_HOME`, by default `~/.codex/config.toml`) and cap how many agent threads
+may run at once:
+
+```toml
+[features]
+multi_agent_v2 = true
+
+[agents]
+max_concurrent_threads_per_session = 6
+```
+
+Restart the service after the change. How subagents and the bridge fit
+together:
+
+- **Two kinds of parallel work.** A *subagent* is started by Codex inside a
+  turn for an independent part of the same task;
+  `max_concurrent_threads_per_session` caps them. A
+  *side thread* is started by the bridge (`KROT_CODEX_PARALLEL=1`) when the
+  owner sends a new message while a task runs; `KROT_CODEX_MAX_PARALLEL` caps
+  those (main thread included, 1 to 8, default 2). The two caps are separate
+  settings: subagents do not take bridge side-thread slots.
+- **Approvals.** An approval request from a subagent of a running turn shows up
+  as the same Telegram approval card as one from the turn itself
+  (`KROT_CODEX_APPROVALS=1`). The bridge accepts it only when the child thread
+  really belongs to that turn.
+- **Status.** While subagents run, the status bubble keeps the task shown as
+  busy.
+- **Agent profile.** The starter `AGENTS.md` written by `install.sh` has a short
+  section on when to use subagents and how to behave in a side thread. Add your
+  own rules there; an example profile is in
+  [examples/AGENTS.example.md](../../examples/AGENTS.example.md).

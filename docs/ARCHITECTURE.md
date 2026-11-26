@@ -18,6 +18,7 @@ This page describes how the bridge works inside: the code map, the path of one m
 One Bun process (`bun run start` = `bun run src/codex/server.ts` in `plugin/`) does everything:
 
 - polls Telegram with grammY,
+- optionally listens for messages from other agents on the inter-agent webhook (`KROT_AGENT_WEBHOOK_LISTEN`, see [Inter-agent webhook](#inter-agent-webhook)),
 - keeps one long-lived `codex app-server` child,
 - writes state into `TELEGRAM_STATE_DIR`,
 - lets Codex work in `TELEGRAM_WORKSPACE_ROOT`, whose `AGENTS.md` carries the agent's instructions.
@@ -46,11 +47,18 @@ The live product. `rpc.ts` starts app-server and speaks JSON-RPC. `session.ts` m
 - `inbox.ts`: saved queue of owner messages and per-part delivery state
 - `approvals.ts`, `questions.ts`, `mcp-approval.ts`, `server-approval-policy.ts`, `card-cleanup.ts`: cards
 - `parallel.ts`: routing rule and registry for side threads
+- `side-delivery.ts`: what a side turn delivered through its tools, counted per turn ID; a turn that answered that way and ends without text gets no "no answer" notice
+- `side-status.ts`: the status card of an owner side turn: a silent reply to the message sent the moment it is routed («Параллельно: слушаю голосовое…» while a voice is transcribed, then «Параллельно: думаю…»), edited with the side thread's progress at most every 3 s and deleted once the side turn ended; a queued message gets «В очереди: возьму после «<title>»» as a silent reply
+- `error-log.ts`: `errorDetail` (name, code and a description with credential headers, key=value pairs, JSON credential fields, URL queries and long opaque tokens masked) and the daily error journal `<state dir>/errors-YYYY-MM-DD.jsonl` (`KROT_ERROR_LOG_DAYS`), read by `/doctor`
 - `work-status.ts`, `mirror.ts`: the status bubble and the optional live mirror
 - `commands.ts`, `chat-actions.ts`, `lease.ts`, `learning.ts`: commands and their helpers
+- `components.ts`: widget components for the model (`send_component`, `update_component`, `component_schema`), see [Widget components](#widget-components)
 - `restart-bridge.ts`, `restart-handoff.ts`, `continuation.ts`: self-restart and continuation of unfinished tasks
 - `pin-service.ts`: deletes the bot's own "pinned a message" service messages
 - `external.ts`: optional local HTTP server on `127.0.0.1` for external tasks and policy cards
+- `agent-webhook.ts`: optional inter-agent webhook, the entry point for messages from other agents (`agentWebhookSettings`, `startAgentWebhook`, `routeAgentMessage`)
+- `provenance.ts`: the untrusted-data frame put around an agent's message
+- `format-reminder.ts`: `ownerTurn`, the static channel rules and the per-turn format reminder (`KROT_FORMAT_REMINDER`)
 
 ### `autonomy/`
 
@@ -60,9 +68,10 @@ Owner-granted autonomy mandates ("leases") and the open-question registry, one J
 
 ### `channel/`
 
-The MCP tool surface of the Claude version (reply, react, edit, pin). Codex does not register these tools. The bridge uses only `createTelegramApi` from `tools.ts`, which wraps grammY and sends `sendRichMessage` through the raw API.
+The MCP tool surface of the Claude version (reply, react, edit, pin). Codex does not register these tools. The bridge uses only `createTelegramApi` from `tools.ts`, which wraps grammY and sends `sendRichMessage` and `sendWidget` through the raw API, and the widget limits in `widget.ts`.
 
 - `tools.ts`: `TelegramApi` and `createTelegramApi` (used); the rest is legacy
+- `widget.ts`: size and chat checks for `sendWidget`
 
 ### `chats/`
 
@@ -82,6 +91,7 @@ Markdown to Telegram HTML, message splitting and Rich Message payloads. Used dir
 
 - `html.ts`: `markdownToTelegramHtml`, `isTelegramHtmlParseError`
 - `chunk.ts`: `splitMessage`
+- `paragraphs.ts`: `splitLongBlock`, the paragraph safety net for a long final answer without blank lines
 - `rich.ts`: `contentFitsRichLimits` (32768 UTF-8 bytes), `buildRichMessagePayload`
 
 ### `hooks/`
@@ -150,7 +160,7 @@ Telegram input.
 
 ### `webhook/`
 
-Shared HTTP helpers for `codex/external.ts`: capped body reads, schema parsing, the auth/origin gate and the JSON reply writer. This is a local HTTP endpoint for other processes on the same machine, not a Telegram webhook.
+Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, the auth/origin gate and the JSON reply writer) and the constant-time bearer compare `bearerEquals` used by `codex/agent-webhook.ts`. Neither endpoint is a Telegram webhook.
 
 - `http.ts`
 
@@ -167,6 +177,7 @@ Shared HTTP helpers for `codex/external.ts`: capped body reads, schema parsing, 
 - `plugin/scripts/codex-permission-hook.ts`: YAML policy hook run inside Codex (see [plugin/docs/claude-compatibility.md](../plugin/docs/claude-compatibility.md))
 - `plugin/scripts/codex-root-relay.py`, `root_backend.py`, `codex-root-health.py`: relay to a separate app-server (see [plugin/docs/root-backend.md](../plugin/docs/root-backend.md))
 - `examples/`: systemd units and a relay config example
+- `plugin/vendor/html-components/`: the vendored Telegram widget packs (MIT, see its `LICENSE` and `VENDOR.md`)
 - `plugin/tests/`: `bun test` suite with a fake app-server (`plugin/tests/codex/fake-app-server.ts`)
 
 ## The path of one message
@@ -188,19 +199,22 @@ Shared HTTP helpers for `codex/external.ts`: capped body reads, schema parsing, 
    - then `thread/resume` for the saved thread or `thread/start` for a new one.
 
    Both carry `cwd`, `sandbox` and `approvalPolicy`.
-6. **Turn.** `turn/start` sends the owner's text and images. A follow-up message during a running turn goes in with `turn/steer`; `/stop` sends `turn/interrupt`.
+6. **Turn.** `turn/start` sends the owner's text and images. `ownerTurn` (`codex/format-reminder.ts`) opens each owner turn with the same static channel rules: the file-sending rule, then a short Telegram format reminder (headings on their own line, paragraphs of 1-3 sentences up to 450 characters, one list item per line, bold only for key numbers and the result line; `KROT_FORMAT_REMINDER=off` drops it). The turn with the owner's answers from a question card (`questionFollowUpTurn`) carries the same rules; a parallel owner turn (`sideOwnerTurn`) opens with the format reminder only, since a side reply is delivered without files. They go into the new user message, not the thread instructions, so the cached history before the turn stays the same. A follow-up message during a running turn goes in with `turn/steer`; `/stop` sends `turn/interrupt`.
 7. **Events.** App-server sends notifications:
    - `turn/started`, `item/started`, `item/completed` (commentary, milestones, the final answer),
    - `item/commandExecution/outputDelta` (for the mirror),
+   - `item/reasoning/summaryPartAdded`, `item/reasoning/summaryTextDelta` (thoughts in the status bubble, step 8),
    - `turn/plan/updated` (HUD plan),
    - `thread/tokenUsage/updated` (HUD context),
    - `thread/goal/updated`,
    - `turn/completed` (end of the turn: completed, interrupted or failed).
 
    App-server requests that need an answer become cards (see [Approval and question cards](#approval-and-question-cards)).
-8. **Status and mirror.** Each event goes to `CodexWorkStatus` (`codex/work-status.ts`), which edits the status bubble: `working -- Ns` and up to three lines of current activity. When the bot sends a new message, the bubble is reposted below it. The mirror (`codex/mirror.ts`) edits one silent message with the stage and the last lines of command output, at most once per second.
-9. **Reply.** On `turn/completed` the final text goes through `deliverReply` and `sendFinalText`. The bridge tries a Rich Message first (`sendRichMessage`, Markdown rendered by Telegram, up to 32768 bytes) when the reply has no files, fits the limit and has no expandable quote. Otherwise, or after the rich latch has switched off, it converts Markdown to Telegram HTML, splits it into parts and sends them with `parse_mode: 'HTML'`, falling back to plain text on a parse error. Each part's delivery is saved in `codex-inbox.json`. Files follow as attachments.
-10. **HUD.** After the turn `hud.bump` deletes the old HUD card, sends a fresh one at the bottom and pins it. The bot's own pin service message is deleted. Then `startNext` takes the next queued message.
+8. **Status and mirror.** Each event goes to `CodexWorkStatus` (`codex/work-status.ts`), which edits the status bubble: `working -- Ns` and up to three lines of current activity. When the bot sends a new message, the bubble is reposted below it.
+
+   **Thoughts.** With `status.thoughts.enabled` (`TELEGRAM_STATUS_THOUGHTS=1`, written by `install.sh` for a new install) the owner `turn/start` carries `summary: "auto"`, and the bubble shows the agent's thinking in place of `reasoning...`: `item/reasoning/summaryTextDelta` deltas of the current summary part (`summaryIndex`; `item/reasoning/summaryPartAdded` starts a new one), or the last entry of `summary` on a completed `reasoning` item, and commentary `agentMessage` items. The text loses its `**bold**` part titles, is redacted line by line (`redactSecrets` with the configured secrets), cut to its latest `max_lines` / `max_chars` tail (default 3 lines, 280 characters) and shown line by line, each line word-wrapped to 45-character rows (`status/activity-renderer.ts`, which also caps any thought at the schema maxima of 8 lines and 2000 characters, so the bubble stays under the 4096-character edit limit), and while streaming the last, unfinished word is held back, so half a secret the redactor cannot match yet never shows. Edits come at most once per `read_throttle_ms` and end on the latest text; each one still goes through the shared Telegram rate limiter and 429 cooldown. Only the owner thread's reasoning is shown, and it is cleared when the turn completes. Under `KROT_CODEX_PROXY` the bridge does not send `summary` (the root relay admits a fixed `turn/start` key set); the server's own Codex config decides there. The mirror (`codex/mirror.ts`) edits one silent message with the stage and the last lines of command output, at most once per second.
+9. **Reply.** On `turn/completed` the final text goes through `deliverReply` and `sendFinalText`. A reply that is one block over 600 characters without a blank line is first split into paragraphs at sentence ends (`splitLongBlock`, `format/paragraphs.ts`); code blocks, list items, links, inline code and bold spans are never cut. The bridge tries a Rich Message first (`sendRichMessage`, Markdown rendered by Telegram, up to 32768 bytes) when the reply has no files, fits the limit and has no expandable quote. Otherwise, or after the rich latch has switched off, it converts Markdown to Telegram HTML, splits it into parts and sends them with `parse_mode: 'HTML'`, falling back to plain text on a parse error. Each part's delivery is saved in `codex-inbox.json`, together with the chunk plan (`textPlan`) saved before the first part is sent, so a resumed delivery sends exactly the chunks its `text:N` receipts count; receipts saved without a plan (a bridge before paragraph grouping) resume with that version's chunking (`splitLongBlockLegacy`). Files follow as attachments.
+10. **HUD.** After the turn the HUD card is refreshed in place (`updateNow`); it does not move. The card was already moved under the owner's message when that message was accepted (step 3), and the reply waited for it to land. Then `startNext` takes the next queued message.
 
 ```mermaid
 sequenceDiagram
@@ -216,6 +230,7 @@ sequenceDiagram
     T-->>P: update
     P->>S: owner + private chat check, route
     S->>S: save to codex-inbox.json
+    S->>W: hud.bump (card moves under the owner's message, pinned)
     S->>C: run(input)
     C->>A: thread/resume or thread/start
     C->>A: turn/start
@@ -227,8 +242,8 @@ sequenceDiagram
     C->>A: decision
     A-->>C: turn/completed
     C-->>S: final answer
-    S->>T: sendRichMessage or HTML parts
-    S->>W: hud.bump (new card at the bottom, pinned)
+    S->>T: sendRichMessage or HTML parts (after the card landed)
+    S->>W: hud.updateNow (card refreshed in place)
     T-->>U: reply
 ```
 
@@ -259,7 +274,7 @@ All files are in `TELEGRAM_STATE_DIR` (default `$XDG_STATE_HOME/krotov-plugin`, 
 
 ## Approval and question cards
 
-**Approval requests.** App-server sends `item/commandExecution/requestApproval` or `item/fileChange/requestApproval` when Codex wants to run a command or change a file outside what the sandbox allows. This happens only with `approvalPolicy: on-request`, that is `KROT_CODEX_APPROVALS=1`. `CodexSession` passes the request to `ApprovalCards` (`codex/approvals.ts`).
+**Approval requests.** App-server sends `item/commandExecution/requestApproval` or `item/fileChange/requestApproval` when Codex wants to run a command or change a file outside what the sandbox allows. This happens only with `approvalPolicy: on-request`, that is `KROT_CODEX_APPROVALS=1` without `KROT_CODEX_APPROVAL_MODE=never`. `CodexSession` passes the request to `ApprovalCards` (`codex/approvals.ts`).
 
 - **The card.** The owner gets an HTML card with the working directory and the exact command or diff, and two buttons: «Allow» (`krot:approve:<id>:a`) and «Deny» (`krot:approve:<id>:d`).
 - **The answer.** The callback handler checks owner, private chat and message ID. The decision is returned to app-server as the result of its request. The card is edited to show the decision and loses its buttons.
@@ -290,7 +305,7 @@ The HUD is off by default. Turn it on with `TELEGRAM_HUD_ENABLED=1` or `"hud": {
 
 - `Контекст`: context window use as a bar, percentage and tokens (from `thread/tokenUsage/updated`),
 - the model,
-- the limits line `Лимиты Codex: 5ч N% · неделя N% (сброс DD.MM HH:MM МСК)`: the used share of each limit window, the weekly reset time in Moscow time when app-server gives one,
+- the limits line `Лимиты Codex: потрачено за неделю N% · за 5ч N% (сброс DD.MM HH:MM МСК)`: the used share of each limit window in percent («потрачено», used, never "left"), weekly window first, then the weekly reset time in Moscow time when app-server gives one,
 - the autonomy line (active mandate, open questions),
 - the current plan (`turn/plan/updated`),
 - a **Сжать** (compact) button.
@@ -299,12 +314,49 @@ Limits come from `account/rateLimits/read`, cached for 60 s and refreshed in the
 
 **Two update paths** (`status/context-hud.ts`):
 
-- `updateNow` edits the card in place. It runs on plan changes, milestones, limit changes and commands.
-- `bump` moves the card to the bottom: it deletes the old card (or unpins it when Telegram refuses the delete), sends a new one and pins it. Bumps are debounced per chat (1.5 s); a bump inside the window only edits in place.
+- `updateNow` edits the card in place. It runs on plan changes, milestones, limit changes, commands and at the end of a turn, a compact, a side turn or a goal outcome. It never moves the card.
+- `bump` moves the card to the bottom: it deletes the old card (or unpins it when Telegram refuses the delete), sends a new one and pins it.
 
-`bump` runs when an owner message is accepted or queued, and when a turn, a compact, a side turn or a goal outcome ends.
+`bump` runs only when an owner message is accepted or queued, through `HudAnchor` (`codex/hud-anchor.ts`), so the chat reads owner message, HUD card, reply:
+
+- **Reply after the card.** Every reply waits (`hudAnchor.settled()`) until the card of the latest owner message has landed or Telegram refused it.
+- **Burst coalescing.** An owner message that arrives while a move is in flight does not start a second move and is not dropped: the move in flight is followed by exactly one more, so the card ends up under the newest message. There is no time-based debounce.
+- **Hang guard (30 s).** If Telegram does not answer the card's send within 30 s, the reply goes out without it. The move is then over: its send is cancelled (a send still queued never leaves; one already in flight stops holding the chat's send queue, while the reply still waits for its own rate-limit slot), an owner message that arrived during it gets no trailing move, and the card is retired (`ContextHud.retire`) once it lands, so it never stays below the reply. The next owner message brings a fresh card back.
+- **Retire cleanup.** When Telegram refuses to delete a retired card, it is unpinned and its ID is kept; the next `bump` or `retire` tries the delete again, at most twice more.
 
 Each pin makes Telegram post a "pinned a message" service line. `codex/pin-service.ts` deletes those lines when the bot itself is the sender; pins made by the owner are not touched.
+
+## Widget components
+
+The model can answer with a visual widget instead of a wall of text: key numbers, a chart, steps, a plan with dates, a comparison. The widgets are the Telegram packs of [qwwiwi/html-components](https://github.com/qwwiwi/html-components), vendored in `plugin/vendor/html-components` at a pinned commit (see its `VENDOR.md`). Nothing is fetched at runtime.
+
+**Tools.** A trusted thread (`thread/start`) gets three dynamic tools next to `telegram_action` (`agentTools` in `codex/chat-actions.ts`):
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `component_schema` | `component` | returns the pack's JSON schema and a working example; sends nothing |
+| `send_component` | `component`, `data`, optional `caption`, optional `target` (a known message to reply to) | renders the pack and sends it with Bot API `sendWidget` |
+| `update_component` | `message_id`, `component`, `data` | sends a new widget with the new data and deletes the old one; only an id this bridge run sent as a component is accepted |
+
+There are 16 packs: `kpi`, `bars`, `progress`, `steps`, `compare`, `pros-cons`, `faq`, `status`, `flowchart`, `architecture`, `line-area`, `donut`, `timeline-roadmap`, `radar`, `bars3d`, `network3d`. The turn instructions (`componentInstructions` in `codex/components.ts`) tell the model when to use one, to add 1–2 lines of text about a shown widget, and to end the turn with an empty final answer when the data went out as text.
+
+**Path of a component call.** App-server sends `item/tool/call`; `CodexSession` accepts only the names in `agentTools`, only for a trusted running turn, and passes the tool name to the bridge. `AgentChatActions.component` runs the call on the same queue as `telegram_action`, so a component and an interim reply keep their order, and returns one result per call ID, so a replayed call never sends a second widget. `AgentComponents` (`codex/components.ts`) then:
+
+1. waits for the HUD card (`hudAnchor.settled()`), like every answer, so the chat reads owner message, HUD card, widget;
+2. renders the pack. A chart pack (`flowchart`, `architecture`, `line-area`, `radar`, `donut`, `bars3d`, `network3d`, `timeline-roadmap`) over the size budget is rendered again as its **static variant** without the chart script; the result then carries `"variant":"static"`;
+3. checks the payload (`channel/widget.ts`: html ≤ 32768 bytes and ≤ 4096 bytes after zlib, caption ≤ 1024 characters) and sends it through the usual safe → rate-limited → reliable chain. `sendWidget` uses the chat's send queue and token bucket like `sendMessage`, is never retried after a timeout or 5xx (a retry could show it twice), and its html is never rewritten by redaction: html that looks like it carries a secret is refused before sending;
+4. when Telegram refuses a widget threaded under a message with a 400 whose code ends in `ALLOWED` (such as a `*_NOT_ALLOWED` code), sends it once more without `reply_parameters`: a 400 means nothing was shown, so this cannot double-post;
+5. when the widget cannot be shown (data does not match the schema, still over the budget, Telegram refuses it), sends the same data **once as plain text** and tells the model not to resend it and to end the turn with an empty final answer. When a send fails after Telegram may have taken it (timeout, 5xx), nothing else is sent and the result says the delivery status is unknown.
+
+**Final answer after a component.** `AgentChatActions.componentDelivery` remembers per Codex turn whether its components were shown (`widget`) or fell back to text (`text`), and `componentTexts` the fallback texts that reached the chat; `finalAfterComponents` (`codex/components.ts`) decides what the bridge does with the final answer. An empty final answer after a component sends nothing, not even the "no answer" notice. After a text fallback, a final answer that repeats a delivered fallback text (compared with whitespace collapsed) is dropped too. Any other final answer goes out, however short: it may carry a new result, such as a rollback.
+
+**When a widget is refused.** The tool result carries Telegram's error description, for example `Telegram не принял виджет: Call to 'sendWidget' failed! (400: Bad Request: <CODE>)`. The secret redactor keeps UPPER_SNAKE codes readable (`safety/redact.ts`), so the code in the hint and the logs is the one Telegram sent. A refusal that stays after the retry without the reply, or that is not about the reply, is on the Telegram side: check the code against the Bot API widget documentation and the bot's settings in BotFather. `doctor` does not probe widget support: this bridge knows of no Bot API field that reports it.
+
+A sent component becomes a known message for `telegram_action`, so the model can pin it (reactions go only on inbound owner messages). The IDs `update_component` may replace live in memory; after a restart the model sends a new component.
+
+**Result.** The tool returns JSON such as `{"tool":"send_component","ok":true,"message_ids":[77],"delivery":"widget"}`; `delivery` is `widget`, `text` or `unknown`, and `hint` explains a fallback.
+
+**Root relay.** `plugin/scripts/codex-root-relay.py` admits exactly this tool list (`CHAT_TOOLS`) on `thread/start` and checks each call's arguments against it. When the tools change, update both catalogs; a test compares them.
 
 ## Parallel threads
 
@@ -318,6 +370,18 @@ Off by default; on with `KROT_CODEX_PARALLEL=1` (`codex/parallel.ts`). While the
 **How a side turn works.** Its instructions tell Codex what the main thread is doing, not to touch the main task's files, and that a real correction should be sent as a reply or start with a correction word. Side threads do not change `codex-thread.json`, the HUD or the status bubble. `/stop` interrupts them together with the main turn.
 
 **Older side replies.** `KROT_CODEX_SIDE_REPLY=1` is a separate, older feature (`codex/side-reply.ts`). It answers a short side question (for example one starting with «быстрый вопрос:») with a one-off query, timeout 25 s, without starting a thread.
+
+## Inter-agent webhook
+
+A second entry point next to Telegram polling, off by default (`codex/agent-webhook.ts`). Other agents of the same fleet send the Codex agent a message over HTTP; it reaches Codex as data, never as an owner instruction.
+
+- **On.** `main()` calls `agentWebhookSettings(process.env)`. Without `KROT_AGENT_WEBHOOK_LISTEN` nothing listens. With it, `startAgentWebhook` binds that `host:port`; without a token and without an IP allowlist the bridge logs an error and does not start it (it never runs open).
+- **Request.** `POST /webhook` (or `POST /`) with a JSON body `{"message", "chatId", "agentId"}` of at most 64 KB. `Authorization: Bearer <token>` and the socket peer address are checked; `X-Delivery-Id` is the idempotency key (last 500 IDs).
+- **Framing.** The message is wrapped in the `[Inter-agent message – untrusted data from <agentId>; the owner did not write this]` prefix (`codex/provenance.ts`), and the owner gets a short Telegram notice.
+- **Routing.** `routeAgentMessage`: an idle Codex starts a turn, a busy Codex queues it, or with `KROT_CODEX_PARALLEL=1` it opens a side thread. An agent message never steers the main turn.
+- **Limits on agent turns.** Sandbox `workspace-write`, no approvals; no owner-only features (memory, learning, leases, restart, question cards, chat actions, attachments). A side turn lost to a restart lands in `dead-letter/webhook/`.
+
+Operator setup and response codes: [plugin/docs/install.md](../plugin/docs/install.md#inter-agent-webhook).
 
 ## Restart behaviour
 
@@ -367,7 +431,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `TELEGRAM_OPEN_QUESTION_REMINDER_MS` | delay before a reminder about an unanswered question; `0` turns reminders off |
 | `TELEGRAM_ALBUM_FLUSH_MS` | how long to wait for all parts of a photo album |
 | `GROQ_API_KEY` | Groq key for voice transcription |
-| `KROT_CODEX_APPROVAL_MODE` | `standard` (default) or `risky`; `risky` needs `KROT_CODEX_APPROVALS=1` |
+| `KROT_CODEX_APPROVAL_MODE` | `standard` (default when unset), `risky` or `never` (what `install.sh` writes for a new install unless `--approval-mode` says otherwise); `risky` needs `KROT_CODEX_APPROVALS=1`; `never` turns every approval card off even when `KROT_CODEX_APPROVALS=1` (`codex/approval-mode.ts`) |
 | `KROT_CODEX_SANDBOX` | `workspace-write` (default) or `danger-full-access` |
 | `TELEGRAM_WEBHOOK_HOST` | host of the inherited webhook config block; the Codex local endpoint always binds `127.0.0.1` |
 | `TELEGRAM_WEBHOOK_PORT` | port of the local HTTP endpoint for external tasks (with `TELEGRAM_WEBHOOK_TOKEN`) |
@@ -391,6 +455,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `TELEGRAM_RICH_MESSAGES` | `0`/`false`/`no`/`off` turns Rich Messages off; anything else on (default on) |
 | `TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT` | CSV of chat IDs that always get the HTML path |
 | `TELEGRAM_HUD_ENABLED` | turns the HUD on (default off); a falsy value forces it off |
+| `TELEGRAM_STATUS_THOUGHTS` | streams the agent's redacted reasoning summary in the status bubble (`status.thoughts.enabled`, default off; `install.sh` writes `1` for a new install); a falsy value forces it off |
 | `TELEGRAM_OUTBOX_ENABLED` | turns on the persistent outbox for replies blocked by a long flood-wait (default off) |
 | `TELEGRAM_CONTEXT_WINDOW_TOKENS` | context window size override; parsed into `config.json` value `context_window_tokens`, which no code outside `config.ts` reads |
 | `TELEGRAM_OWNER_CHAT_IDS` | CSV of owner chat IDs for owner-only features; falls back to the allowed user IDs |
@@ -399,7 +464,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 
 | Variable | Where | Meaning |
 |---|---|---|
-| `KROT_CODEX_APPROVALS` | `codex/server.ts` | `1` turns on approval cards (`approvalPolicy: on-request`); otherwise `never` |
+| `KROT_CODEX_APPROVALS` | `codex/approval-mode.ts` | `1` turns on approval cards (`approvalPolicy: on-request`) unless `KROT_CODEX_APPROVAL_MODE=never`; otherwise `never` |
 | `KROT_CODEX_AGENT_NAME` | `codex/server.ts` | agent name in status, greetings and exports (default `Codex`) |
 | `KROT_CODEX_MODEL` | `codex/server.ts` | default Codex model; `/cc model` overrides it per conversation |
 | `KROT_CODEX_PROXY` | `codex/server.ts` | absolute path to a relay that connects to a separate app-server ([plugin/docs/root-backend.md](../plugin/docs/root-backend.md)) |
@@ -408,8 +473,18 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_CODEX_MAX_PARALLEL` | `codex/parallel.ts` | maximum threads at once, main included (1 to 8, default 2) |
 | `KROT_CODEX_CORRECTION_WORDS` | `codex/parallel.ts` | CSV of words that mark a message as a correction of the main task |
 | `KROT_CODEX_SIDE_REPLY` | `codex/server.ts` | `1` turns on the older one-off side replies |
+| `KROT_ACK_REACTION` | `codex/reactions.ts` | `off` or unset (the default, also for an upgraded install whose `plugin/.env` lacks the variable): no automatic 👀 on inbound owner messages, nor on the legacy `/hooks/react` receipt (the installer writes `off` for a fresh install); `eyes`, set explicitly: 👀 on every inbound message, as in older versions. Typing and the status bubble do not change; `doctor` shows it |
+| `KROT_REACTION_PALETTE` | `codex/reactions.ts` | comma-separated emoji (up to 10) the agent may react with through `telegram_action` `react`: only on an inbound owner message, one per message, each a Telegram reaction emoji (checked at startup). Default `👍,❤,🔥,🎉,😁,🤔,👏,🙏,💯,🤝` |
+| `KROT_FORMAT_REMINDER` | `codex/format-reminder.ts` | `on` (default, also when unset) adds the short Telegram format reminder to every owner turn; `off` drops it; any other value stops the bridge at start |
+| `KROT_ERROR_LOG_DAYS` | `codex/error-log.ts` | days of the error journal `<state dir>/errors-YYYY-MM-DD.jsonl` to keep: every warn/error log line as one redacted JSON line, one file per UTC day; default 14, values below 7 count as 7, anything else not a whole number as 14; a 50 MB total cap drops the oldest day first, never today; `/doctor` shows the counts for 24 hours and 7 days and the last 5 |
+| `KROT_MENU_COMMANDS` | `codex/commands.ts` | CSV of commands for the Telegram «/» menu, in order (default `new,stop,status,goal,compact,cc,doctor,help`); a listed command the build does not register is skipped; unlisted commands still work and stay in `/help` |
+| `KROT_AGENT_WEBHOOK_LISTEN` | `codex/agent-webhook.ts` | `host:port` of the inter-agent webhook; unset keeps it off |
+| `KROT_AGENT_WEBHOOK_TOKEN` | `codex/agent-webhook.ts` | bearer token the sending agents must present |
+| `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |
 | `KROT_CODEX_SELF_RESTART` | `codex/server.ts` | `1` allows an owner-requested restart (Linux, under systemd) |
 | `KROT_CODEX_COMMANDS_DIR` | `codex/server.ts` | folder with custom prompt commands for `/cc <name>` |
+| `KROT_UPDATE_REMOTE` | `codex/doctor-command.ts` | git remote `/doctor` fetches to compare the install with GitHub; default `public` if present, else `origin` |
+| `KROT_UPDATE_BRANCH` | `codex/doctor-command.ts` | branch of that remote `/doctor` compares with; default `main` |
 | `KROT_CODEX_LEARNING` | `codex/server.ts` | `1` turns on learning memory and `/memory` ([plugin/docs/learning.md](../plugin/docs/learning.md)) |
 | `KROT_CODEX_LEARNING_INTERVAL` | `codex/server.ts` | turns between background reviews (1 to 30, default 10) |
 | `KROT_CODEX_LEARNING_AUTO_SAVE` | `codex/server.ts` | `1` saves learning suggestions as approved without waiting for `/memory approve` |

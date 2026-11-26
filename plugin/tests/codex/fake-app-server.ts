@@ -73,7 +73,9 @@ for await (const line of createInterface({ input: process.stdin })) {
       respond({ rateLimits: { primary: { usedPercent: 16.8, windowDurationMins: 300 } } })
       break
     case 'model/list':
-      respond({ data: [{ model: 'gpt-test', isDefault: true }, { model: 'hidden-test', hidden: true }] })
+      respond({ data: [{ model: 'gpt-test', isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [
+        { reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' },
+      ] }, { model: 'hidden-test', hidden: true }] })
       break
     case 'config/read':
       respond({ config: { mcp_servers: { external: { enabled: true } } } })

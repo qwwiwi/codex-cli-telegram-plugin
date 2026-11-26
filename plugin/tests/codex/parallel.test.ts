@@ -58,7 +58,7 @@ test('the cap counts the main thread: beyond it new messages are queued', () => 
   expect(route('вопрос два', undefined, sides, 2)).toEqual({ route: 'side' })
 })
 
-test('the queue notice and side note say what is running', () => {
+test('[R02] the queue notice and side note say what is running', () => {
   const sides = new SideRegistry()
   sides.begin(7, 'Найди рецепт борща')
   const notice = busyNotice({ title: 'Перепиши лендинг', elapsedMs: 5 * 60_000 }, sides.titles, 2)
@@ -72,4 +72,16 @@ test('the queue notice and side note say what is running', () => {
   expect(note).toContain('2 мин')
   expect(note).toContain('файл')
   expect(sideInstructions({ title: 'x'.repeat(500), elapsedMs: 0 }, ownerProvenance).length).toBeLessThan(1500)
+})
+
+test('[R03] at the largest cap seven side threads run next to the main one and the eighth message waits', () => {
+  const { maxParallel } = parallelSettings({ KROT_CODEX_PARALLEL: '1', KROT_CODEX_MAX_PARALLEL: '8' })
+  expect(maxParallel).toBe(8)
+  const sides = new SideRegistry()
+  for (let id = 1; id <= 7; id++) {
+    expect(route(`вопрос ${id}`, undefined, sides, maxParallel)).toEqual({ route: 'side' })
+    sides.begin(id, `вопрос ${id}`)
+  }
+  expect(sides.size).toBe(7)
+  expect(route('вопрос 8', undefined, sides, maxParallel)).toEqual({ route: 'queue' })
 })

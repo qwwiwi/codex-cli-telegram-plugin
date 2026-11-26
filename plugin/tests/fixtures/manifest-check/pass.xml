@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="6" assertions="6" failures="0" skipped="0" time="0.01">
+  <testsuite name="tests/login.test.ts" file="tests/login.test.ts" tests="4" assertions="4" failures="0" skipped="0" time="0" hostname="localhost">
+    <testsuite name="Login" file="tests/login.test.ts" line="3" tests="3" assertions="3" failures="0" skipped="0" time="0" hostname="localhost">
+      <testcase name="[R01] login page renders" classname="Login" time="0" file="tests/login.test.ts" line="4" assertions="1" />
+      <testcase name="[R02][R03i] logout keeps the session" classname="Login" time="0" file="tests/login.test.ts" line="5" assertions="1" />
+      <testcase name="[D01] bun version" classname="Login" time="0" file="tests/login.test.ts" line="6" assertions="1" />
+    </testsuite>
+  </testsuite>
+  <testsuite name="tests/audit.test.ts" file="tests/audit.test.ts" tests="2" assertions="2" failures="0" skipped="0" time="0" hostname="localhost">
+    <testcase name="[G01] writes &quot;quoted&quot; &amp; &lt;tagged&gt; lines" classname="" time="0" file="tests/audit.test.ts" line="2" assertions="1" />
+    <testcase name="[R04] draft report" classname="" time="0" file="tests/audit.test.ts" line="3" assertions="1">
+    </testcase>
+  </testsuite>
+</testsuites>

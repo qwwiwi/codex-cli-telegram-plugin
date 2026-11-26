@@ -86,6 +86,7 @@ import type {
   SendMessageOpts,
   SendRichMessageOpts,
   SendRichMessageResult,
+  SendWidgetParams,
   TelegramApi,
 } from '../channel/tools.js'
 
@@ -351,6 +352,10 @@ export function createReliableTelegramApi(
       chat_id: d.chatId,
       attempts,
       error_class: errorClass,
+      // The Telegram error itself (redacted by the logger), so the journal says why the send failed.
+      error: record.error,
+      ...(typeof (err as { error_code?: unknown } | null)?.error_code === 'number'
+        ? { code: (err as { error_code: number }).error_code } : {}),
     })
   }
 
@@ -443,6 +448,14 @@ export function createReliableTelegramApi(
       // layer.
       const res = await raw.sendRichMessage(chatId, rawMarkdown, richOpts)
       if ('message_id' in res) stampOutbound(chatId)
+      return res
+    },
+
+    async sendWidget(chatId, params: SendWidgetParams): Promise<{ message_id: number }> {
+      // NOT retried: a widget send is non-idempotent and its transient errors are
+      // ambiguous (the widget may have landed); a retry could show it twice.
+      const res = await raw.sendWidget(chatId, params)
+      stampOutbound(chatId)
       return res
     },
 

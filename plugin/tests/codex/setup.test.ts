@@ -3,6 +3,9 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statS
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+import { type ApprovalEnv, resolveApprovalSetup } from '../../src/codex/approval-mode.js'
+import { loadConfig } from '../../src/config.js'
+
 const source = resolve(import.meta.dir, '../../..')
 const temporary: string[] = []
 const token = '123456789:setup_fixture_token'
@@ -87,6 +90,102 @@ test('install configures a private owner and checks doctor without starting the 
   expect(repeated.code, repeated.text).toBe(0)
   expect(readFileSync(file, 'utf8')).toBe(saved)
   expect(readFileSync(profile, 'utf8')).toBe('A custom profile\n')
+})
+
+// Reads the approval lines of plugin/.env into the shape resolveApprovalSetup takes.
+function approvalEnv(file: string): ApprovalEnv {
+  const lines = readFileSync(file, 'utf8').split('\n')
+  const value = (name: string) => lines.filter(line => line.startsWith(name + '=')).at(-1)?.slice(name.length + 1)
+  return { KROT_CODEX_APPROVALS: value('KROT_CODEX_APPROVALS'), KROT_CODEX_APPROVAL_MODE: value('KROT_CODEX_APPROVAL_MODE') }
+}
+
+test('[R01] a fresh install defaults to approval mode never, so the agent never waits for a card', () => {
+  const { repo, env } = checkout()
+  const result = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(result.code, result.text).toBe(0)
+  const saved = approvalEnv(join(repo, 'plugin/.env'))
+  expect(saved).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' })
+  expect(resolveApprovalSetup(saved)).toEqual({ cards: false, risky: false })
+  expect(result.text).toContain('Режим подтверждений: never')
+})
+
+test('[R02] a fresh install shows the agent thoughts in the working bubble and an existing one keeps its choice', () => {
+  const { repo, env } = checkout()
+  const file = join(repo, 'plugin/.env')
+  const thoughts = () => {
+    const saved = Object.fromEntries(readFileSync(file, 'utf8').trim().split('\n').map(line => {
+      const at = line.indexOf('=')
+      return [line.slice(0, at), line.slice(at + 1).replace(/^"(.*)"$/, '$1')]
+    }))
+    return loadConfig({ ...saved, XDG_STATE_HOME: env.XDG_STATE_HOME }).status.thoughts?.enabled ?? false
+  }
+  const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(fresh.code, fresh.text).toBe(0)
+  expect(readFileSync(file, 'utf8')).toContain('TELEGRAM_STATUS_THOUGHTS=1\n')
+  expect(thoughts()).toBe(true)
+  // An install made before this setting has no line; a rerun leaves it as it was.
+  writeFileSync(file, readFileSync(file, 'utf8').replace('TELEGRAM_STATUS_THOUGHTS=1\n', ''), { mode: 0o600 })
+  const rerun = command(repo, env, 'bash', './install.sh', '--non-interactive', '--approval-mode', 'standard')
+  expect(rerun.code, rerun.text).toBe(0)
+  expect(readFileSync(file, 'utf8')).not.toContain('TELEGRAM_STATUS_THOUGHTS')
+  expect(thoughts()).toBe(false)
+})
+
+test('[R02] a fresh install switches the automatic 👀 off, an existing install keeps its setting', () => {
+  const { repo, env } = checkout()
+  const file = join(repo, 'plugin/.env')
+  const ack = () => readFileSync(file, 'utf8').split('\n').filter(line => line.startsWith('KROT_ACK_REACTION='))
+  const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(fresh.code, fresh.text).toBe(0)
+  expect(ack()).toEqual(['KROT_ACK_REACTION=off'])
+  // An install that predates the setting: a rerun leaves it unset, so the legacy 👀 stays.
+  writeFileSync(file, readFileSync(file, 'utf8').replace('KROT_ACK_REACTION=off\n', ''))
+  expect(command(repo, env, 'bash', './install.sh', '--non-interactive').code).toBe(0)
+  expect(ack()).toEqual([])
+})
+
+test('[R01] the installer offers never and keeps standard selectable, on a fresh and on an existing install', () => {
+  const { repo, env } = checkout()
+  const help = command(repo, env, 'bash', './install.sh', '--help')
+  expect(help.text).toContain('--approval-mode never|standard|risky')
+  const file = join(repo, 'plugin/.env')
+  const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321', '--approval-mode', 'standard')
+  expect(fresh.code, fresh.text).toBe(0)
+  expect(approvalEnv(file)).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'standard' })
+  expect(resolveApprovalSetup(approvalEnv(file))).toEqual({ cards: true, risky: false })
+  // A rerun without --approval-mode keeps the owner's earlier choice.
+  expect(command(repo, env, 'bash', './install.sh', '--non-interactive').code).toBe(0)
+  expect(approvalEnv(file).KROT_CODEX_APPROVAL_MODE).toBe('standard')
+  const switched = command(repo, env, 'bash', './install.sh', '--approval-mode', 'never')
+  expect(switched.code, switched.text).toBe(0)
+  expect(approvalEnv(file)).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' })
+  expect(command(repo, env, 'bash', './install.sh', '--approval-mode', 'sometimes').code).not.toBe(0)
+})
+
+test('[R18] the generated agent profile explains subagents and parallel side threads', () => {
+  const { repo, env, home } = checkout()
+  const result = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321', '--agent-name', 'Helper')
+  expect(result.code, result.text).toBe(0)
+  const profile = readFileSync(join(home, 'krotov-workspace/AGENTS.md'), 'utf8')
+  const section = profile.slice(profile.indexOf('## Субагенты и параллельные потоки'))
+  expect(section.startsWith('## Субагенты и параллельные потоки')).toBe(true)
+  for (const word of ['multi_agent_v2', 'spawn_agent', 'wait', 'close_agent', 'KROT_CODEX_PARALLEL']) {
+    expect(section).toContain(word)
+  }
+  expect(section).toMatch(/параллельн\S* поток/)
+})
+
+test('[R90] the generated agent profile says where the bridge error journal lives and how to read it', () => {
+  const { repo, env, home } = checkout()
+  const result = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321', '--agent-name', 'Helper')
+  expect(result.code, result.text).toBe(0)
+  const profile = readFileSync(join(home, 'krotov-workspace/AGENTS.md'), 'utf8')
+  const section = profile.slice(profile.indexOf('## Журнал ошибок моста'))
+  expect(section.startsWith('## Журнал ошибок моста')).toBe(true)
+  expect(section).toContain(join(home, '.local/state/krotov-plugin') + '/errors-ГГГГ-ММ-ДД.jsonl')
+  // The path is quoted in the commands, so a state directory with a space still works.
+  expect(section).toContain(`'${join(home, '.local/state/krotov-plugin')}'/errors-$(date -u +%F).jsonl`)
+  expect(section).toContain(`grep -h '"level":"error"'`)
 })
 
 test('an agent can pair a new bot without requesting an ID and opt into service startup', () => {

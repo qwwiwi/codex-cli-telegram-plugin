@@ -35,6 +35,8 @@ Full list: [CHANGELOG.md](CHANGELOG.md).
 - **Telegram widget components.** Render answers with the components from
   [qwwiwi/html-components](https://github.com/qwwiwi/html-components).
   Done when: answers can include a widget; plain-text fallback when Telegram rejects it.
+  Status: done, not released yet: `send_component`, `update_component` and `component_schema`
+  ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#widget-components)).
 - **Measured cache hit rate.** Measure how often side threads and new turns hit the
   prompt cache over time, not only the share of the last turn.
   Done when: the bridge logs the cache hit rate per turn and shows it in the HUD.

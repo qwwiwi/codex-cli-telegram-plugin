@@ -1,6 +1,8 @@
 import { accessSync, constants, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, sep } from 'node:path'
-import { loadConfig, RuntimeEnvSchema } from '../src/config.js'
+import { loadConfig, type RuntimeEnv, RuntimeEnvSchema } from '../src/config.js'
+import { type ApprovalSetup, resolveApprovalSetup } from '../src/codex/approval-mode.js'
+import { ackReactionMode, parseReactionPalette } from '../src/codex/reactions.js'
 import { CodexRpc, object } from '../src/codex/rpc.js'
 
 type Check = { status: 'ok' | 'warning' | 'error'; message: string }
@@ -41,14 +43,26 @@ export async function probeProxy(workspace: string, env: NodeJS.ProcessEnv, comm
   } finally { clearTimeout(timer); rpc.close() }
 }
 
-async function checkCodex(env: NodeJS.ProcessEnv, workspace?: string): Promise<Check> {
+export async function checkCodex(env: NodeJS.ProcessEnv, workspace?: string,
+  probe: typeof probeProxy = probeProxy): Promise<Check> {
   if (env.KROT_CODEX_PROXY) {
     if (env.KROT_CODEX_APPROVALS !== '1' || !isAbsolute(env.KROT_CODEX_PROXY) ||
         !Bun.which(env.KROT_CODEX_PROXY)) {
       return { status: 'error', message: 'KROT_CODEX_PROXY требует абсолютный путь к исполняемому файлу и KROT_CODEX_APPROVALS=1.' }
     }
+    // Startup refuses the proxy without approval cards: resolve the mode the bridge will run with.
+    let cards = false
+    try {
+      cards = resolveApprovalSetup({
+        KROT_CODEX_APPROVALS: env.KROT_CODEX_APPROVALS,
+        KROT_CODEX_APPROVAL_MODE: env.KROT_CODEX_APPROVAL_MODE,
+      }).cards
+    } catch { /* risky without KROT_CODEX_APPROVALS=1: startup fails, so no cards either. */ }
+    if (!cards) {
+      return { status: 'error', message: 'KROT_CODEX_PROXY работает только с карточками подтверждения: режим never с прокси мост не запустит. Укажите KROT_CODEX_APPROVAL_MODE=standard или risky.' }
+    }
     if (!workspace) return { status: 'error', message: 'Нужна доступная рабочая папка для проверки прокси.' }
-    return probeProxy(workspace, env, ['/usr/bin/sudo', '-n', '--', env.KROT_CODEX_PROXY])
+    return probe(workspace, env, ['/usr/bin/sudo', '-n', '--', env.KROT_CODEX_PROXY])
   }
   const codex = Bun.which('codex')
   if (!codex) return { status: 'error', message: 'Codex CLI не найден в PATH. Установите его и проверьте codex --version.' }
@@ -79,6 +93,33 @@ async function telegram(method: TelegramMethod, token: string): Promise<Record<s
   return data.ok ? data.result ?? null : null
 }
 
+// The reaction settings; the schema has already validated both, so this only reports them.
+function reactionCheck(env: RuntimeEnv): Check {
+  const ack = ackReactionMode(env) === 'off'
+    ? 'автоматической 👀 на входящие нет (KROT_ACK_REACTION=off)'
+    : 'мост ставит 👀 на каждое входящее (KROT_ACK_REACTION=eyes)'
+  return { status: 'ok', message: `Реакции: ${ack}; агент сам выбирает из палитры ${parseReactionPalette(env.KROT_REACTION_PALETTE).join(' ')}.` }
+}
+
+// The approval mode the bridge will run with, as resolveApprovalSetup decides it.
+function approvalModeCheck(env: NodeJS.ProcessEnv): Check {
+  let setup: ApprovalSetup
+  try {
+    setup = resolveApprovalSetup({
+      KROT_CODEX_APPROVALS: env.KROT_CODEX_APPROVALS,
+      KROT_CODEX_APPROVAL_MODE: env.KROT_CODEX_APPROVAL_MODE,
+    })
+  } catch {
+    return { status: 'error', message: 'Для KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1 в plugin/.env.' }
+  }
+  if (!setup.cards) {
+    return { status: 'ok', message: 'Режим подтверждений: never. Агент работает автономно, без карточек подтверждения; действия, которым нужно подтверждение, не выполняются.' }
+  }
+  return setup.risky
+    ? { status: 'ok', message: 'Режим подтверждений: risky. Карточки приходят только для рискованных и неясных действий.' }
+    : { status: 'ok', message: 'Режим подтверждений: standard. Codex присылает карточку перед действием за пределами песочницы.' }
+}
+
 export async function runDoctor(
   env: NodeJS.ProcessEnv,
   probes: Probes = { checkCodex, telegram },
@@ -96,10 +137,7 @@ export async function runDoctor(
     const fields = [...new Set(parsed.error.issues.map(issue => issue.path.join('.')))]
     checks.push({ status: 'error', message: `Проверьте переменные в plugin/.env: ${fields.join(', ')}.` })
   }
-  if (parsed.success && parsed.data.KROT_CODEX_APPROVAL_MODE === 'risky') {
-    report(env.KROT_CODEX_APPROVALS === '1', 'Включён режим карточек для рискованных команд.',
-      'Для KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1 в plugin/.env.')
-  }
+  if (parsed.success) checks.push(approvalModeCheck(env), reactionCheck(parsed.data))
   let config: ReturnType<typeof loadConfig> | undefined
   if (parsed.success) {
     try {
@@ -107,6 +145,11 @@ export async function runDoctor(
     } catch {
       checks.push({ status: 'error', message: 'Проверьте JSON и права чтения для TELEGRAM_CONFIG_FILE или config.json в папке состояния.' })
     }
+  }
+  if (config) {
+    checks.push(config.status.thoughts?.enabled
+      ? { status: 'ok', message: 'Мысли агента в карточке работы: включены; секреты, токены и пути в них скрываются.' }
+      : { status: 'ok', message: 'Мысли агента в карточке работы: выключены. Включить: TELEGRAM_STATUS_THOUGHTS=1 в plugin/.env.' })
   }
   const ownerId = env.TELEGRAM_ALLOWED_USER_IDS?.trim()
   report(Boolean(ownerId && /^[1-9]\d*$/.test(ownerId)

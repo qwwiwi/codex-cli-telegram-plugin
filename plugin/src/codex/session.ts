@@ -3,7 +3,7 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { resolve as resolvePath } from 'node:path'
 import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rpc.js'
 import { sameFilePatch, type NativeFileChange } from './file-approval.js'
-import { agentChatTool, type AgentChatActions } from './chat-actions.js'
+import { agentTools, type AgentChatActions } from './chat-actions.js'
 import { isRoutineServerCommand } from './server-approval-policy.js'
 import { parseMcpApproval } from './mcp-approval.js'
 import { parseRateLimits, type CodexLimitWindow } from '../status/codex-limits.js'
@@ -47,6 +47,16 @@ export interface TurnOptions {
   untrusted?: boolean
 }
 
+// A model from the App Server's model/list with the reasoning efforts it accepts.
+export interface CodexModel {
+  name: string
+  default: boolean
+  efforts: string[]
+  defaultEffort?: string
+}
+
+const effortName = /^[a-z]{1,16}$/
+
 export type PolicyApprovalRequest = ApprovalRequest & {
   kind: 'command' | 'file'
   operation?: { threadId: string; turnId: string; itemId: string }
@@ -59,6 +69,10 @@ type Settings = {
   command?: readonly [string, ...string[]]
   model?: string
   selectedModel?: () => string | undefined
+  // Owner-chosen reasoning effort (turn/start `effort`); undefined: the model default.
+  selectedEffort?: () => string | undefined
+  // Ask for reasoning summaries (turn/start `summary: "auto"`) so the working bubble can show them.
+  reasoningSummary?: boolean
   onThread?: (threadId: string) => void
   onProgress?: (kind: string) => void
   onActivity?: (event: CodexEvent, currentThread: string | null) => void
@@ -68,7 +82,8 @@ type Settings = {
   riskyApprovals?: boolean
   sandbox?: CodexSandboxMode
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
-  chatAction?: (key: string, args: unknown, current: () => boolean) => ReturnType<AgentChatActions['call']>
+  // `tool` is one of agentTools: telegram_action or a component tool.
+  chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) => ReturnType<AgentChatActions['call']>
   // Operational notes without user content, e.g. a fallback the bridge took.
   onWarning?: (message: string) => void
 }
@@ -296,11 +311,21 @@ export class CodexSession {
     }
   }
 
-  async models(): Promise<Array<{ name: string; default: boolean }>> {
+  async models(): Promise<CodexModel[]> {
     const reply = await this.rpc.request('model/list', { limit: 100, includeHidden: false })
     return Array.isArray(reply.data) ? reply.data.map(object)
       .filter(x => typeof x.model === 'string' && x.hidden !== true)
-      .map(x => ({ name: x.model as string, default: x.isDefault === true })) : []
+      .map(x => {
+        // Only short lowercase names: they go into Telegram callback data and back to turn/start.
+        const efforts = Array.isArray(x.supportedReasoningEfforts) ? [...new Set(x.supportedReasoningEfforts
+          .map(option => object(option).reasoningEffort)
+          .filter((effort): effort is string => typeof effort === 'string' && effortName.test(effort)))] : []
+        const fallback = x.defaultReasoningEffort
+        return {
+          name: x.model as string, default: x.isDefault === true, efforts,
+          ...(typeof fallback === 'string' && efforts.includes(fallback) ? { defaultEffort: fallback } : {}),
+        }
+      }) : []
   }
 
   async usageLimits(): Promise<CodexLimitWindow[]> {
@@ -342,10 +367,14 @@ export class CodexSession {
     return this.withTurn(async (threadId, turn) => {
       if (options.untrusted) turn.untrusted = true
       const model = this.settings.selectedModel?.() ?? this.settings.model
+      const effort = this.settings.selectedEffort?.()
       const response = await this.rpc.request('turn/start', {
         threadId,
         // A turn override stays for later turns; resending an unchanged model is noise.
         ...(model && model !== this.model ? { model } : {}),
+        // The effort is sent with every turn: a fresh or resumed thread would otherwise fall back to the model default.
+        ...(effort ? { effort } : {}),
+        ...(this.settings.reasoningSummary ? { summary: 'auto' } : {}),
         ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
@@ -402,11 +431,14 @@ export class CodexSession {
   // thread and an untrusted (agent) side starts a fresh one.
   // `onStarted` fires once Codex accepted the turn.
   async runSide(text: string, imagePaths: readonly string[] = [], reuse?: string,
-    onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string }> {
+    onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string; turnId?: string }> {
     if (reuse !== undefined && (!this.sideThreads.has(reuse) || this.sides.has(reuse))) {
       throw new Error('This side thread is not available')
     }
+    // Model and effort are read together before the thread opens: a switch meanwhile never pairs one model with
+    // another model's effort; it applies from the next turn.
     const model = this.settings.selectedModel?.() ?? this.settings.model
+    const effort = this.settings.selectedEffort?.()
     // Registered before thread/start so a stop during start-up is never missed.
     const starting = { stop: false }
     this.startingSides.add(starting)
@@ -429,6 +461,7 @@ export class CodexSession {
       const response = await this.rpc.request('turn/start', {
         threadId,
         ...(sendModel ? { model } : {}),
+        ...(effort ? { effort } : {}),
         ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
@@ -440,7 +473,7 @@ export class CodexSession {
       if (sendModel && this.sideThreads.has(threadId)) this.sideThreads.set(threadId, model)
       if (!turn.id) this.setTurnId(turn, id)
       onStarted?.(threadId)
-      return { ...await completed, threadId }
+      return { ...await completed, threadId, turnId: id }
     } finally {
       if (this.sides.get(threadId) === turn) this.sides.delete(threadId)
     }
@@ -464,7 +497,7 @@ export class CodexSession {
       cwd: this.settings.cwd,
       ...this.permissions(),
       ...(model ? { model } : {}),
-      ...(this.settings.chatAction ? { dynamicTools: [agentChatTool] } : {}),
+      ...(this.settings.chatAction ? { dynamicTools: agentTools } : {}),
     })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || id === this.threadId) throw new Error('Codex did not return a side thread ID')
@@ -589,7 +622,7 @@ export class CodexSession {
       ? await this.rpc.request('thread/resume', { ...options, threadId: expected, excludeTurns: true })
       : await this.rpc.request('thread/start', {
         ...options,
-        ...(this.settings.chatAction ? { dynamicTools: [agentChatTool] } : {}),
+        ...(this.settings.chatAction ? { dynamicTools: agentTools } : {}),
       })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || (expected && id !== expected)) {
@@ -817,10 +850,11 @@ export class CodexSession {
       const { threadId, turnId, callId, namespace, tool, arguments: args } = params
       const run = this.settings.chatAction
       const turn = this.runningTurns().find(turn => turn.threadId === threadId && turn.id === turnId)
-      if (!run || !turn || turn.untrusted || namespace !== null || tool !== agentChatTool.name ||
+      if (!run || !turn || turn.untrusted || namespace !== null || typeof tool !== 'string' ||
+          !agentTools.some(entry => entry.name === tool) ||
           typeof callId !== 'string' || !/^[\w.:-]{1,128}$/u.test(callId)) return
       return this.withServerRequest(id, turn.threadId, signal =>
-        run(JSON.stringify([threadId, turnId, callId]), args, () => !signal.aborted && this.runningTurns().includes(turn)))
+        run(JSON.stringify([threadId, turnId, callId]), args, () => !signal.aborted && this.runningTurns().includes(turn), tool))
     }
     if (method === 'item/tool/requestUserInput') {
       const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active

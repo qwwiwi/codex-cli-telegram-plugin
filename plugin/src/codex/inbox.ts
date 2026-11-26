@@ -14,7 +14,9 @@ type Work = { continuation?: ContinuationContext; lease?: LeaseTicket; mayRestar
   verificationEligible?: true; voiceTaskText?: string }
 type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string } |
   { stage: 'ready'; reply: InboxReply; continueGoal?: true; restartBridge?: true; restartVerification?: true;
-    delivery?: Record<string, PartStatus> }
+    delivery?: Record<string, PartStatus>;
+    // The Telegram HTML chunks the `text:N` receipts refer to, saved before the first text part is sent.
+    textPlan?: string[] }
 type Active = { messages: Message[]; outcome: Outcome; work?: Work }
 // A side turn Codex accepted (turn/start answered); kept until the side turn finishes.
 // `unconfirmed`: a follow-up held by recovery because its dead letter could not be written.
@@ -56,6 +58,14 @@ export class CodexInbox {
       const first = state.active?.messages[0]
       if (legacy && first && state.active?.outcome.stage !== 'claimed') {
         state.origins[String(first.message_id)] = agentProvenance('unknown')
+      }
+      // A damaged or empty chunk plan is dropped rather than trusted (an empty one would finish the reply without
+      // its text); its receipts then resume like receipts saved without a plan.
+      const outcome = state.active?.outcome
+      if (outcome?.stage === 'ready' && outcome.textPlan !== undefined &&
+          !(Array.isArray(outcome.textPlan) && outcome.textPlan.length > 0 &&
+            outcome.textPlan.every(part => typeof part === 'string'))) {
+        delete outcome.textPlan
       }
       if (state.active && (!first || state.origins[String(first.message_id)]?.origin !== 'owner')) {
         state.active = withoutOwnerMetadata(state.active)
@@ -220,6 +230,20 @@ export class CodexInbox {
     this.updateActive(id, { ...active.outcome, delivery })
   }
 
+  replyPlan(id: number): readonly string[] | undefined {
+    const active = this.state.active
+    return active?.messages[0]?.message_id === id && active.outcome.stage === 'ready'
+      ? active.outcome.textPlan : undefined
+  }
+
+  setReplyPlan(id: number, parts: readonly string[]): void {
+    const active = this.state.active
+    if (active?.messages[0]?.message_id !== id || active.outcome.stage !== 'ready') {
+      throw new Error('Pending reply changed during delivery')
+    }
+    this.updateActive(id, { ...active.outcome, textPlan: [...parts] })
+  }
+
   finish(id: number): void {
     const { active, ...pending } = this.state
     if (active?.messages[0]?.message_id === id) this.save(pending)
@@ -233,7 +257,8 @@ export class CodexInbox {
     if (!continuation && !mayRestartBridge && !verificationEligible && !voiceTaskText && !restart) return
     const outcome = active.outcome.stage === 'ready'
       ? { stage: 'ready' as const, reply: active.outcome.reply,
-        ...(active.outcome.delivery ? { delivery: active.outcome.delivery } : {}) } : active.outcome
+        ...(active.outcome.delivery ? { delivery: active.outcome.delivery } : {}),
+        ...(active.outcome.textPlan ? { textPlan: active.outcome.textPlan } : {}) } : active.outcome
     this.save({ ...this.state, active: { ...active, work, outcome } })
   }
 
@@ -274,10 +299,10 @@ export class CodexInbox {
 function withoutOwnerMetadata(active: Active): Active {
   const { work: _work, ...rest } = active
   if (active.outcome.stage !== 'ready') return { ...rest, outcome: active.outcome }
-  const { reply, delivery } = active.outcome
+  const { reply, delivery, textPlan } = active.outcome
   const textParts = Object.entries(delivery ?? {}).filter(([key]) => !key.startsWith('file:'))
   const outcome: Outcome = { stage: 'ready', reply: { ...reply, files: [] },
-    ...(textParts.length ? { delivery: Object.fromEntries(textParts) } : {}) }
+    ...(textParts.length ? { delivery: Object.fromEntries(textParts) } : {}), ...(textPlan ? { textPlan } : {}) }
   return { ...rest, outcome }
 }
 

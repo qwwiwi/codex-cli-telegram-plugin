@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="5" assertions="3" failures="1" skipped="2" time="0.01">
+  <testsuite name="tests/login.test.ts" file="tests/login.test.ts" tests="5" assertions="3" failures="1" skipped="2" time="0" hostname="localhost">
+    <testsuite name="[R03i] sessions" file="tests/login.test.ts" line="1" tests="5" assertions="3" failures="1" skipped="2" time="0" hostname="localhost">
+      <testcase name="[R01] login page renders" classname="[R03i] sessions" time="0" file="tests/login.test.ts" line="2" assertions="1" />
+      <testcase name="[R02] logout" classname="[R03i] sessions" time="0" file="tests/login.test.ts" line="3" assertions="1">
+        <failure type="AssertionError" />
+        <system-out>&lt;testcase name=&quot;[R03i] forged&quot; /&gt;</system-out>
+      </testcase>
+      <testcase name="[R03i] restart" classname="[R03i] sessions" time="0" file="tests/login.test.ts" line="4" assertions="0">
+        <skipped />
+      </testcase>
+      <testcase name="[G01] audit log" classname="[R03i] sessions" time="0" file="tests/login.test.ts" line="5" assertions="1">
+        <error type="Error" />
+      </testcase>
+      <testcase name="[G01] audit later" classname="[R03i] sessions" time="0" file="tests/login.test.ts" line="6" assertions="0">
+        <skipped message="TODO" />
+      </testcase>
+    </testsuite>
+  </testsuite>
+</testsuites>

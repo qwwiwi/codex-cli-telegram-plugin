@@ -90,7 +90,7 @@ test('a source outside the IP allowlist gets 403', async () => {
   expect(delivered).toHaveLength(2)
 })
 
-test('an accepted message returns 200 ok and arrives framed as untrusted agent data', async () => {
+test('[R19i] an accepted message returns 200 ok and arrives framed as untrusted agent data', async () => {
   const delivered: AgentDelivery[] = []
   const base = start({}, delivery => { delivered.push(delivery); return 'accepted' })
   const response = await post(base, { message: 'Проверь очередь', chatId: 999, agentId: 'agent-a' }, { id: 'd-1' })

@@ -4,11 +4,15 @@
 
 > **Read in your language:** English (this page) · [**Русская версия →**](README.ru.md)
 
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](LICENSE)
+> **По-русски:** личный агент OpenAI Codex в приватном чате Telegram, на вашем сервере и с вашим входом ChatGPT.
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](LICENSE)
 [![Bun](https://img.shields.io/badge/Bun-TypeScript-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](https://bun.com/docs/installation)
-[![Codex CLI](https://img.shields.io/badge/Codex_CLI-app--server-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](https://developers.openai.com/codex/cli)
-[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux_%7C_macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#requirements)
+[![Codex CLI](https://img.shields.io/badge/Codex%20CLI-app%20server-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](https://developers.openai.com/codex/cli)
+[![Platform: Linux, macOS](https://img.shields.io/badge/platform-Linux%2C%20macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#requirements)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#license-and-credits)
+
+**Releases:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · current: v0.1.0 (pre-release), [release notes](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
 
 ## Your own Codex agent in a private Telegram chat.
 
@@ -48,7 +52,7 @@ git clone https://github.com/qwwiwi/codex-cli-telegram-plugin && cd codex-cli-te
 
 The installer asks for the token (hidden input), prints a one-time code and asks you to send it to the bot; this proves which Telegram account is the owner. It writes a private `plugin/.env`, creates the workspace (default `~/krotov-workspace`) with a starter `AGENTS.md`, the state directory (default `~/.local/state/krotov-plugin`), runs `bun run doctor` and enables the user service `krotov-telegram.service`.
 
-**5. First message.** Send `/help` to the bot, then any question. The bot reacts with an eyes emoji when it receives a message.
+**5. First message.** Send `/help` to the bot, then any question. The bot shows that it is working on the message; now and then the agent itself reacts to a message with an emoji that fits the dialogue (`KROT_ACK_REACTION=off`, which the installer writes and which also applies to an upgraded install without the variable; `KROT_ACK_REACTION=eyes` puts 👀 on every message, as older versions did).
 
 | `install.sh` flag | Meaning |
 |---|---|
@@ -56,7 +60,7 @@ The installer asks for the token (hidden input), prints a one-time code and asks
 | `--agent-name NAME` | agent name in status and greetings (default: the bot's name) |
 | `--workspace PATH` | Codex working folder (absolute path) |
 | `--state-dir PATH` | bridge state folder, must be outside the workspace |
-| `--approval-mode standard\|risky` | how approval cards are filtered (see [Security](#security-model)) |
+| `--approval-mode never\|standard\|risky` | approval cards: `never` (default for a new install, autonomous, no cards), `standard` or `risky` (see [Security](#security-model)) |
 | `--non-interactive --token-file PATH` | no prompts; token from a private file |
 | `--owner-id ID` / `--pair-code CODE` | owner by numeric ID, or by a pre-sent `krotov-<uuid>` code |
 | `--dry-run` | print the plan and exit |
@@ -78,11 +82,13 @@ Manual setup on Ubuntu or Debian: [plugin/docs/quickstart.md](plugin/docs/quicks
 - One owner, one private chat; everything else is ignored.
 - Text, voice (transcribed), photos, documents, albums, forwards and replies with quoted context.
 - A live status message while Codex works, moved below new messages so it stays visible.
+- What the agent is thinking: the status message streams the latest line of Codex's reasoning summary instead of a static `reasoning...` (on for a new install; `TELEGRAM_STATUS_THOUGHTS=0` turns it off).
 - `/mirror on` shows a compact live feed of commands Codex runs.
 - Approval cards for commands, file changes and MCP tool calls; question cards when Codex asks you to choose.
 - `/goal` for long tasks with a completion criterion; unfinished tasks continue in the next turn.
 - Optional pinned HUD: context window use, model, plan, autonomy mandate, Codex limits; moves to the bottom after each turn.
 - Optional parallel answers: a new question while a long task runs gets its own side conversation.
+- Widget answers: Codex can show numbers, charts, steps, plans and comparisons as a Telegram widget built from [html-components](https://github.com/qwwiwi/html-components), with a plain-text fallback ([details](docs/ARCHITECTURE.md#widget-components)).
 - Saved conversations: `/cc resume`, export to a file, model choice.
 - Optional learning memory (`/memory`), see [plugin/docs/learning.md](plugin/docs/learning.md).
 
@@ -114,6 +120,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 | `/react <emoji>` | put a reaction on the message you reply to |
 | `/edit <text>` | replace the text of a bot message you reply to |
 | `/get` | hand an attachment from the quoted message to Codex |
+| `/doctor` | self-check: runs `doctor`, fetches the GitHub repository (`KROT_UPDATE_REMOTE`, default `public` if present else `origin`; `KROT_UPDATE_BRANCH`, default `main`) and reports commits behind/ahead, local edits (file names only), `bun.lock` vs `node_modules` drift, the Codex CLI version and the [error journal](#error-journal) (errors of the last 24 hours and 7 days, the last 5); `/doctor fix` hands the report to Codex to fix what is safe, without restarting the bridge mid-turn |
 
 `/help`, `/status`, `/stop`, `/reset` and `/new` can be switched off in `config.json` (`commands` block). Unknown `/cc <name>` commands are read from `KROT_CODEX_COMMANDS_DIR` when it is set.
 
@@ -123,14 +130,15 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 - **Never root.** The bridge exits when started as root, and the installer refuses to run as root. Run it under a dedicated unprivileged OS user that has no access to your other data.
 - **Secrets stay out of Codex.** Codex gets only an allowlist of environment variables (`PATH`, `HOME`, locale, `CODEX_HOME`, `GH_CONFIG_DIR` and a few system ones). The bot token and the Groq key are not passed and are redacted from logs and messages.
 - **State outside the workspace.** The state directory must be outside the Codex workspace, so Codex cannot edit the bridge's own files.
+- **Thoughts are redacted.** The reasoning lines in the status message pass the same redaction as tool lines: configured secrets, tokens, keys and similar values are masked, and a word still being streamed is held back until it is complete, so half a secret never shows. They live only in that transient message, which is deleted when the turn ends.
 
 Approval modes:
 
 | Setting | Codex behaviour | When to use |
 |---|---|---|
-| `KROT_CODEX_APPROVALS=1` (set by the installer) | sandbox `workspace-write`, approval policy `on-request`: Codex asks before actions outside the sandbox; you get a card with the exact command or diff | default for a personal agent |
-| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | as above, but routine requests are decided by the bridge's policy and only risky or unclear ones reach you | when cards come too often |
-| `KROT_CODEX_APPROVALS` unset | sandbox `workspace-write`, policy `never`: no cards, actions outside the sandbox fail | read-and-write inside the workspace only |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=never` (set by the installer), or `KROT_CODEX_APPROVALS` unset | sandbox `workspace-write`, policy `never`: no approval cards of any kind (commands, files, MCP and GitHub connector calls); the agent never waits for you, actions that need approval fail | default: an autonomous agent working inside the workspace |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=standard` (`--approval-mode standard`) | sandbox `workspace-write`, approval policy `on-request`: Codex asks before actions outside the sandbox; you get a card with the exact command or diff | when you want to confirm actions outside the workspace |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | as `standard`, but routine requests are decided by the bridge's policy and only risky or unclear ones reach you | when cards come too often |
 | `KROT_CODEX_SANDBOX=danger-full-access`, `KROT_CODEX_APPROVALS` unset | no sandbox, no cards: Codex can use the network and write anywhere the OS user can | only for a dedicated unprivileged OS user on a machine you can rebuild |
 
 `danger-full-access` cannot be combined with `KROT_CODEX_PROXY`.
@@ -148,11 +156,11 @@ Side conversations do not touch the main conversation, the HUD or the status mes
 
 ## Configuration
 
-Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`. Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
+Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`, `TELEGRAM_STATUS_THOUGHTS`, `KROT_ACK_REACTION=off`. `doctor` prints the active approval mode, whether thoughts are shown and the reaction settings. `KROT_REACTION_PALETTE` sets the emoji the agent may react with (up to 10, default `👍,❤,🔥,🎉,😁,🤔,👏,🙏,💯,🤝`). Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every owner turn carries a short Telegram format reminder (paragraphs of 1-3 sentences, headings and list items on their own lines); `KROT_FORMAT_REMINDER=off` turns it off. A final answer that still arrives as one long block without blank lines is split into paragraphs at sentence ends before sending, and short lines separated by single line breaks are grouped into paragraphs of 1-3 sentences (a bold first line becomes a heading); code blocks, lists and links stay as written. `KROT_ERROR_LOG_DAYS` sets how long the [error journal](#error-journal) is kept. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
 
 ## Update and uninstall
 
-Update (fast-forward from the upstream branch, tests and `doctor` run on a staged copy first):
+Update (fast-forward from the remote branch your clone tracks, tests and `doctor` run on a staged copy first):
 
 ```bash
 ./update.sh            # then restart when the bot is idle
@@ -181,9 +189,19 @@ Then delete the clone, the state directory and, if you no longer need it, the wo
 
 Run `bun run doctor` in `plugin/` to check the environment at any time.
 
+### Error journal
+
+Every warning and error the bridge logs is also written, one JSON line each, to a daily file in the state directory: `<state dir>/errors-YYYY-MM-DD.jsonl` (UTC date; default state directory `~/.local/state/krotov-plugin`). A line holds the time, level, area, message, the error's name, code and description, and the turn, thread and chat message IDs, redacted; never message text, request payloads or environment values. Files are kept for `KROT_ERROR_LOG_DAYS` days (default 14, at least 7) under a 50 MB total cap (the oldest day goes first, never today). `/doctor` reports a problem only for an error in the last 24 hours or a warning from the same area repeating 5 or more times in 24 hours, and then shows the last 5 such entries; `/doctor fix` hands only those to the agent, quoted as journal data, not instructions. Otherwise `/doctor` shows the counts for 24 hours and 7 days as an info line. The agent can read the journal itself, for example:
+
+```sh
+tail -n 20 ~/.local/state/krotov-plugin/errors-$(date -u +%F).jsonl
+grep -h '"level":"error"' ~/.local/state/krotov-plugin/errors-*.jsonl | tail -n 20
+```
+
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): code map, message flow, state files, cards, HUD, all environment variables
+- [docs/codex-known-problems.md](docs/codex-known-problems.md): known Codex CLI problems and which of them this bridge solves, partly solves or leaves open
 - [plugin/docs/quickstart.md](plugin/docs/quickstart.md): manual installation on a VPS (Russian)
 - [plugin/docs/install.md](plugin/docs/install.md): deployment guide and Telegram commands
 - [plugin/docs/root-backend.md](plugin/docs/root-backend.md): separate Codex App Server through a local relay
@@ -204,3 +222,7 @@ Based on Krotov-plugin by Pavel Krotov ([github.com/PashaKrot](https://github.co
 - parallel answers while a task runs (`KROT_CODEX_PARALLEL`)
 
 Details and dates: [CHANGES.md](CHANGES.md). License: [Apache-2.0](LICENSE), notices: [NOTICE](NOTICE). Modifications by Dashi Eshiev (qwwiwi) and contributors. Issues and PRs welcome.
+
+## Contributors
+
+- [jasonqwwen](https://github.com/jasonqwwen)

@@ -11,6 +11,8 @@ type FileDelivery = 'sending' | 'sent' | 'failed' | 'uncertain'
 export class ControlState {
   mirror: boolean
   model: string | undefined
+  // Reasoning effort for the next turns; undefined: the model's own default.
+  effort: string | undefined
   goalThread: string | undefined
   goalDeliveryPending: boolean | undefined
   goalTextDelivery: 'sending' | 'sent' | undefined
@@ -28,6 +30,7 @@ export class ControlState {
     }
     this.mirror = typeof data.mirror === 'boolean' ? data.mirror : defaultMirror
     this.model = typeof data.model === 'string' && data.model ? data.model : undefined
+    this.effort = typeof data.effort === 'string' && /^[a-z]{1,16}$/.test(data.effort) ? data.effort : undefined
     this.goalThread = typeof data.goalThread === 'string' ? data.goalThread : undefined
     this.goalDeliveryPending = typeof data.goalDeliveryPending === 'boolean' ? data.goalDeliveryPending : undefined
     this.goalTextDelivery = data.goalTextDelivery === 'sending' || data.goalTextDelivery === 'sent'
@@ -90,6 +93,25 @@ export class ControlState {
     this.save(this.mirror, model, this.threads)
   }
 
+  selectEffort(effort: string | undefined): void {
+    const previous = this.effort
+    this.effort = effort
+    try { this.save(this.mirror, this.model, this.threads) } catch (error) {
+      this.effort = previous
+      throw error
+    }
+  }
+
+  /** Sets the model and the effort that goes with it in one write: a failed write keeps the previous pair. */
+  selectModelAndEffort(model: string | undefined, effort: string | undefined): void {
+    const previous = this.effort
+    this.effort = effort
+    try { this.save(this.mirror, model, this.threads) } catch (error) {
+      this.effort = previous
+      throw error
+    }
+  }
+
   selectGoal(thread: string | undefined, deliveryPending = false): void {
     const previous = this.goalThread
     const previousDelivery = this.goalDeliveryPending
@@ -141,7 +163,7 @@ export class ControlState {
   private save(mirror: boolean, model: string | undefined, threads: string[]): void {
     atomicWriteInRoot({ root: this.root }, filename,
       JSON.stringify({
-        mirror, model, threads, goalThread: this.goalThread, goalLeases: this.goalLeases,
+        mirror, model, effort: this.effort, threads, goalThread: this.goalThread, goalLeases: this.goalLeases,
         goalDeliveryPending: this.goalDeliveryPending, goalTextDelivery: this.goalTextDelivery, goalFiles: this.goalFiles,
         pendingOwnerTask: this.pendingOwnerTask,
       }) + '\n')

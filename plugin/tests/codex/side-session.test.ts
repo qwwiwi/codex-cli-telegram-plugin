@@ -36,7 +36,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-test('a side turn answers on its own thread while the main turn keeps running', async () => {
+test('[R02] a side turn answers on its own thread while the main turn keeps running', async () => {
   const { session, readThread } = fixture()
   await session.initialize()
   const main = session.run('wait')
@@ -59,7 +59,10 @@ test('a side turn answers on its own thread while the main turn keeps running', 
   expect(await session.steer('уточнение', 5)).toBe(true)
   // A reply to the side conversation reuses its thread.
   const again = await session.runSide('ещё', [], side.threadId)
-  expect(again).toEqual({ status: 'completed', text: 'side: ещё', threadId: side.threadId })
+  expect(again).toEqual({ status: 'completed', text: 'side: ещё', threadId: side.threadId, turnId: expect.any(String) })
+  // Each turn on the reused thread has its own ID: tool deliveries are counted per turn.
+  expect(typeof again.turnId).toBe('string')
+  expect(again.turnId).not.toBe(side.turnId)
   await session.stop()
   expect((await main).status).toBe('interrupted')
 })

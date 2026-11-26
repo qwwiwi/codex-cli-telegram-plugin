@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { z } from 'zod'
+import { parseReactionPalette } from './codex/reactions.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // AppConfig — the merged, validated runtime config.
@@ -169,7 +170,9 @@ export const AppConfigSchema = z.object({
     // default: it inverts the deliberate "drop freeform Claude text" privacy
     // policy, so it is opt-in per channel. All text is redacted (paths,
     // tokens, IPs) before render, same as tool lines. Optional block — absent
-    // → feature off, legacy configs need no migration.
+    // → feature off, legacy configs need no migration. The Codex bridge
+    // (codex/work-status.ts) streams the reasoning summary from app-server
+    // instead; there read_throttle_ms is the minimum gap between its edits.
     thoughts: z.object({
       enabled: z.boolean().default(false),
       // Tail length of the narration shown in the bubble (chars / lines).
@@ -512,15 +515,32 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_ALLOWED_CHAT_IDS: z.string().optional(),
   TELEGRAM_WORKSPACE_ROOT: z.string().optional(),
   TELEGRAM_STATUS_INTERVAL_MS: z.coerce.number().int().positive().optional(),
+  // Streaming thoughts in the working bubble (status.thoughts.enabled). Same
+  // shape as TELEGRAM_HUD_ENABLED: 0/false/no/off forces it off, any other
+  // value on. Unset = config.json / schema default (off). A fresh install
+  // writes TELEGRAM_STATUS_THOUGHTS=1.
+  TELEGRAM_STATUS_THOUGHTS: z
+    .string()
+    .transform((v) => !/^(0|false|no|off)$/i.test(v.trim()))
+    .optional(),
   // Delay before the first open-question reminder. 0 switches the feature off
   // — one knob per channel.env, no second boolean to keep in sync.
   TELEGRAM_OPEN_QUESTION_REMINDER_MS: z.coerce.number().int().nonnegative().optional(),
   TELEGRAM_ALBUM_FLUSH_MS: z.coerce.number().int().positive().optional(),
   GROQ_API_KEY: z.string().optional(),
-  KROT_CODEX_APPROVAL_MODE: z.enum(['standard', 'risky']).optional(),
+  // never: no approval cards at all, even with KROT_CODEX_APPROVALS=1 (codex/approval-mode.ts).
+  KROT_CODEX_APPROVAL_MODE: z.enum(['standard', 'risky', 'never']).optional(),
   // Codex sandbox (session.ts CodexSandboxMode). Absent means workspace-write.
   // danger-full-access only for a dedicated unprivileged OS user.
   KROT_CODEX_SANDBOX: z.enum(['workspace-write', 'danger-full-access']).optional(),
+  // Reactions (codex/reactions.ts). off: no automatic 👀 on inbound owner messages; unset keeps eyes.
+  KROT_ACK_REACTION: z.enum(['off', 'eyes']).optional(),
+  // The emoji the agent may react with itself, comma-separated; each must be a Telegram reaction.
+  KROT_REACTION_PALETTE: z.string().superRefine((value, ctx) => {
+    try { parseReactionPalette(value) } catch (error) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: error instanceof Error ? error.message : String(error) })
+    }
+  }).optional(),
   TELEGRAM_WEBHOOK_HOST: z.string().optional(),
   TELEGRAM_WEBHOOK_PORT: z.coerce.number().int().min(0).optional(),
   TELEGRAM_WEBHOOK_TOKEN: z.string().optional(),
@@ -727,6 +747,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const status = (merged.status && typeof merged.status === 'object' ? merged.status : {}) as Record<string, unknown>
   if (parsedEnv.TELEGRAM_STATUS_INTERVAL_MS !== undefined) {
     status.interval_ms = parsedEnv.TELEGRAM_STATUS_INTERVAL_MS
+  }
+  if (parsedEnv.TELEGRAM_STATUS_THOUGHTS !== undefined) {
+    const thoughts = status.thoughts && typeof status.thoughts === 'object' ? status.thoughts : {}
+    status.thoughts = { ...thoughts, enabled: parsedEnv.TELEGRAM_STATUS_THOUGHTS }
   }
   if (Object.keys(status).length > 0) merged.status = status
 
