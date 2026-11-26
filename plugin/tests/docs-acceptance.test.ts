@@ -60,13 +60,18 @@ test('[R10] release notes, the changelog and a Releases link for v0.1.0 are publ
   expect(line!).toContain('CHANGELOG.md')
 })
 
-test('[R15] the operator guide shows how to enable Codex subagents with a thread cap', () => {
+test('[R15][R18] the operator guide shows how to enable Codex subagents with a thread cap of 6', () => {
   const doc = read('plugin/docs/install.md')
   const section = doc.slice(doc.indexOf('## Codex subagents'))
   expect(section.startsWith('## Codex subagents')).toBe(true)
   const toml = /```toml\n([\s\S]*?)```/.exec(section)?.[1] ?? ''
   expect(toml).toMatch(/^\[features\]\nmulti_agent_v2 = true$/m)
-  expect(toml).toMatch(/^\[agents\]\nmax_threads = \d+$/m)
+  // Codex CLI 0.172 key: agents.max_concurrent_threads_per_session (max_threads is rejected).
+  expect(toml).toMatch(/^\[agents\]\nmax_concurrent_threads_per_session = 6$/m)
+  expect(doc).not.toContain('max_threads')
+  const profile = read('examples/AGENTS.example.md')
+  expect(profile).toContain('[agents] max_concurrent_threads_per_session')
+  expect(profile).not.toContain('max_threads')
   for (const word of ['KROT_CODEX_PARALLEL', 'KROT_CODEX_MAX_PARALLEL', 'side thread', 'approval']) {
     expect(section).toContain(word)
   }

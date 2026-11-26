@@ -70,7 +70,7 @@ When I hit one of these, I do everything else and ask one concrete question.
 **Subagents (`multi_agent_v2`).** `spawn_agent` starts one, `wait` waits for its
 result, `send_input` sends a follow-up, `close_agent` closes it, `list_agents`
 shows who is alive. At most as many at once as the Codex thread cap allows
-(`[agents] max_threads`). Each gets a narrow task and a criterion; two never
+(`[agents] max_concurrent_threads_per_session`). Each gets a narrow task and a criterion; two never
 edit the same files; I check every result myself and close all of them before
 my report. For a review of my own work I use a subagent with fresh context, not
 a fork of my conversation: the author does not review themselves.

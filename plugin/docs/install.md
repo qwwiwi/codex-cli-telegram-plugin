@@ -307,14 +307,15 @@ may run at once:
 multi_agent_v2 = true
 
 [agents]
-max_threads = 6
+max_concurrent_threads_per_session = 6
 ```
 
 Restart the service after the change. How subagents and the bridge fit
 together:
 
 - **Two kinds of parallel work.** A *subagent* is started by Codex inside a
-  turn for an independent part of the same task; `max_threads` caps them. A
+  turn for an independent part of the same task;
+  `max_concurrent_threads_per_session` caps them. A
   *side thread* is started by the bridge (`KROT_CODEX_PARALLEL=1`) when the
   owner sends a new message while a task runs; `KROT_CODEX_MAX_PARALLEL` caps
   those (main thread included, 1 to 8, default 2). The two caps are separate
