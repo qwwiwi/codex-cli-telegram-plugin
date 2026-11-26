@@ -120,6 +120,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 | `/react <emoji>` | put a reaction on the message you reply to |
 | `/edit <text>` | replace the text of a bot message you reply to |
 | `/get` | hand an attachment from the quoted message to Codex |
+| `/usage [1\|7\|30]` | Token usage and UTC daily trends from local Codex logs. Defaults to seven days. See [usage analytics](docs/usage-analytics.md). |
 | `/doctor` | self-check: runs `doctor`, fetches the GitHub repository (`KROT_UPDATE_REMOTE`, default `public` if present else `origin`; `KROT_UPDATE_BRANCH`, default `main`) and reports commits behind/ahead, local edits (file names only), `bun.lock` vs `node_modules` drift, the Codex CLI version and the [error journal](#error-journal) (errors of the last 24 hours and 7 days, the last 5); `/doctor fix` hands the report to Codex to fix what is safe, without restarting the bridge mid-turn |
 
 `/help`, `/status`, `/stop`, `/reset` and `/new` can be switched off in `config.json` (`commands` block). Unknown `/cc <name>` commands are read from `KROT_CODEX_COMMANDS_DIR` when it is set.

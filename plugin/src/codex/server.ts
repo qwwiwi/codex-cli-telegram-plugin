@@ -39,6 +39,7 @@ import { CardCleanup } from './card-cleanup.js'
 import { extractAttachments, sendAttachment } from './attachments.js'
 import { formatReminderEnabled, ownerTurn, questionFollowUpTurn, sideOwnerTurn } from './format-reminder.js'
 import { codexAgentName, codexCommandSet, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
+import { collectUsage, usageCommand } from './usage-command.js'
 import { collectDoctorReport, DoctorCommand, runDoctorScript } from './doctor-command.js'
 import {
   directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
@@ -1189,6 +1190,7 @@ async function main(): Promise<void> {
     }
 
     const bridgeRepo = join(import.meta.dir, '..', '..', '..')
+    const usage = usageCommand(days => collectUsage(bridgeRepo, paths.root, days), send)
     const doctor = new DoctorCommand({
       collect: () => collectDoctorReport({
         repo: bridgeRepo, env: process.env,
@@ -1274,6 +1276,10 @@ async function main(): Promise<void> {
       }
       if (name === 'stop') return stop()
       if (name === 'compact') return compact()
+      if (name === 'usage') {
+        void usage(args).catch((error: unknown) => warnError(error, 'Could not deliver /usage'))
+        return
+      }
       if (name === 'doctor') {
         // In the background: the checks take up to a minute and must not hold /stop and other updates.
         void doctor.handle(args, async text => {

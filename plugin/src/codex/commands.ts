@@ -4,6 +4,7 @@ import type { Logger } from '../log.js'
 const specs = [
   { command: 'help', description: 'справка по командам' },
   { command: 'status', description: 'снимок плагина и сессии' },
+  { command: 'usage', description: 'расход токенов и динамика за 1, 7 или 30 дней' },
   { command: 'stop', description: 'прервать текущую задачу' },
   { command: 'reset', description: 'сбросить сессию (нужен force)' },
   { command: 'new', description: 'начать новую сессию' },

@@ -3,6 +3,10 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
+## Usage analytics
+
+- Added the owner command `/usage` and a local JSON export for token trends and observed subscription quota. [Usage analytics](docs/usage-analytics.md).
+
 ## v0.3.1.1
 
 Fix release on top of v0.3.1. Release notes: [docs/releases/v0.3.1.1.md](docs/releases/v0.3.1.1.md).
