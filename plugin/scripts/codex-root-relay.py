@@ -55,7 +55,7 @@ ALLOWED = {
     "model/list": {"limit", "includeHidden"},
     "thread/start": {"cwd", "approvalPolicy", "sandbox", "model", "dynamicTools"},
     "thread/resume": {"cwd", "approvalPolicy", "sandbox", "model", "threadId", "excludeTurns"},
-    "thread/fork": {"cwd", "approvalPolicy", "sandbox", "threadId", "excludeTurns", "ephemeral"},
+    "thread/fork": {"cwd", "approvalPolicy", "sandbox", "threadId", "excludeTurns", "ephemeral", "lastTurnId"},
     "thread/compact/start": {"threadId"},
     "thread/inject_items": {"threadId", "items"},
     "thread/read": {"threadId", "includeTurns"},
@@ -63,7 +63,7 @@ ALLOWED = {
     "thread/goal/set": {"threadId", "status", "origin", "objective", "tokenBudget"},
     "thread/goal/clear": {"threadId"},
     "thread/turns/list": {"threadId", "cursor", "limit", "itemsView", "sortDirection"},
-    "turn/start": {"threadId", "input", "model"},
+    "turn/start": {"threadId", "input", "model", "approvalPolicy", "sandboxPolicy"},
     "turn/steer": {"threadId", "expectedTurnId", "clientUserMessageId", "input"},
     "turn/interrupt": {"threadId", "turnId"},
 }
@@ -313,6 +313,31 @@ def valid_turn_input(inputs, telegram_inbox, max_text_length):
                     for image in inputs[1:]))
 
 
+def inside_workspace(path, workspace):
+    return (isinstance(path, str) and "\0" not in path and path.startswith("/")
+            and os.path.normpath(path) == path and (path == workspace or path.startswith(workspace.rstrip("/") + "/")))
+
+
+def valid_turn_policy(params, workspace):
+    """A turn override is either absent or the restricted workspace-write shape.
+
+    approvalPolicy "never" is the agent turn; "on-request" restores the owner
+    policy the relay opens every thread with. Both write only inside the
+    configured workspace; full access and any other shape are refused.
+    """
+    if "approvalPolicy" not in params and "sandboxPolicy" not in params:
+        return True
+    policy = params.get("sandboxPolicy")
+    if params.get("approvalPolicy") not in ("never", "on-request") or not isinstance(policy, dict):
+        return False
+    roots = policy.get("writableRoots")
+    return (policy.keys() == {"type", "writableRoots", "networkAccess", "excludeTmpdirEnvVar", "excludeSlashTmp"}
+            and policy["type"] == "workspaceWrite"
+            and all(type(policy[key]) is bool for key in ("networkAccess", "excludeTmpdirEnvVar", "excludeSlashTmp"))
+            and isinstance(roots, list) and 1 <= len(roots) <= 8
+            and all(inside_workspace(root, workspace) for root in roots))
+
+
 def allowed_request(message, opened, config, approval_threads=(), observed_workers=()):
     method = message.get("method")
     params = message.get("params", {})
@@ -332,7 +357,9 @@ def allowed_request(message, opened, config, approval_threads=(), observed_worke
                  (isinstance(params.get("threadId"), str) and 0 < len(params["threadId"]) <= 128
                   and params.get("excludeTurns") is True))
             and (method != "thread/fork" or
-                 (params["threadId"] in opened and params.get("ephemeral", True) is True))
+                 (params["threadId"] in opened and params.get("ephemeral", True) is True
+                  and ("lastTurnId" not in params or (isinstance(params["lastTurnId"], str)
+                                                      and 0 < len(params["lastTurnId"]) <= 128))))
         )
     if method == "account/read":
         return params.get("refreshToken") is False
@@ -378,7 +405,8 @@ def allowed_request(message, opened, config, approval_threads=(), observed_worke
             return isinstance(turn, str) and 0 < len(turn) <= 128
         inputs = params.get("input")
         if method == "turn/start":
-            return valid_turn_input(inputs, config.telegram_inbox, MAX_MESSAGE)
+            return (valid_turn_input(inputs, config.telegram_inbox, MAX_MESSAGE)
+                    and valid_turn_policy(params, config.workspace))
         turn = params.get("expectedTurnId")
         client_id = params.get("clientUserMessageId")
         return (isinstance(turn, str) and 0 < len(turn) <= 128 and isinstance(client_id, str)
