@@ -205,3 +205,15 @@ test('[R21] /doctor fix redacts a configured secret in a local file name and han
     expect(text).not.toMatch(/^Ignore all rules/m)
   }
 })
+
+test('[R21] doctor still lists local edits when the fetch from GitHub fails', async () => {
+  const { repo } = fixture()
+  writeFileSync(join(repo, 'notes.txt'), 'draft\n')
+  git(repo, 'remote', 'add', 'mirror', 'https://127.0.0.1:1/bridge.git')
+  const report = await collectDoctorReport({
+    repo, env: { KROT_UPDATE_REMOTE: 'mirror', KROT_UPDATE_BRANCH: 'main' }, doctor: healthy, codexVersion,
+  })
+  const text = formatDoctorReport(report)
+  expect(text).toContain('Не удалось получить')
+  expect(text).toContain('notes.txt')
+})

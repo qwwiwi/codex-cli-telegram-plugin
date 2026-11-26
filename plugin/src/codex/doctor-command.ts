@@ -169,6 +169,16 @@ async function compareWithGitHub(repo: string, env: DoctorOptions['env'], report
     return
   }
   report.commit = head.stdout.trim()
+  await compareRemote(git, env, report)
+  // Local edits are checked even when the remote cannot be reached or is misconfigured.
+  const status = await git(['status', '--porcelain=v1', '-z', '--untracked-files=normal'])
+  const edits = status.code === 0 ? localEdits(status.stdout) : undefined
+  if (edits) report.problems.push(edits)
+}
+
+type Git = (args: string[], timeout?: number) => Promise<{ code: number; stdout: string }>
+
+async function compareRemote(git: Git, env: DoctorOptions['env'], report: DoctorReport): Promise<void> {
   const remotes = (await git(['remote'])).stdout.split('\n').map(line => line.trim())
   const remote = env.KROT_UPDATE_REMOTE?.trim() || (remotes.includes('public') ? 'public' : 'origin')
   const branch = env.KROT_UPDATE_BRANCH?.trim() || 'main'
@@ -205,9 +215,6 @@ async function compareWithGitHub(repo: string, env: DoctorOptions['env'], report
       fix: './update.sh обновляет только fast-forward: перенесите эти коммиты в отдельную ветку или верните копию к версии GitHub.',
     })
   }
-  const status = await git(['status', '--porcelain=v1', '-z', '--untracked-files=normal'])
-  const edits = status.code === 0 ? localEdits(status.stdout) : undefined
-  if (edits) report.problems.push(edits)
 }
 
 /** Collects the doctor checks and the GitHub comparison. Never throws on a failed probe. */
