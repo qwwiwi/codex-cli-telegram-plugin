@@ -131,6 +131,19 @@ test('[R02] a fresh install shows the agent thoughts in the working bubble and a
   expect(thoughts()).toBe(false)
 })
 
+test('[R02] a fresh install switches the automatic 👀 off, an existing install keeps its setting', () => {
+  const { repo, env } = checkout()
+  const file = join(repo, 'plugin/.env')
+  const ack = () => readFileSync(file, 'utf8').split('\n').filter(line => line.startsWith('KROT_ACK_REACTION='))
+  const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(fresh.code, fresh.text).toBe(0)
+  expect(ack()).toEqual(['KROT_ACK_REACTION=off'])
+  // An install that predates the setting: a rerun leaves it unset, so the legacy 👀 stays.
+  writeFileSync(file, readFileSync(file, 'utf8').replace('KROT_ACK_REACTION=off\n', ''))
+  expect(command(repo, env, 'bash', './install.sh', '--non-interactive').code).toBe(0)
+  expect(ack()).toEqual([])
+})
+
 test('[R01] the installer offers never and keeps standard selectable, on a fresh and on an existing install', () => {
   const { repo, env } = checkout()
   const help = command(repo, env, 'bash', './install.sh', '--help')

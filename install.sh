@@ -184,6 +184,8 @@ else
     printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "${approval_mode:-never}"
     # The working bubble streams the agent's redacted reasoning summaries; 0 turns it off.
     printf 'TELEGRAM_STATUS_THOUGHTS=1\n'
+    # No automatic 👀 on every message: the agent reacts itself, rarely, from KROT_REACTION_PALETTE.
+    printf 'KROT_ACK_REACTION=off\n'
   } > "$tmp_env"
   unset setup_token
   ln -- "$tmp_env" "$env_file" || setup_fail 'Не удалось сохранить plugin/.env. Проверь, не появился ли файл параллельно.'

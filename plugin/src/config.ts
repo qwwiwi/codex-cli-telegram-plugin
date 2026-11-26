@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { z } from 'zod'
+import { parseReactionPalette } from './codex/reactions.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // AppConfig — the merged, validated runtime config.
@@ -532,6 +533,14 @@ export const RuntimeEnvSchema = z.object({
   // Codex sandbox (session.ts CodexSandboxMode). Absent means workspace-write.
   // danger-full-access only for a dedicated unprivileged OS user.
   KROT_CODEX_SANDBOX: z.enum(['workspace-write', 'danger-full-access']).optional(),
+  // Reactions (codex/reactions.ts). off: no automatic 👀 on inbound owner messages; unset keeps eyes.
+  KROT_ACK_REACTION: z.enum(['off', 'eyes']).optional(),
+  // The emoji the agent may react with itself, comma-separated; each must be a Telegram reaction.
+  KROT_REACTION_PALETTE: z.string().superRefine((value, ctx) => {
+    try { parseReactionPalette(value) } catch (error) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: error instanceof Error ? error.message : String(error) })
+    }
+  }).optional(),
   TELEGRAM_WEBHOOK_HOST: z.string().optional(),
   TELEGRAM_WEBHOOK_PORT: z.coerce.number().int().min(0).optional(),
   TELEGRAM_WEBHOOK_TOKEN: z.string().optional(),

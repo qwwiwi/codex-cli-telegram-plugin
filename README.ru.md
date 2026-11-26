@@ -72,7 +72,7 @@ git clone https://github.com/qwwiwi/codex-cli-telegram-plugin && cd codex-cli-te
 5. Запустит проверку `bun run doctor`.
 6. Включит службу `krotov-telegram.service`, чтобы бот работал и после перезагрузки сервера.
 
-**5. Первое сообщение.** Отправьте боту `/help`, потом любой вопрос. Получив сообщение, бот ставит на него реакцию с глазами.
+**5. Первое сообщение.** Отправьте боту `/help`, потом любой вопрос. Бот показывает, что работает над сообщением; иногда агент сам ставит на сообщение подходящую по смыслу реакцию (`KROT_ACK_REACTION=off`, установщик записывает это сам; `eyes` ставит 👀 на каждое сообщение, как в старых установках).
 
 Параметры `install.sh`:
 
@@ -182,7 +182,7 @@ Codex пишет ответ в Markdown — это простая разметк
 
 ## Настройки
 
-Настройки лежат в `plugin/.env` (переменные окружения) и в необязательном `config.json` в папке состояния; переменные окружения важнее. Установщик сам записывает обязательные: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`, `TELEGRAM_STATUS_THOUGHTS`. `doctor` показывает действующий режим подтверждений и включены ли размышления в статусе.
+Настройки лежат в `plugin/.env` (переменные окружения) и в необязательном `config.json` в папке состояния; переменные окружения важнее. Установщик сам записывает обязательные: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`, `TELEGRAM_STATUS_THOUGHTS`, `KROT_ACK_REACTION=off`. `doctor` показывает действующий режим подтверждений, включены ли размышления в статусе и настройки реакций. `KROT_REACTION_PALETTE` задаёт эмодзи, которые агент может ставить сам (до 10, по умолчанию `👍,❤,🔥,🎉,😁,🤔,👏,🙏,💯,🤝`).
 
 Часто добавляют:
 

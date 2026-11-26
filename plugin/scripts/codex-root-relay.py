@@ -40,7 +40,10 @@ CHAT_TOOL = {
             ]},
             "target": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "string", "enum": ["last_reply"]}]},
             "text": {"type": "string", "maxLength": 3900},
-            "emoji": {"type": "string"},
+            "emoji": {"type": "string", "description":
+                      "For react: one emoji from the reaction palette in your instructions, only on an inbound owner "
+                      "message, at most one per message. React rarely and only when it fits the dialogue (a joke, good news, "
+                      "thanks), never on every message."},
             "files": {"type": "array", "maxItems": 10, "items": {"type": "string", "maxLength": 4096}},
             "id": {"type": "string", "maxLength": 256},
             "resolution": {"type": "string", "enum": ["answered"]},
