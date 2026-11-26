@@ -6,6 +6,7 @@ import type { TelegramApi } from '../channel/tools.js'
 import { redactSecrets } from '../safety/redact.js'
 import { attachmentInstructions, extractAttachments } from './attachments.js'
 import { chatContextPrefix } from './chat-actions.js'
+import { formatReminder } from './format-reminder.js'
 import { followUpInstructions, hideContinuationMarker } from './continuation.js'
 import { object } from './rpc.js'
 import { hideQuestionMarker } from './questions.js'
@@ -26,6 +27,7 @@ export function formatConversation(turns: unknown[], partial: boolean, secrets: 
               part.text.startsWith('Служебный результат действия Telegram. Не показывай его владельцу.\n')) return ''
           return part.text
             .replace(attachmentInstructions + '\n\n', '')
+            .replace(formatReminder + '\n\n', '')
             .replace(/^Актуальные мандаты владельца Telegram[^\n]*\n\n/u, '')
             .replace(/^Для большой задачи составь план[^\n]*(?:\r?\n(?!\r?\n)[^\n]*)*\r?\n\r?\n/mu, '')
             .replace(followUpInstructions + '\n\n', '')

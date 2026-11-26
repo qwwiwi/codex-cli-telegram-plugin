@@ -7,6 +7,7 @@ import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
 import { carriesExpandableBlockquote, createTelegramApi, type TelegramApi } from '../channel/tools.js'
 import { getStatePaths, loadConfig, resolveAskGuardMode, resolveHudEnabled, resolveOutboxEnabled, RuntimeEnvSchema } from '../config.js'
 import { splitMessage } from '../format/chunk.js'
+import { splitLongBlock } from '../format/paragraphs.js'
 import { isTelegramHtmlParseError, markdownToTelegramHtml } from '../format/html.js'
 import { contentFitsRichLimits } from '../format/rich.js'
 import { createLogger } from '../log.js'
@@ -36,7 +37,8 @@ import { resolveApprovalSetup, sessionApprovalOptions } from './approval-mode.js
 import { removeOwnPinService } from './pin-service.js'
 import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
-import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
+import { extractAttachments, sendAttachment } from './attachments.js'
+import { formatReminderEnabled, ownerTurn } from './format-reminder.js'
 import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import {
   directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
@@ -105,6 +107,8 @@ async function main(): Promise<void> {
     KROT_CODEX_APPROVAL_MODE: env.KROT_CODEX_APPROVAL_MODE,
   })
   const riskyApprovals = approvalSetup.risky
+  // Throws on any KROT_FORMAT_REMINDER other than on, off or unset (on).
+  const formatReminderOn = formatReminderEnabled(process.env.KROT_FORMAT_REMINDER)
   const agentName = codexAgentName(process.env.KROT_CODEX_AGENT_NAME, config.memory.agent_label)
   const agentTitle = agentName === 'Codex' ? agentName : agentName + ' · Codex'
   const ownerId = config.allowed_user_ids[0]
@@ -586,7 +590,7 @@ async function main(): Promise<void> {
 
     async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number,
       onSent?: (id: number) => void): Promise<void> {
-      text = normalizeChatReply(text)
+      text = splitLongBlock(normalizeChatReply(text))
       if (!text) return
       await hudAnchor.settled()
       const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
@@ -1942,8 +1946,8 @@ async function main(): Promise<void> {
               return
             }
           }
-          let result = await codex.run([
-            attachmentInstructions, leases.instructions(), agentChatInstructions, chatContext(messages),
+          let result = await codex.run(ownerTurn(formatReminderOn, [
+            leases.instructions(), agentChatInstructions, chatContext(messages),
             handoff,
             learning?.context(ownerText ?? input.text) ?? '',
             config.ask_user_question.enabled
@@ -1957,7 +1961,7 @@ async function main(): Promise<void> {
                 'Изменения выполняй после того, как мост подтвердит, что отчёт относится к сохранённому поручению.',
               !editTarget && question.instructions].filter(Boolean).join(' '), input.text,
             ...(editTarget ? ['Для редактирования верни только готовый новый текст цитируемого сообщения в нужном формате.'] : []),
-          ].join('\n\n'), input.images, saveTurn)
+          ]), input.images, saveTurn)
           await agentChat.flush()
           for (let count = 0; count < 4 && !stopping && epoch === stopEpoch && result.status === 'completed'; count++) {
             const requested = !editTarget && question.take(result.text)
