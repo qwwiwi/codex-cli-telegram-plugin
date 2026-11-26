@@ -37,7 +37,7 @@ import { removeOwnPinService } from './pin-service.js'
 import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
 import { attachmentInstructions, extractAttachments, sendAttachment } from './attachments.js'
-import { codexAgentName, codexCommands, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
+import { codexAgentName, codexCommandSet, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import {
   directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
   ownerTaskBlocked, ownerTaskWithdrawn, publicProgress,
@@ -515,7 +515,9 @@ async function main(): Promise<void> {
       outboxTimer.unref()
     }
 
-    const menu = codexCommands(config, !!learning)
+    // Every enabled command is accepted and listed in /help; Telegram's menu
+    // shows only the short list (KROT_MENU_COMMANDS or the default).
+    const commands = codexCommandSet(config, !!learning, process.env.KROT_MENU_COMMANDS, log)
     // Account limits for the HUD: cached for a minute and refreshed in the
     // background, so a slow or failing read never delays or breaks the HUD.
     const codexLimits = new CodexLimitsCache(() => codex.usageLimits(), {
@@ -1193,8 +1195,8 @@ async function main(): Promise<void> {
     }
 
     async function handleCommand(name: string, args: string, messageId?: number): Promise<void> {
-      if (!menu.some(spec => spec.command === name)) {
-        await send('Команда недоступна. Список настроенных команд в меню Telegram.')
+      if (!commands.accepts(name)) {
+        await send('Команда недоступна. Список команд: /help.')
         return
       }
       if (name === 'stop') return stop()
@@ -1228,7 +1230,7 @@ async function main(): Promise<void> {
         return
       }
       if (name === 'help') {
-        await send([agentTitle, ...menu.map(spec => '/' + spec.command + ' — ' + spec.description),
+        await send([agentTitle, ...commands.help.map(spec => '/' + spec.command + ' — ' + spec.description),
           'Можно отправлять текст, голосовые, фото и документы. Чтобы получить файл, попроси прислать его вложением.'].join('\n'))
         return
       }
@@ -1251,7 +1253,7 @@ async function main(): Promise<void> {
       if (name === 'keys') {
         const buttons = [
           ['status', '📋 Статус'], ['stop', '⏹ Стоп'], ['compact', '🗜 Сжать'], ['help', '❔ Справка'],
-        ].filter(([key]) => menu.some(spec => spec.command === key))
+        ].filter(([key]) => commands.accepts(key!))
         await telegram.sendMessage(ownerChat, 'Управление агентом · ' + agentName, {
           reply_markup: { inline_keyboard: [buttons.map(([key, text]) => ({ text: text!, callback_data: 'codex:control:' + key }))] },
         })
@@ -1294,7 +1296,7 @@ async function main(): Promise<void> {
       const name = ctx.callbackQuery.data === HUD_PREFIX + 'compact' ? 'compact' : ctx.callbackQuery.data.split(':')[2]!
       await handleCommand(name, '')
     })
-    void registerOwnerScopedCommands(bot.api, menu, [ownerId], log)
+    void registerOwnerScopedCommands(bot.api, commands.menu, [ownerId], log)
 
     bot.callbackQuery(APPROVAL_CALLBACK, async ctx => {
       if (ctx.from.id !== ownerId || ctx.chat?.type !== 'private' || ctx.chat.id !== ownerId) return
@@ -1627,7 +1629,7 @@ async function main(): Promise<void> {
       }
       if (text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
           (task || codex.isRunning || goalActive || recoveringGoal || deliveringGoal) &&
-          menu.some(spec => spec.command === 'status') && isStatusQuestion(text, agentName)) {
+          commands.accepts('status') && isStatusQuestion(text, agentName)) {
         await handleCommand('status', '')
         return
       }

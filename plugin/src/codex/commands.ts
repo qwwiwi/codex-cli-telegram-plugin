@@ -1,4 +1,5 @@
 import type { AppConfig } from '../config.js'
+import type { Logger } from '../log.js'
 
 const specs = [
   { command: 'help', description: 'справка по командам' },
@@ -24,6 +25,66 @@ export function codexCommands(config: AppConfig, learningEnabled = false) {
   return specs.filter(({ command }) =>
     (command !== 'memory' || learningEnabled) &&
     (!(command in config.commands) || config.commands[command as keyof AppConfig['commands']]))
+}
+
+export interface CodexCommandSpec {
+  command: string
+  description: string
+}
+
+// The Telegram «/» menu shows only the commands needed all the time; every
+// other command still works when typed and stays listed in /help.
+// KROT_MENU_COMMANDS (comma list) replaces this list. /doctor is listed ahead
+// of its registration: the menu skips it until a build registers it.
+export const DEFAULT_MENU_COMMANDS: readonly string[] = ['new', 'stop', 'status', 'goal', 'compact', 'cc', 'doctor', 'help']
+
+// Short menu labels; a command without one keeps its /help description.
+const menuDescriptions: Readonly<Record<string, string>> = {
+  new: 'Новая сессия',
+  stop: 'Прервать задачу',
+  status: 'Состояние и лимиты',
+  goal: 'Длинная цель',
+  compact: 'Сжать контекст',
+  cc: 'Модель и сессии',
+  doctor: 'Самопроверка и сверка с GitHub',
+  help: 'Все команды',
+}
+
+function menuNames(value: string | undefined): readonly string[] {
+  const names = (value ?? '').split(',')
+    .map(name => name.trim().replace(/^\//u, '').toLowerCase())
+    .filter(name => name !== '')
+  return names.length > 0 ? [...new Set(names)] : DEFAULT_MENU_COMMANDS
+}
+
+/**
+ * Splits the commands into what the bot accepts and shows in /help (every
+ * enabled command) and what it publishes in the Telegram menu (the short
+ * list, in its order). A listed command that is not registered is skipped
+ * with a log line. `extra` holds commands registered outside the built-in list.
+ */
+export function codexCommandSet(
+  config: AppConfig,
+  learningEnabled: boolean,
+  menuEnv: string | undefined,
+  log: Pick<Logger, 'info'>,
+  extra: readonly CodexCommandSpec[] = [],
+) {
+  const help: readonly CodexCommandSpec[] = [...codexCommands(config, learningEnabled), ...extra]
+  const menu: CodexCommandSpec[] = []
+  for (const name of menuNames(menuEnv)) {
+    const spec = help.find(item => item.command === name)
+    if (!spec) {
+      log.info('telegram menu: listed command is not registered, skipped', { command: name })
+      continue
+    }
+    menu.push({ command: spec.command, description: menuDescriptions[spec.command] ?? spec.description })
+  }
+  return {
+    help,
+    menu,
+    accepts: (name: string): boolean => help.some(spec => spec.command === name),
+  }
 }
 
 export function codexAgentName(override: string | undefined, previousLabel: string | undefined): string {

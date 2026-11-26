@@ -459,6 +459,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_CODEX_MAX_PARALLEL` | `codex/parallel.ts` | maximum threads at once, main included (1 to 8, default 2) |
 | `KROT_CODEX_CORRECTION_WORDS` | `codex/parallel.ts` | CSV of words that mark a message as a correction of the main task |
 | `KROT_CODEX_SIDE_REPLY` | `codex/server.ts` | `1` turns on the older one-off side replies |
+| `KROT_MENU_COMMANDS` | `codex/commands.ts` | CSV of commands for the Telegram «/» menu, in order (default `new,stop,status,goal,compact,cc,doctor,help`); a listed command the build does not register is skipped; unlisted commands still work and stay in `/help` |
 | `KROT_AGENT_WEBHOOK_LISTEN` | `codex/agent-webhook.ts` | `host:port` of the inter-agent webhook; unset keeps it off |
 | `KROT_AGENT_WEBHOOK_TOKEN` | `codex/agent-webhook.ts` | bearer token the sending agents must present |
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |
