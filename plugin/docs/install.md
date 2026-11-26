@@ -200,7 +200,7 @@ listener is off by default; nothing changes until you set
 
 | Variable | Meaning |
 | --- | --- |
-| `KROT_AGENT_WEBHOOK_LISTEN` | `host:port` to listen on, for example `100.100.79.127:8097`. IPv6 as `[::1]:8097`. |
+| `KROT_AGENT_WEBHOOK_LISTEN` | `host:port` to listen on, for example `192.0.2.10:8097`. IPv6 as `[::1]:8097`. |
 | `KROT_AGENT_WEBHOOK_TOKEN` | Bearer token. When set, `Authorization: Bearer <token>` must match (constant-time compare), otherwise 401. |
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | Comma-separated source IPs. When set, any other socket peer gets 403. `X-Forwarded-For` is ignored. |
 
@@ -248,3 +248,33 @@ or attachments. The reply reaches the owner as «Ответ на сообщен�
 <name>: …». If the bridge stops while an agent's side turn runs, the owner gets
 a plain notice after the restart and the message body is kept in the
 `webhook` dead-letter bucket.
+
+## MCP servers
+
+The bridge does not register MCP servers itself. Codex reads them from its own
+configuration, `config.toml` in `CODEX_HOME` (by default `~/.codex/config.toml`)
+of the user that runs the bridge:
+
+```toml
+# A local server started as a process (stdio).
+[mcp_servers.example-local]
+command = "npx"
+args = ["-y", "example-mcp-server"]
+
+# A remote server over HTTP with a bearer token taken from the environment.
+[mcp_servers.example-remote]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "GBRAIN_BEARER"
+```
+
+Codex starts with a filtered environment (`plugin/src/codex/environment.ts`):
+Telegram and other bridge credentials never reach it. The one credential the
+bridge passes through for MCP servers is `GBRAIN_BEARER`; despite the name it
+works for any HTTP MCP server that reads its token through
+`bearer_token_env_var`. Put the value in `plugin/.env`; logs and replies redact
+it by exact value. A server that needs a different variable needs that name
+added to `codexEnvironment` in `environment.ts`.
+
+With `KROT_CODEX_APPROVALS=1`, an MCP tool call that Codex asks to approve
+shows up as an approval card in Telegram. Restart the service after you change the Codex
+configuration.
