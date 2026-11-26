@@ -6,6 +6,9 @@ import { object, type CodexEvent } from './rpc.js'
 
 type Settings = AppConfig['status']
 const REPOST_DELAY_MS = 120
+// Codex app-server v2 streams a reasoning item's summary as parts (summaryIndex) of text deltas.
+const REASONING_PART = 'item/reasoning/summaryPartAdded'
+const REASONING_DELTA = 'item/reasoning/summaryTextDelta'
 
 function activityCall(item: ReturnType<typeof object>, clean: (text: string) => string): ActivityCall | undefined {
   const tool = typeof item.tool === 'string' ? clean(item.tool) : ''
@@ -53,6 +56,10 @@ export class CodexWorkStatus {
   private backgroundCommands = new Set<string>()
   private calls = new Map<string, ActivityCall>()
   private thought = ''
+  // The summary part being streamed now; a new item or part starts it over.
+  private reasoning = { item: '', index: -1, text: '' }
+  private thoughtTimer: ReturnType<typeof setTimeout> | undefined
+  private lastThoughtAt = Number.NEGATIVE_INFINITY
   private replyTo: number | undefined
   private startedAt = 0
   private lastActivityAt = 0
@@ -101,6 +108,7 @@ export class CodexWorkStatus {
   async close(): Promise<void> {
     this.closed = true
     clearTimeout(this.repostTimer)
+    clearTimeout(this.thoughtTimer)
     this.render()
     await this.pending
   }
@@ -143,7 +151,8 @@ export class CodexWorkStatus {
   receive({ method, params }: CodexEvent, currentThread: string | null): void {
     if (this.closed || typeof params.threadId !== 'string') return
     // Aggregate thread status may arrive after the turn that produced it.
-    if (!['turn/started', 'turn/completed', 'thread/closed', 'item/started', 'item/completed'].includes(method)) return
+    if (!['turn/started', 'turn/completed', 'thread/closed', 'item/started', 'item/completed',
+      REASONING_PART, REASONING_DELTA].includes(method)) return
     const thread = params.threadId
     if (thread !== currentThread && !this.children.has(thread) && !this.native.has(thread) &&
         ![...this.commands.values()].includes(thread)) return
@@ -151,6 +160,20 @@ export class CodexWorkStatus {
     if (wasBusy) this.lastActivityAt = this.now()
     let update = false
     const item = object(params.item)
+    if (method === REASONING_PART || method === REASONING_DELTA) {
+      // Only the owner turn's own reasoning; a subagent's would interleave with it.
+      if (!this.busy || thread !== currentThread || !this.config.thoughts?.enabled || typeof params.itemId !== 'string') return
+      const index = typeof params.summaryIndex === 'number' ? params.summaryIndex : 0
+      if (params.itemId !== this.reasoning.item || index !== this.reasoning.index) {
+        this.reasoning = { item: params.itemId, index, text: '' }
+      }
+      if (method === REASONING_DELTA && typeof params.delta === 'string') {
+        this.reasoning.text += params.delta
+        // Hold back the word still arriving: half of a secret does not match the redactor yet.
+        this.showThought(this.reasoning.text.replace(/\S+$/, ''), true)
+      }
+      return
+    }
     if (method === 'turn/started') {
       this.native.add(thread)
       if (this.children.has(thread)) this.children.set(thread, ++this.childRevision)
@@ -167,6 +190,12 @@ export class CodexWorkStatus {
         for (const [id, owner] of this.commands) if (owner === thread) this.backgroundCommands.add(id)
       }
       update = wasBusy !== this.busy
+      // The turn's thoughts end with it, even while a background command keeps the bubble.
+      if (thread === currentThread && (this.thought || this.reasoning.item)) {
+        this.thought = ''
+        this.reasoning = { item: '', index: -1, text: '' }
+        update = true
+      }
     } else if (method === 'item/started' || method === 'item/completed') {
       if (item.type === 'subAgentActivity' && typeof item.agentThreadId === 'string') {
         if (item.kind === 'started' || item.kind === 'interacted') {
@@ -208,16 +237,52 @@ export class CodexWorkStatus {
       }
       if (this.busy && method === 'item/completed' && item.type === 'agentMessage' && item.phase === 'commentary'
           && this.config.thoughts?.enabled && typeof item.text === 'string') {
-        this.thought = item.text.replace(/```[\s\S]*?```/g, ' ').split(/\r?\n/)
-          .map(line => this.clean(line)).filter(Boolean)
-          .slice(-this.config.thoughts.max_lines).join('\n').slice(-this.config.thoughts.max_chars)
+        this.thought = this.shapeThought(item.text)
         update = true
+      }
+      if (this.busy && method === 'item/completed' && item.type === 'reasoning' && thread === currentThread
+          && this.config.thoughts?.enabled && Array.isArray(item.summary)) {
+        const last: unknown = item.summary.at(-1)
+        this.reasoning = { item: '', index: -1, text: '' }
+        if (typeof last === 'string' && last.trim()) this.showThought(last, true)
       }
       if (update) this.render()
       return
     }
     if (this.busy && !wasBusy) this.newActivity()
     if (update) this.render()
+  }
+
+  // Code-stripped, redacted tail of a narration or reasoning summary, bounded by max_lines / max_chars.
+  private shapeThought(text: string, plain = false): string {
+    const { max_lines, max_chars } = this.config.thoughts ?? { max_lines: 3, max_chars: 280 }
+    const stripped = text.replace(/```[\s\S]*?```/g, ' ')
+    // Reasoning summaries head each part with a **bold** title; the bubble is plain text.
+    return (plain ? stripped.replace(/\*\*/g, '') : stripped).split(/\r?\n/)
+      .map(line => this.clean(line)).filter(Boolean)
+      .slice(-max_lines).join('\n').slice(-max_chars)
+  }
+
+  // Streamed reasoning changes many times a second: edit at most once per read_throttle_ms and
+  // always end on the latest text. Each edit still goes through the shared Telegram rate limiter.
+  private showThought(text: string, plain: boolean): void {
+    const thought = this.shapeThought(text, plain)
+    if (!thought || thought === this.thought) return
+    this.thought = thought
+    const wait = this.lastThoughtAt + (this.config.thoughts?.read_throttle_ms ?? 0) - this.now()
+    if (wait > 0) {
+      this.thoughtTimer ??= setTimeout(() => {
+        this.thoughtTimer = undefined
+        this.lastThoughtAt = this.now()
+        if (this.busy) this.render()
+      }, wait)
+      this.thoughtTimer.unref()
+      return
+    }
+    clearTimeout(this.thoughtTimer)
+    this.thoughtTimer = undefined
+    this.lastThoughtAt = this.now()
+    this.render()
   }
 
   private clean(text: string): string {
@@ -230,6 +295,7 @@ export class CodexWorkStatus {
     this.startedAt = this.now()
     this.lastActivityAt = this.startedAt
     this.thought = ''
+    this.reasoning = { item: '', index: -1, text: '' }
     this.calls.clear()
   }
 
