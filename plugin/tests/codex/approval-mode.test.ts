@@ -15,11 +15,12 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-// The installer always writes KROT_CODEX_APPROVALS=1 into plugin/.env.
+// The installer always writes KROT_CODEX_APPROVALS=1 into plugin/.env and, without
+// --approval-mode, KROT_CODEX_APPROVAL_MODE=never (setup.test.ts runs the installer).
 const freshInstall = { KROT_CODEX_APPROVALS: '1' }
 
-test('[R01] a fresh install keeps approval cards on', () => {
-  expect(resolveApprovalSetup(freshInstall)).toEqual({ cards: true, risky: false })
+test('[R01] a fresh install runs autonomously without approval cards, standard and risky stay selectable', () => {
+  expect(resolveApprovalSetup({ ...freshInstall, KROT_CODEX_APPROVAL_MODE: 'never' })).toEqual({ cards: false, risky: false })
   expect(resolveApprovalSetup({ ...freshInstall, KROT_CODEX_APPROVAL_MODE: 'standard' }))
     .toEqual({ cards: true, risky: false })
   expect(resolveApprovalSetup({ ...freshInstall, KROT_CODEX_APPROVAL_MODE: 'risky' }))
@@ -55,8 +56,8 @@ test('[R01] with approval policy never no Codex or GitHub connector approval rea
   expect((await session.run('approval:valid')).text).toBe('decline')
   expect(shown).toEqual([])
 
-  // The same bridge with cards on does relay them (the fresh-install default).
-  const standard = sessionApprovalOptions(resolveApprovalSetup(freshInstall), cards)
+  // The same bridge with cards on (approval mode standard) does relay them.
+  const standard = sessionApprovalOptions(resolveApprovalSetup({ ...freshInstall, KROT_CODEX_APPROVAL_MODE: 'standard' }), cards)
   expect(typeof standard.approve).toBe('function')
   expect(standard.riskyApprovals).toBe(false)
 })

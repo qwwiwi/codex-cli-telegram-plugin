@@ -60,7 +60,7 @@ The installer asks for the token (hidden input), prints a one-time code and asks
 | `--agent-name NAME` | agent name in status and greetings (default: the bot's name) |
 | `--workspace PATH` | Codex working folder (absolute path) |
 | `--state-dir PATH` | bridge state folder, must be outside the workspace |
-| `--approval-mode standard\|risky` | how approval cards are filtered (see [Security](#security-model)) |
+| `--approval-mode never\|standard\|risky` | approval cards: `never` (default for a new install, autonomous, no cards), `standard` or `risky` (see [Security](#security-model)) |
 | `--non-interactive --token-file PATH` | no prompts; token from a private file |
 | `--owner-id ID` / `--pair-code CODE` | owner by numeric ID, or by a pre-sent `krotov-<uuid>` code |
 | `--dry-run` | print the plan and exit |
@@ -132,9 +132,9 @@ Approval modes:
 
 | Setting | Codex behaviour | When to use |
 |---|---|---|
-| `KROT_CODEX_APPROVALS=1` (set by the installer) | sandbox `workspace-write`, approval policy `on-request`: Codex asks before actions outside the sandbox; you get a card with the exact command or diff | default for a personal agent |
-| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | as above, but routine requests are decided by the bridge's policy and only risky or unclear ones reach you | when cards come too often |
-| `KROT_CODEX_APPROVALS` unset, or `KROT_CODEX_APPROVAL_MODE=never` | sandbox `workspace-write`, policy `never`: no approval cards of any kind (commands, files, MCP and GitHub connector calls); actions that need approval fail | read-and-write inside the workspace only |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=never` (set by the installer), or `KROT_CODEX_APPROVALS` unset | sandbox `workspace-write`, policy `never`: no approval cards of any kind (commands, files, MCP and GitHub connector calls); the agent never waits for you, actions that need approval fail | default: an autonomous agent working inside the workspace |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=standard` (`--approval-mode standard`) | sandbox `workspace-write`, approval policy `on-request`: Codex asks before actions outside the sandbox; you get a card with the exact command or diff | when you want to confirm actions outside the workspace |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | as `standard`, but routine requests are decided by the bridge's policy and only risky or unclear ones reach you | when cards come too often |
 | `KROT_CODEX_SANDBOX=danger-full-access`, `KROT_CODEX_APPROVALS` unset | no sandbox, no cards: Codex can use the network and write anywhere the OS user can | only for a dedicated unprivileged OS user on a machine you can rebuild |
 
 `danger-full-access` cannot be combined with `KROT_CODEX_PROXY`.
@@ -152,7 +152,7 @@ Side conversations do not touch the main conversation, the HUD or the status mes
 
 ## Configuration
 
-Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`. Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
+Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`. `doctor` prints the active approval mode. Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
 
 ## Update and uninstall
 

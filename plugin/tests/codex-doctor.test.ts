@@ -26,7 +26,7 @@ test('doctor verifies ChatGPT login through the configured App Server connection
   expect((await probeProxy(import.meta.dir, process.env, [...command, 'apiKey'])).status).toBe('error')
 })
 
-async function checkInstallation(options: { botId?: number; webhook?: string; omitOwner?: boolean; networkError?: boolean } = {}) {
+async function checkInstallation(options: { botId?: number; webhook?: string; omitOwner?: boolean; networkError?: boolean; env?: Record<string, string> } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'krotov-doctor-'))
   try {
     mkdirSync(join(root, 'workspace'))
@@ -39,6 +39,7 @@ async function checkInstallation(options: { botId?: number; webhook?: string; om
       TELEGRAM_ALLOWED_CHAT_IDS: '200001',
       TELEGRAM_WORKSPACE_ROOT: join(root, 'workspace'),
       TELEGRAM_STATE_DIR: join(root, 'state'),
+      ...options.env,
     }, {
       checkCodex: () => ({ status: 'ok', message: 'Codex CLI готов' }),
       telegram: async (method) => {
@@ -75,4 +76,27 @@ test('doctor requires an explicit owner and hides sensitive network errors', asy
   expect(failures).toContain('TELEGRAM_ALLOWED_USER_IDS')
   expect(failures).toContain('getMe')
   expect(JSON.stringify(checks)).not.toContain(token)
+})
+
+test('[R01] doctor reports the active approval mode, including never', async () => {
+  const mode = async (approvals: Record<string, string>) => {
+    const { checks } = await checkInstallation({ env: approvals })
+    return checks.filter(check => check.message.startsWith('Режим подтверждений:'))
+  }
+  const never = await mode({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' })
+  expect(never).toHaveLength(1)
+  expect(never[0]!.status).toBe('ok')
+  expect(never[0]!.message).toContain('never')
+  expect(never[0]!.message).toContain('без карточек')
+  const unset = await mode({})
+  expect(unset[0]!.message).toContain('never')
+  const standard = await mode({ KROT_CODEX_APPROVALS: '1' })
+  expect(standard[0]!.message).toContain('standard')
+  expect((await mode({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'standard' }))[0]!.message).toContain('standard')
+  const risky = await mode({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'risky' })
+  expect(risky[0]!.status).toBe('ok')
+  expect(risky[0]!.message).toContain('risky')
+  const { checks } = await checkInstallation({ env: { KROT_CODEX_APPROVAL_MODE: 'risky' } })
+  expect(checks.filter(check => check.status === 'error').map(check => check.message).join('\n'))
+    .toContain('KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1')
 })

@@ -1,6 +1,7 @@
 import { accessSync, constants, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, sep } from 'node:path'
 import { loadConfig, RuntimeEnvSchema } from '../src/config.js'
+import { type ApprovalSetup, resolveApprovalSetup } from '../src/codex/approval-mode.js'
 import { CodexRpc, object } from '../src/codex/rpc.js'
 
 type Check = { status: 'ok' | 'warning' | 'error'; message: string }
@@ -79,6 +80,25 @@ async function telegram(method: TelegramMethod, token: string): Promise<Record<s
   return data.ok ? data.result ?? null : null
 }
 
+// The approval mode the bridge will run with, as resolveApprovalSetup decides it.
+function approvalModeCheck(env: NodeJS.ProcessEnv): Check {
+  let setup: ApprovalSetup
+  try {
+    setup = resolveApprovalSetup({
+      KROT_CODEX_APPROVALS: env.KROT_CODEX_APPROVALS,
+      KROT_CODEX_APPROVAL_MODE: env.KROT_CODEX_APPROVAL_MODE,
+    })
+  } catch {
+    return { status: 'error', message: 'Для KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1 в plugin/.env.' }
+  }
+  if (!setup.cards) {
+    return { status: 'ok', message: 'Режим подтверждений: never. Агент работает автономно, без карточек подтверждения; действия, которым нужно подтверждение, не выполняются.' }
+  }
+  return setup.risky
+    ? { status: 'ok', message: 'Режим подтверждений: risky. Карточки приходят только для рискованных и неясных действий.' }
+    : { status: 'ok', message: 'Режим подтверждений: standard. Codex присылает карточку перед действием за пределами песочницы.' }
+}
+
 export async function runDoctor(
   env: NodeJS.ProcessEnv,
   probes: Probes = { checkCodex, telegram },
@@ -96,10 +116,7 @@ export async function runDoctor(
     const fields = [...new Set(parsed.error.issues.map(issue => issue.path.join('.')))]
     checks.push({ status: 'error', message: `Проверьте переменные в plugin/.env: ${fields.join(', ')}.` })
   }
-  if (parsed.success && parsed.data.KROT_CODEX_APPROVAL_MODE === 'risky') {
-    report(env.KROT_CODEX_APPROVALS === '1', 'Включён режим карточек для рискованных команд.',
-      'Для KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1 в plugin/.env.')
-  }
+  if (parsed.success) checks.push(approvalModeCheck(env))
   let config: ReturnType<typeof loadConfig> | undefined
   if (parsed.success) {
     try {

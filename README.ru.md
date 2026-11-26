@@ -82,7 +82,7 @@ git clone https://github.com/qwwiwi/codex-cli-telegram-plugin && cd codex-cli-te
 | `--agent-name ИМЯ` | имя агента в статусе и приветствиях (по умолчанию имя бота) |
 | `--workspace ПУТЬ` | рабочая папка Codex (абсолютный путь) |
 | `--state-dir ПУТЬ` | папка состояния моста, обязательно вне рабочей папки |
-| `--approval-mode standard\|risky` | какие запросы Codex попадают в карточки (см. [Безопасность](#безопасность)) |
+| `--approval-mode never\|standard\|risky` | карточки подтверждения: `never` (по умолчанию для новой установки, автономно, без карточек), `standard` или `risky` (см. [Безопасность](#безопасность)) |
 | `--non-interactive --token-file ПУТЬ` | без вопросов, токен из приватного файла |
 | `--owner-id ID` / `--pair-code КОД` | владелец по числовому ID или по заранее отправленному коду `krotov-<uuid>` |
 | `--dry-run` | показать план и выйти |
@@ -159,9 +159,9 @@ Codex пишет ответ в Markdown — это простая разметк
 
 | Настройка | Как ведёт себя Codex | Когда подходит |
 |---|---|---|
-| `KROT_CODEX_APPROVALS=1` (ставит установщик) | песочница `workspace-write`, политика `on-request`: перед действием за пределами песочницы Codex спрашивает; вы видите карточку с точной командой или изменением файла | обычный личный агент |
-| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | то же, но простые запросы на чтение мост одобряет сам, а до вас доходят рискованные и неясные | когда карточек слишком много |
-| `KROT_CODEX_APPROVALS` не задан | песочница `workspace-write`, политика `never`: карточек нет, действия за пределами песочницы не выполняются | работа только внутри рабочей папки |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=never` (ставит установщик) или `KROT_CODEX_APPROVALS` не задан | песочница `workspace-write`, политика `never`: карточек нет совсем, агент не ждёт вашего ответа, действия за пределами песочницы не выполняются | по умолчанию: автономный агент внутри рабочей папки |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=standard` (`--approval-mode standard`) | песочница `workspace-write`, политика `on-request`: перед действием за пределами песочницы Codex спрашивает; вы видите карточку с точной командой или изменением файла | когда хотите подтверждать действия за пределами рабочей папки |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | как `standard`, но простые запросы на чтение мост одобряет сам, а до вас доходят рискованные и неясные | когда карточек слишком много |
 | `KROT_CODEX_SANDBOX=danger-full-access`, `KROT_CODEX_APPROVALS` не задан | без песочницы и без карточек: Codex ходит в сеть и пишет везде, куда может пользователь системы | только для отдельного непривилегированного пользователя на сервере, который не жалко переустановить |
 
 `danger-full-access` нельзя совмещать с `KROT_CODEX_PROXY`.
@@ -179,7 +179,7 @@ Codex пишет ответ в Markdown — это простая разметк
 
 ## Настройки
 
-Настройки лежат в `plugin/.env` (переменные окружения) и в необязательном `config.json` в папке состояния; переменные окружения важнее. Установщик сам записывает обязательные: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`.
+Настройки лежат в `plugin/.env` (переменные окружения) и в необязательном `config.json` в папке состояния; переменные окружения важнее. Установщик сам записывает обязательные: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`. `doctor` показывает действующий режим подтверждений.
 
 Часто добавляют:
 

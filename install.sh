@@ -19,7 +19,7 @@ usage() {
   cat <<'HELP'
 Использование
   ./install.sh [--start] [--agent-name NAME] [--workspace PATH] [--state-dir PATH]
-               [--approval-mode standard|risky]
+               [--approval-mode never|standard|risky]
   ./install.sh --non-interactive --token-file PATH [--owner-id ID | --pair-code CODE] [--start]
   ./install.sh --dry-run
 
@@ -27,8 +27,9 @@ usage() {
 Для автоматизации используйте приватный файл с токеном или TELEGRAM_BOT_TOKEN.
 Если ID владельца известен, передайте --owner-id или TELEGRAM_OWNER_ID.
 При повторном запуске используется сохранённый plugin/.env.
+--approval-mode never (по умолчанию для новой установки): агент работает автономно, без карточек подтверждения.
+--approval-mode standard включает карточки Codex для действий за пределами песочницы.
 --approval-mode risky пропускает обычную диагностику и оставляет карточки для действий с риском.
---approval-mode standard возвращает обычную обработку подтверждений Codex.
 --start включает пользовательскую службу и автозапуск. Нужен вход в Codex через ChatGPT.
 HELP
 }
@@ -52,8 +53,8 @@ while (( $# )); do
         --pair-code) pair_code=$2 ;;
         --approval-mode)
           case $2 in
-            standard|risky) approval_mode=$2 ;;
-            *) setup_fail 'Для --approval-mode выбери standard или risky.' ;;
+            never|standard|risky) approval_mode=$2 ;;
+            *) setup_fail 'Для --approval-mode выбери never, standard или risky.' ;;
           esac ;;
       esac
       shift 2 ;;
@@ -67,7 +68,8 @@ done
 
 if (( dry_run )); then
   printf '%s\n' 'План: проверить зависимости и вход Codex, связать личку, установить зависимости проекта, запустить doctor и подготовить службу.'
-  if [[ -n $approval_mode ]]; then printf 'Режим подтверждений: %s\n' "$approval_mode"; fi
+  if [[ -n $approval_mode ]]; then printf 'Режим подтверждений: %s\n' "$approval_mode"
+  else printf '%s\n' 'Режим подтверждений новой установки: never.'; fi
   if (( start )); then printf '%s\n' 'После успешного doctor служба будет включена.'; fi
   exit 0
 fi
@@ -112,6 +114,7 @@ if [[ -e $env_file || -L $env_file ]]; then
     printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "$approval_mode" >> "$tmp_env"
     mv -fT -- "$tmp_env" "$env_file"
     tmp_env=''
+    printf 'Режим подтверждений: %s\n' "$approval_mode"
   fi
 else
   workspace=$(private_dir "$workspace")
@@ -176,11 +179,13 @@ else
     printf 'TELEGRAM_ALLOWED_USER_IDS=%s\nTELEGRAM_ALLOWED_CHAT_IDS=%s\n' "$owner" "$owner"
     printf 'TELEGRAM_STATE_DIR="%s"\nTELEGRAM_WORKSPACE_ROOT="%s"\n' "$state" "$workspace"
     printf 'KROT_CODEX_AGENT_NAME="%s"\n' "$agent_name"
-    printf '%s\n' 'KROT_CODEX_APPROVALS=1'
-    if [[ -n $approval_mode ]]; then printf 'KROT_CODEX_APPROVAL_MODE=%s\n' "$approval_mode"; fi
+    # An autonomous agent by default: no approval cards. KROT_CODEX_APPROVALS=1 stays,
+    # so switching to standard or risky is one line.
+    printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "${approval_mode:-never}"
   } > "$tmp_env"
   unset setup_token
   ln -- "$tmp_env" "$env_file" || setup_fail 'Не удалось сохранить plugin/.env. Проверь, не появился ли файл параллельно.'
+  printf 'Режим подтверждений: %s\n' "${approval_mode:-never}"
   if [[ ! -e $workspace/AGENTS.md && ! -L $workspace/AGENTS.md ]]; then
     (set -o noclobber; printf '%s\n' '# Профиль агента' '' \
       "Твоё имя — $agent_name. Ты работаешь с владельцем в личке Telegram." '' \

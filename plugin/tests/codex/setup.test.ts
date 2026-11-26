@@ -3,6 +3,8 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statS
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+import { type ApprovalEnv, resolveApprovalSetup } from '../../src/codex/approval-mode.js'
+
 const source = resolve(import.meta.dir, '../../..')
 const temporary: string[] = []
 const token = '123456789:setup_fixture_token'
@@ -87,6 +89,41 @@ test('install configures a private owner and checks doctor without starting the 
   expect(repeated.code, repeated.text).toBe(0)
   expect(readFileSync(file, 'utf8')).toBe(saved)
   expect(readFileSync(profile, 'utf8')).toBe('A custom profile\n')
+})
+
+// Reads the approval lines of plugin/.env into the shape resolveApprovalSetup takes.
+function approvalEnv(file: string): ApprovalEnv {
+  const lines = readFileSync(file, 'utf8').split('\n')
+  const value = (name: string) => lines.filter(line => line.startsWith(name + '=')).at(-1)?.slice(name.length + 1)
+  return { KROT_CODEX_APPROVALS: value('KROT_CODEX_APPROVALS'), KROT_CODEX_APPROVAL_MODE: value('KROT_CODEX_APPROVAL_MODE') }
+}
+
+test('[R01] a fresh install defaults to approval mode never, so the agent never waits for a card', () => {
+  const { repo, env } = checkout()
+  const result = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(result.code, result.text).toBe(0)
+  const saved = approvalEnv(join(repo, 'plugin/.env'))
+  expect(saved).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' })
+  expect(resolveApprovalSetup(saved)).toEqual({ cards: false, risky: false })
+  expect(result.text).toContain('Режим подтверждений: never')
+})
+
+test('[R01] the installer offers never and keeps standard selectable, on a fresh and on an existing install', () => {
+  const { repo, env } = checkout()
+  const help = command(repo, env, 'bash', './install.sh', '--help')
+  expect(help.text).toContain('--approval-mode never|standard|risky')
+  const file = join(repo, 'plugin/.env')
+  const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321', '--approval-mode', 'standard')
+  expect(fresh.code, fresh.text).toBe(0)
+  expect(approvalEnv(file)).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'standard' })
+  expect(resolveApprovalSetup(approvalEnv(file))).toEqual({ cards: true, risky: false })
+  // A rerun without --approval-mode keeps the owner's earlier choice.
+  expect(command(repo, env, 'bash', './install.sh', '--non-interactive').code).toBe(0)
+  expect(approvalEnv(file).KROT_CODEX_APPROVAL_MODE).toBe('standard')
+  const switched = command(repo, env, 'bash', './install.sh', '--approval-mode', 'never')
+  expect(switched.code, switched.text).toBe(0)
+  expect(approvalEnv(file)).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' })
+  expect(command(repo, env, 'bash', './install.sh', '--approval-mode', 'sometimes').code).not.toBe(0)
 })
 
 test('[R18] the generated agent profile explains subagents and parallel side threads', () => {

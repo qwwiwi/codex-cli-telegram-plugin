@@ -388,7 +388,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `TELEGRAM_OPEN_QUESTION_REMINDER_MS` | delay before a reminder about an unanswered question; `0` turns reminders off |
 | `TELEGRAM_ALBUM_FLUSH_MS` | how long to wait for all parts of a photo album |
 | `GROQ_API_KEY` | Groq key for voice transcription |
-| `KROT_CODEX_APPROVAL_MODE` | `standard` (default), `risky` or `never`; `risky` needs `KROT_CODEX_APPROVALS=1`; `never` turns every approval card off even when `KROT_CODEX_APPROVALS=1` (`codex/approval-mode.ts`) |
+| `KROT_CODEX_APPROVAL_MODE` | `standard` (default when unset), `risky` or `never` (what `install.sh` writes for a new install unless `--approval-mode` says otherwise); `risky` needs `KROT_CODEX_APPROVALS=1`; `never` turns every approval card off even when `KROT_CODEX_APPROVALS=1` (`codex/approval-mode.ts`) |
 | `KROT_CODEX_SANDBOX` | `workspace-write` (default) or `danger-full-access` |
 | `TELEGRAM_WEBHOOK_HOST` | host of the inherited webhook config block; the Codex local endpoint always binds `127.0.0.1` |
 | `TELEGRAM_WEBHOOK_PORT` | port of the local HTTP endpoint for external tasks (with `TELEGRAM_WEBHOOK_TOKEN`) |
