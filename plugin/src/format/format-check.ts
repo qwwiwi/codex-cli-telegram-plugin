@@ -24,7 +24,7 @@ import { fenceProtectedLines } from './rich.js'
 const PARAGRAPH_MAX_VISIBLE = 450
 
 // A line that begins a markdown block construct (mirrors rich.ts scope).
-const BLOCK_START_RE =
+export const BLOCK_START_RE =
   /^\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}\s|>|\||```|~~~|(?:[-*_])\s*(?:[-*_])\s*(?:[-*_]))/
 
 // A line that renders as a heading: an ATX `#` heading, or a whole line that

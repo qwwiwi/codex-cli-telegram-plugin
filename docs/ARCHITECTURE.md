@@ -55,6 +55,7 @@ The live product. `rpc.ts` starts app-server and speaks JSON-RPC. `session.ts` m
 - `external.ts`: optional local HTTP server on `127.0.0.1` for external tasks and policy cards
 - `agent-webhook.ts`: optional inter-agent webhook, the entry point for messages from other agents (`agentWebhookSettings`, `startAgentWebhook`, `routeAgentMessage`)
 - `provenance.ts`: the untrusted-data frame put around an agent's message
+- `format-reminder.ts`: `ownerTurn`, the static channel rules and the per-turn format reminder (`KROT_FORMAT_REMINDER`)
 
 ### `autonomy/`
 
@@ -87,6 +88,7 @@ Markdown to Telegram HTML, message splitting and Rich Message payloads. Used dir
 
 - `html.ts`: `markdownToTelegramHtml`, `isTelegramHtmlParseError`
 - `chunk.ts`: `splitMessage`
+- `paragraphs.ts`: `splitLongBlock`, the paragraph safety net for a long final answer without blank lines
 - `rich.ts`: `contentFitsRichLimits` (32768 UTF-8 bytes), `buildRichMessagePayload`
 
 ### `hooks/`
@@ -194,7 +196,7 @@ Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, 
    - then `thread/resume` for the saved thread or `thread/start` for a new one.
 
    Both carry `cwd`, `sandbox` and `approvalPolicy`.
-6. **Turn.** `turn/start` sends the owner's text and images. A follow-up message during a running turn goes in with `turn/steer`; `/stop` sends `turn/interrupt`.
+6. **Turn.** `turn/start` sends the owner's text and images. `ownerTurn` (`codex/format-reminder.ts`) opens each owner turn with the same static channel rules: the file-sending rule, then a short Telegram format reminder (headings on their own line, paragraphs of 1-3 sentences up to 450 characters, one list item per line, bold only for key numbers and the result line; `KROT_FORMAT_REMINDER=off` drops it). They go into the new user message, not the thread instructions, so the cached history before the turn stays the same. A follow-up message during a running turn goes in with `turn/steer`; `/stop` sends `turn/interrupt`.
 7. **Events.** App-server sends notifications:
    - `turn/started`, `item/started`, `item/completed` (commentary, milestones, the final answer),
    - `item/commandExecution/outputDelta` (for the mirror),
@@ -205,7 +207,7 @@ Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, 
 
    App-server requests that need an answer become cards (see [Approval and question cards](#approval-and-question-cards)).
 8. **Status and mirror.** Each event goes to `CodexWorkStatus` (`codex/work-status.ts`), which edits the status bubble: `working -- Ns` and up to three lines of current activity. When the bot sends a new message, the bubble is reposted below it. The mirror (`codex/mirror.ts`) edits one silent message with the stage and the last lines of command output, at most once per second.
-9. **Reply.** On `turn/completed` the final text goes through `deliverReply` and `sendFinalText`. The bridge tries a Rich Message first (`sendRichMessage`, Markdown rendered by Telegram, up to 32768 bytes) when the reply has no files, fits the limit and has no expandable quote. Otherwise, or after the rich latch has switched off, it converts Markdown to Telegram HTML, splits it into parts and sends them with `parse_mode: 'HTML'`, falling back to plain text on a parse error. Each part's delivery is saved in `codex-inbox.json`. Files follow as attachments.
+9. **Reply.** On `turn/completed` the final text goes through `deliverReply` and `sendFinalText`. A reply that is one block over 600 characters without a blank line is first split into paragraphs at sentence ends (`splitLongBlock`, `format/paragraphs.ts`); code blocks, list items, links, inline code and bold spans are never cut. The bridge tries a Rich Message first (`sendRichMessage`, Markdown rendered by Telegram, up to 32768 bytes) when the reply has no files, fits the limit and has no expandable quote. Otherwise, or after the rich latch has switched off, it converts Markdown to Telegram HTML, splits it into parts and sends them with `parse_mode: 'HTML'`, falling back to plain text on a parse error. Each part's delivery is saved in `codex-inbox.json`. Files follow as attachments.
 10. **HUD.** After the turn the HUD card is refreshed in place (`updateNow`); it does not move. The card was already moved under the owner's message when that message was accepted (step 3), and the reply waited for it to land. Then `startNext` takes the next queued message.
 
 ```mermaid
@@ -459,6 +461,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_CODEX_MAX_PARALLEL` | `codex/parallel.ts` | maximum threads at once, main included (1 to 8, default 2) |
 | `KROT_CODEX_CORRECTION_WORDS` | `codex/parallel.ts` | CSV of words that mark a message as a correction of the main task |
 | `KROT_CODEX_SIDE_REPLY` | `codex/server.ts` | `1` turns on the older one-off side replies |
+| `KROT_FORMAT_REMINDER` | `codex/format-reminder.ts` | `on` (default, also when unset) adds the short Telegram format reminder to every owner turn; `off` drops it; any other value stops the bridge at start |
 | `KROT_AGENT_WEBHOOK_LISTEN` | `codex/agent-webhook.ts` | `host:port` of the inter-agent webhook; unset keeps it off |
 | `KROT_AGENT_WEBHOOK_TOKEN` | `codex/agent-webhook.ts` | bearer token the sending agents must present |
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |
