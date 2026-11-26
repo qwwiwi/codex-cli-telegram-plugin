@@ -473,6 +473,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_ACK_REACTION` | `codex/reactions.ts` | `off`: no automatic 👀 on inbound owner messages, nor on the legacy `/hooks/react` receipt (the installer writes it for a fresh install); `eyes` or unset: 👀 on every inbound message, as before. Typing and the status bubble do not change; `doctor` shows it |
 | `KROT_REACTION_PALETTE` | `codex/reactions.ts` | comma-separated emoji (up to 10) the agent may react with through `telegram_action` `react`: only on an inbound owner message, one per message, each a Telegram reaction emoji (checked at startup). Default `👍,❤,🔥,🎉,😁,🤔,👏,🙏,💯,🤝` |
 | `KROT_FORMAT_REMINDER` | `codex/format-reminder.ts` | `on` (default, also when unset) adds the short Telegram format reminder to every owner turn; `off` drops it; any other value stops the bridge at start |
+| `KROT_MENU_COMMANDS` | `codex/commands.ts` | CSV of commands for the Telegram «/» menu, in order (default `new,stop,status,goal,compact,cc,doctor,help`); a listed command the build does not register is skipped; unlisted commands still work and stay in `/help` |
 | `KROT_AGENT_WEBHOOK_LISTEN` | `codex/agent-webhook.ts` | `host:port` of the inter-agent webhook; unset keeps it off |
 | `KROT_AGENT_WEBHOOK_TOKEN` | `codex/agent-webhook.ts` | bearer token the sending agents must present |
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |
