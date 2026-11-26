@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
 
+import { redactSecrets } from '../safety/redact.js'
+
 // The /doctor Telegram command: the doctor script's self-check plus a comparison of the installed
 // bridge with its GitHub repository. Read-only: it never edits files, it only fetches the remote.
 
@@ -131,7 +133,8 @@ function localEdits(porcelain: string): DoctorProblem | undefined {
     if (/[RC]/.test(entry.slice(0, 2))) index++
     const path = entry.slice(3)
     if (path.split('/').filter(Boolean).some(segment => secretSegment.test(segment))) hidden++
-    else names.push(path)
+    // Quoted as data: a file name may carry newlines or text that reads like an instruction.
+    else names.push(JSON.stringify(path))
   }
   if (!names.length && !hidden) return undefined
   const shown = names.slice(0, listedFiles)
@@ -268,6 +271,8 @@ interface DoctorCommandHooks {
   repo: string
   /** KROT_CODEX_SELF_RESTART: the owner can ask the bridge to restart after the reply. */
   selfRestart: boolean
+  /** Configured secret values, masked in the chat report and in the turn handed to Codex. */
+  secrets: readonly string[]
 }
 
 export class DoctorCommand {
@@ -296,7 +301,7 @@ export class DoctorCommand {
         await this.hooks.send('Не удалось выполнить самопроверку. Запустите на сервере в папке plugin: bun run doctor.')
         return
       }
-      const text = formatDoctorReport(report)
+      const text = redactSecrets(formatDoctorReport(report), this.hooks.secrets)
       if (!report.problems.length) {
         await this.hooks.send(text + (mode === 'fix' ? '\n\nИсправлять нечего.' : ''))
         return
@@ -307,7 +312,7 @@ export class DoctorCommand {
       }
       await this.hooks.send(text + '\n\nПередаю отчёт агенту для исправления.')
       try {
-        await enqueueTurn(doctorFixTurn(report, this.hooks.repo, this.hooks.selfRestart))
+        await enqueueTurn(redactSecrets(doctorFixTurn(report, this.hooks.repo, this.hooks.selfRestart), this.hooks.secrets))
       } catch {
         await this.hooks.send('Не удалось передать отчёт агенту. Отправьте /doctor fix ещё раз.')
       }

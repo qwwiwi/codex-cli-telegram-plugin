@@ -1152,7 +1152,7 @@ async function main(): Promise<void> {
         repo: bridgeRepo, env: process.env,
         doctor: () => runDoctorScript(join(import.meta.dir, '..', '..', 'scripts', 'doctor.ts'), process.env),
       }),
-      send, repo: bridgeRepo, selfRestart: selfRestartEnabled,
+      send, repo: bridgeRepo, selfRestart: selfRestartEnabled, secrets,
     })
 
     async function compact(): Promise<void> {
