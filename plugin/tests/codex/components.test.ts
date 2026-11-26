@@ -427,7 +427,7 @@ test('[R12][R13] after a text fallback the owner gets exactly one message: a rep
 test('[R12][R13] a widget fallback whose text an interim reply of the same turn already delivered reuses that message', async () => {
   const chat = fakeTelegramChat()
   const components = new AgentComponents({ ...chat.raw, async sendWidget() { throw refusal(TELEGRAM_CODE) } }, OWNER)
-  const actions = new AgentChatActions(chat.raw, OWNER, { components })
+  const actions = new AgentChatActions({ ...chat.raw, pinChatMessage: unexpected, unpinChatMessage: unexpected }, OWNER, { components })
   const data = { title: 'Демо', label: 'Выполнено задач', value: 75 }
   const same = componentFallbackText('progress', data, undefined, text => redactSecrets(text))
   let firstTurn = true
