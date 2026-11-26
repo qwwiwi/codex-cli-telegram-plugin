@@ -5,7 +5,7 @@ import { codexAgentName, codexCommands, isStatusQuestion, parseCodexCommand } fr
 test('hides disabled commands and resolves supported legacy aliases', () => {
   const config = AppConfigSchema.parse({ commands: { stop: false, new: false } })
   expect(codexCommands(config).map(x => x.command)).toEqual([
-    'help', 'status', 'reset', 'compact', 'keys', 'mirror', 'lease', 'cc', 'goal', 'pin', 'unpin', 'react', 'edit', 'get', 'doctor',
+    'help', 'status', 'usage', 'reset', 'compact', 'keys', 'mirror', 'lease', 'cc', 'goal', 'pin', 'unpin', 'react', 'edit', 'get', 'doctor',
   ])
   expect(parseCodexCommand('/CC@ExampleBot Context', 'examplebot')).toEqual({
     name: 'status', args: '',

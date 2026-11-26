@@ -54,7 +54,7 @@ test('[R20] start publishes exactly the eight-entry short menu in order, /doctor
 test('[R20] a command hidden from the menu still dispatches and stays in /help', () => {
   const { log } = recordingLog()
   const set = codexCommandSet(config, false, undefined, log)
-  for (const hidden of ['lease', 'mirror', 'keys', 'reset', 'pin']) {
+  for (const hidden of ['lease', 'mirror', 'keys', 'reset', 'pin', 'usage']) {
     expect(set.menu.some(spec => spec.command === hidden)).toBe(false)
     expect(set.accepts(parseCodexCommand('/' + hidden, 'examplebot')!.name)).toBe(true)
     expect(set.help.some(spec => spec.command === hidden)).toBe(true)
