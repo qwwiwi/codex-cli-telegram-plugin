@@ -190,3 +190,29 @@ test('native download returns only the file from a known Telegram message', asyn
     action: 'download', ok: true, message_ids: [12], attachment: { path: '/inbox/report.pdf', size: 23 },
   })
 })
+
+test('[R12] an edit of a reply sent as HTML keeps its paragraphs and formatting, and falls back to plain text on a parse error', async () => {
+  const calls: unknown[][] = []
+  let refuseHtml = false
+  const actions = new AgentChatActions({
+    async sendMessage() { return { message_id: 24 } },
+    async editMessageText(chat, id, text, options) {
+      calls.push([chat, id, text, options])
+      if (refuseHtml && options.parse_mode === 'HTML') {
+        throw Object.assign(new Error("Bad Request: can't parse entities"), { error_code: 400 })
+      }
+    },
+    async pinChatMessage() {}, async unpinChatMessage() {}, async setMessageReaction() {},
+  }, '123')
+  const text = 'Первый **абзац**.\n\nВторой с `code`.\n\n- пункт\n\nТретий.'
+  expect(await actions.call('r1', { action: 'reply', text: 'Черновик' }, () => true)).toMatchObject({ success: true })
+  expect(await actions.call('e1', { action: 'edit', target: 'last_reply', text }, () => true)).toMatchObject({ success: true })
+  refuseHtml = true
+  expect(await actions.call('e2', { action: 'edit', target: 'last_reply', text }, () => true)).toMatchObject({ success: true })
+  const html = 'Первый <b>абзац</b>.\n\nВторой с <code>code</code>.\n\n- пункт\n\nТретий.'
+  expect(calls).toEqual([
+    ['123', 24, html, { parse_mode: 'HTML' }],
+    ['123', 24, html, { parse_mode: 'HTML' }],
+    ['123', 24, text, {}],
+  ])
+})

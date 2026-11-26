@@ -78,6 +78,8 @@ export const componentInstructions =
   'числа и доли (kpi, bars, donut, bars3d, progress), тренд (line-area), шаги и процесс (steps, flowchart), ' +
   'система и связи (architecture, network3d), план с датами (timeline-roadmap), сравнение (compare, radar, pros-cons), ' +
   'вопросы и ответы (faq), статус работы (status). Перед первым использованием вызови component_schema. ' +
+  'flowchart только для процесса без возвратов: каждая связь ведёт к ещё не пройденному шагу, цикл отклоняется. ' +
+  'Схему с обменом туда и обратно рисуй через architecture, простую последовательность через steps. ' +
   'Короткий ответ, мнение или разговор отправляй текстом, не компонентом. Не больше одного компонента на ответ. ' +
   'Если виджет показан, в финальном ответе напиши 1–2 строки о том, что показывает компонент. Если данные ушли текстом, ' +
   'не отправляй их повторно и не сообщай о сбое: заверши ход пустым финальным ответом. Если статус доставки неизвестен, ' +
@@ -160,15 +162,46 @@ function flatten(value: unknown, depth: number): string[] {
   return []
 }
 
-// Plain text of the data for a reply without a widget: the pack's own caption
-// for valid data, a generic flattening otherwise. Redacted before the cap, so
-// a cut cannot split a secret into an unrecognisable prefix.
+type GraphEdge = { source: number; target: number; label?: string }
+
+// An edge as the packs define it ({source, target, label?}) or as a bare [source, target] pair.
+function graphEdge(value: unknown, size: number): GraphEdge | undefined {
+  const [source, target, label] = Array.isArray(value) ? [value[0], value[1], undefined]
+    : isPlainObject(value) ? [value.source, value.target, value.label] : []
+  const inRange = (index: unknown): index is number => Number.isInteger(index) && (index as number) >= 0 && (index as number) < size
+  if (!inRange(source) || !inRange(target)) return undefined
+  return typeof label === 'string' && label.trim().length > 0 ? { source, target, label } : { source, target }
+}
+
+// Graph data (flowchart, architecture, network3d) as numbered lines a reader can follow without the widget: node
+// labels with their outgoing links by name, never node kinds or index pairs. A chain in node order is plain steps.
+// Undefined when the data is not a graph of labelled nodes.
+function graphText(data: Record<string, unknown>): string | undefined {
+  const { nodes, edges } = data
+  if (!Array.isArray(nodes) || nodes.length === 0 || !Array.isArray(edges)) return undefined
+  const labels = nodes.map(node => isPlainObject(node) && typeof node.label === 'string' ? node.label.trim() : '')
+  if (labels.some(label => label.length === 0)) return undefined
+  const links = edges.map(edge => graphEdge(edge, labels.length)).filter((edge): edge is GraphEdge => edge !== undefined)
+  const chain = links.length === labels.length - 1 &&
+    links.every((edge, index) => edge.source === index && edge.target === index + 1 && edge.label === undefined)
+  return labels.map((label, index) => {
+    const node: unknown = nodes[index]
+    const lane = isPlainObject(node) && typeof node.lane === 'string' ? ` (${node.lane})` : ''
+    const targets = chain ? [] : links.filter(edge => edge.source === index)
+      .map(edge => labels[edge.target] + (edge.label === undefined ? '' : ` (${edge.label})`))
+    return `${index + 1}. ${label}${lane}${targets.length > 0 ? ' → ' + targets.join(', ') : ''}`
+  }).join('\n')
+}
+
+// Plain text of the data for a reply without a widget: numbered lines for a graph, the pack's own caption for
+// other valid data, a generic flattening otherwise. Redacted before the cap, so a cut cannot split a secret into an
+// unrecognisable prefix.
 export function componentFallbackText(name: ComponentName, data: Record<string, unknown>, header: string | undefined,
   redact: (text: string) => string): string {
   const title = typeof data.title === 'string' ? data.title : undefined
-  let body: string | undefined
+  let body = graphText(data)
   const template = templates[name]
-  if (template !== undefined && validate(name, data)) {
+  if (body === undefined && template !== undefined && validate(name, data)) {
     try { body = template.caption(data) } catch { body = undefined }
   }
   if (body === undefined) {

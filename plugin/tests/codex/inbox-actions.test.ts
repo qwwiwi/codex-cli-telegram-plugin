@@ -139,7 +139,37 @@ test('scopes pin, reaction and edit to the private quoted message and protects s
   await executeChatAction(api, '100', 1, 'react', reply, '👍')
   expect(calls).toEqual([
     ['pin', '100', 7, { disable_notification: true }],
-    ['edit', '100', 7, 'corrected', {}],
+    ['edit', '100', 7, 'corrected', { parse_mode: 'HTML' }],
     ['react', '100', 7, '👍'],
   ])
+})
+
+test('an owner /edit of an ordinary text reply renders Markdown as Telegram HTML and redacts the source first', async () => {
+  const calls: unknown[] = []
+  const api = {
+    async pinChatMessage() {},
+    async unpinChatMessage() {},
+    async setMessageReaction() {},
+    async editMessageText(...args: unknown[]) { calls.push(args) },
+  }
+  const reply = message(7, { from: bot, text: 'reply' })
+  const secret = 'own&er-secret'
+  expect(await executeChatAction(api, '100', 1, 'edit', reply, `**Итог** ключ ${secret}`,
+    text => text.replaceAll(secret, '[REDACTED]'))).toBe('Сообщение обновлено.')
+  expect(calls).toEqual([['100', 7, '<b>Итог</b> ключ [REDACTED]', { parse_mode: 'HTML' }]])
+})
+
+test('an owner /edit falls back to plain text when Telegram cannot parse the HTML', async () => {
+  const calls: unknown[] = []
+  const api = {
+    async pinChatMessage() {},
+    async unpinChatMessage() {},
+    async setMessageReaction() {},
+    async editMessageText(...args: unknown[]) {
+      calls.push(args)
+      if (calls.length === 1) throw Object.assign(new Error("Bad Request: can't parse entities: Unexpected end tag"), { error_code: 400 })
+    },
+  }
+  await executeChatAction(api, '100', 1, 'edit', message(7, { from: bot, text: 'reply' }), '**Итог**')
+  expect(calls).toEqual([['100', 7, '<b>Итог</b>', { parse_mode: 'HTML' }], ['100', 7, '**Итог**', {}]])
 })

@@ -148,7 +148,14 @@ interface ChatState {
   // chat does not affect others. Worst-case per-chat stall is bounded by
   // `maxRetries * MAX_RETRY_AFTER_S`.
   tail: Promise<void>
+  // FIFO tail for the owner's replies (SendMessageOpts.ownerReply). Separate
+  // from `tail`: an auxiliary send parked on the minute budget must never hold
+  // a reply, which may use the reserved slots it may not.
+  replyTail: Promise<void>
 }
+
+// What a bucket-consuming call is, for the share of the minute budget it may fill.
+type CapacityKind = 'reply' | 'send' | 'edit'
 
 export interface RateLimitOptions {
   perChatRefillPerSec?: number
@@ -200,6 +207,24 @@ export interface RateLimitOptions {
    * caller. Set to 0 to disable.
    */
   perChatTypingMaxPerMinute?: number
+  /**
+   * Slots of the per-chat minute budget (`perChatMaxPerMinute`) that edits
+   * may never take, so they are always there for new messages. The status
+   * bubble edits every ~1.1s and used to burn the whole budget in ~20s; every
+   * send (a side turn's card, an answer, the HUD card) then waited up to ~45s
+   * for a slot to age out. Default 6 (edits get at most 12 of 18). Ignored
+   * when the minute budget is off.
+   */
+  perChatSendReserve?: number
+  /**
+   * Slots of the per-chat minute budget that only the owner's replies
+   * (`ownerReply`) may take. Auxiliary sends (side cards, queue notices, the
+   * HUD card) stop short of them, so after a burst of edits and cards a final
+   * reply still leaves at once instead of waiting ~40s for a slot to age out.
+   * Default 3 (auxiliary sends get at most 15 of 18). Ignored when the minute
+   * budget is off.
+   */
+  perChatReplyReserve?: number
   /**
    * JSONL file recording every outbound call (method, chat, wait, verdict,
    * retry_after). The structured logger writes to stderr, which on these
@@ -291,7 +316,25 @@ export function createRateLimitedTelegramApi(
     perChatMaxPerMinute: opts.perChatMaxPerMinute ?? 18,
     perChatEditsMaxPerMinute: opts.perChatEditsMaxPerMinute ?? 0,
     perChatTypingMaxPerMinute: opts.perChatTypingMaxPerMinute ?? 20,
+    perChatSendReserve: opts.perChatSendReserve ?? 6,
+    perChatReplyReserve: opts.perChatReplyReserve ?? 3,
     sendLogPath: opts.sendLogPath,
+  }
+  // The share of the minute budget an edit may fill (see perChatSendReserve);
+  // 0 = no minute budget at all.
+  const editMinuteLimit =
+    cfg.perChatMaxPerMinute > 0
+      ? Math.max(1, cfg.perChatMaxPerMinute - Math.max(0, cfg.perChatSendReserve))
+      : 0
+  // The share an auxiliary (non-reply) send may fill (see perChatReplyReserve).
+  const auxMinuteLimit =
+    cfg.perChatMaxPerMinute > 0
+      ? Math.max(1, cfg.perChatMaxPerMinute - Math.max(0, cfg.perChatReplyReserve))
+      : 0
+  const minuteLimit: Record<CapacityKind, number> = {
+    reply: cfg.perChatMaxPerMinute,
+    send: auxMinuteLimit,
+    edit: Math.min(editMinuteLimit, auxMinuteLimit),
   }
   const now = opts.now ?? ((): number => Date.now())
   const sleep =
@@ -331,6 +374,7 @@ export function createRateLimitedTelegramApi(
       s = {
         bucket: makeBucket(cfg.perChatBurstCapacity, cfg.perChatRefillPerSec, now()),
         tail: Promise.resolve(),
+        replyTail: Promise.resolve(),
         windowTimes: [],
         editWindowTimes: [],
         typingWindowTimes: [],
@@ -362,7 +406,7 @@ export function createRateLimitedTelegramApi(
 
   // Give back a slot taken by waitForCapacity when the call it was taken for
   // never happened (the message was deleted while the edit waited).
-  function refundCapacity(state: ChatState, kind: 'send' | 'edit'): void {
+  function refundCapacity(state: ChatState, kind: CapacityKind): void {
     state.bucket.tokens = Math.min(state.bucket.capacity, state.bucket.tokens + 1)
     globalBucket.tokens = Math.min(globalBucket.capacity, globalBucket.tokens + 1)
     state.windowTimes.pop()
@@ -372,7 +416,7 @@ export function createRateLimitedTelegramApi(
   // A cancelled `signal` stops the wait before any slot is taken.
   async function waitForCapacity(
     state: ChatState,
-    kind: 'send' | 'edit',
+    kind: CapacityKind,
     signal?: AbortSignal,
   ): Promise<number> {
     const startedAt = now()
@@ -384,7 +428,9 @@ export function createRateLimitedTelegramApi(
       const t = now()
       const chatWait = waitMs(state.bucket, t)
       const globalWait = waitMs(globalBucket, t)
-      const minuteWait = windowWaitMs(state.windowTimes, cfg.perChatMaxPerMinute, t)
+      // Edits stop short of the send reserve and auxiliary sends short of the
+      // reply reserve, so those slots stay free for the owner's replies.
+      const minuteWait = windowWaitMs(state.windowTimes, minuteLimit[kind], t)
       const editWait =
         kind === 'edit'
           ? windowWaitMs(state.editWindowTimes, cfg.perChatEditsMaxPerMinute, t)
@@ -501,9 +547,12 @@ export function createRateLimitedTelegramApi(
     label = 'send',
     minRetryWaitMs = 0,
     signal?: AbortSignal,
+    releaseInFlight = false,
+    kind: 'reply' | 'send' = 'send',
   ): Promise<T> {
     const state = getChatState(chatId)
-    const prev = state.tail.catch(() => {})
+    // Replies keep their own order on their own queue (see ChatState.replyTail).
+    const prev = (kind === 'reply' ? state.replyTail : state.tail).catch(() => {})
     let release!: () => void
     const mine = new Promise<void>((r) => {
       release = r
@@ -511,16 +560,21 @@ export function createRateLimitedTelegramApi(
     // The next op waits for everything ahead of this one AND for this one, so a
     // cancelled op leaves the queue without letting the next op overtake the
     // ops that were ahead of it.
-    state.tail = Promise.all([prev, mine]).then(() => undefined)
+    const tail = Promise.all([prev, mine]).then(() => undefined)
+    if (kind === 'reply') state.replyTail = tail
+    else state.tail = tail
     try {
       await unlessCancelled(prev, signal)
-      const waited = await waitForCapacity(state, 'send', signal)
+      const waited = await waitForCapacity(state, kind, signal)
       if (signal?.aborted === true) {
         // Cancelled between taking the slot and the call: hand the slot back.
-        refundCapacity(state, 'send')
+        refundCapacity(state, kind)
         throw new SendCancelledError()
       }
       signal?.addEventListener('abort', release, { once: true })
+      // On the wire now: the order against the ops ahead is kept, and the
+      // next op no longer waits for Telegram's answer to this one.
+      if (releaseInFlight) release()
       try {
         return await withRetry(label, op, minRetryWaitMs, chatId, waited, signal)
       } finally {
@@ -574,6 +628,7 @@ export function createRateLimitedTelegramApi(
     messageId: number,
     text: string,
     editOpts: EditOpts,
+    signal?: AbortSignal,
   ): Promise<void> {
     const key = editKey(chatId, messageId)
     if (deletedMessages.has(key)) {
@@ -594,14 +649,31 @@ export function createRateLimitedTelegramApi(
     pendingEdits.set(key, pending)
 
     const state = getChatState(chatId)
-    const prev = state.editTail
+    const prev = state.editTail.catch(() => {})
     let release!: () => void
-    state.editTail = new Promise<void>((r) => {
+    const mine = new Promise<void>((r) => {
       release = r
     })
+    // The next edit waits for everything ahead of this one AND for this one,
+    // so a cancelled edit leaves the queue without letting the next edit
+    // overtake an older one still in flight (edits finish in order).
+    state.editTail = Promise.all([prev, mine]).then(() => undefined)
     try {
-      await prev.catch(() => {})
-      const waited = await waitForCapacity(state, 'edit')
+      let waited: number
+      try {
+        await unlessCancelled(prev, signal)
+        waited = await waitForCapacity(state, 'edit', signal)
+        if (signal?.aborted === true) {
+          // Cancelled between taking the slot and the call: hand the slot back.
+          refundCapacity(state, 'edit')
+          throw new SendCancelledError()
+        }
+      } catch (err) {
+        // Cancelled before it left the process: edits coalesced into this one
+        // get the same verdict (see the catch around the call below).
+        for (const w of pending.waiters) w.reject(err)
+        throw err
+      }
       // Stop coalescing into this entry: from here the text is committed and
       // a newer edit must start its own wait rather than mutate one in flight.
       pendingEdits.delete(key)
@@ -735,8 +807,9 @@ export function createRateLimitedTelegramApi(
       sendOpts: SendMessageOpts,
     ): Promise<{ message_id: number }> {
       // The signal is this layer's business (see enqueueSend); it never travels on.
-      const { signal, ...rest } = sendOpts
-      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, rest), 'sendMessage', 0, signal)
+      const { signal, releaseQueueInFlight, ownerReply, ...rest } = sendOpts
+      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, rest), 'sendMessage', 0, signal,
+        releaseQueueInFlight === true, ownerReply === true ? 'reply' : 'send')
     },
 
     async sendRichMessage(
@@ -747,10 +820,15 @@ export function createRateLimitedTelegramApi(
       // Route through the SAME per-chat FIFO + token-bucket path as
       // sendMessage: a rich message counts toward the identical per-chat
       // flood limit, and same-chat ordering must be preserved.
+      const { ownerReply, ...rest } = richOpts
       return enqueueSend(
         chatId,
-        () => raw.sendRichMessage(chatId, rawMarkdown, richOpts),
+        () => raw.sendRichMessage(chatId, rawMarkdown, rest),
         'sendRichMessage',
+        0,
+        undefined,
+        false,
+        ownerReply === true ? 'reply' : 'send',
       )
     },
 
@@ -768,7 +846,9 @@ export function createRateLimitedTelegramApi(
       // Edits count toward the same per-chat flood limit as fresh sends, but
       // run on their own FIFO with their own sub-budget and coalescing —
       // see enqueueEdit. A status bubble must never park a reply behind it.
-      return enqueueEdit(chatId, messageId, text, editOpts)
+      // The signal is this layer's business; it never travels on.
+      const { signal, ...rest } = editOpts
+      return enqueueEdit(chatId, messageId, text, rest, signal)
     },
 
     async setMessageReaction(

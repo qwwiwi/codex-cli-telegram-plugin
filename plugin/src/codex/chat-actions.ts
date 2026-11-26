@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import type { Message } from 'grammy/types'
 import { atomicWriteInRoot } from '../autonomy/store.js'
 import type { DownloadResult, TelegramApi } from '../channel/tools.js'
+import { isTelegramHtmlParseError, markdownToTelegramHtml } from '../format/html.js'
 import { stripAgentAddress } from './commands.js'
 import { componentInstructions, componentTools, sameText, type AgentComponents } from './components.js'
 import { normalizeChatReply } from './continuation.js'
@@ -38,7 +39,7 @@ type ActionApi = Pick<TelegramApi, 'setMessageReaction' | 'editMessageText'> & {
 
 export async function executeChatAction(
   api: ActionApi, ownerChat: string, botId: number, action: Exclude<ChatAction, 'get'>,
-  target: Message | undefined, args: string,
+  target: Message | undefined, args: string, redact?: (text: string) => string,
 ): Promise<string> {
   if (!safeActionTarget(target) || target.chat.type !== 'private' || String(target.chat.id) !== ownerChat) {
     return 'Выбери обычное сообщение в этой личке через «Ответить».'
@@ -60,8 +61,25 @@ export async function executeChatAction(
   }
   if (target.from?.id !== botId || !target.text) return 'Могу редактировать только свои текстовые сообщения.'
   if (!args || args.length > 3900) return 'Пришли новый текст после /edit, максимум 3900 символов.'
-  await api.editMessageText(ownerChat, id, args, {})
+  // Rendered like every reply, so Markdown in the new text shows as formatting, not as `**` markers.
+  await editAsHtml(api, ownerChat, id, args, redact)
   return 'Сообщение обновлено.'
+}
+
+/**
+ * Edits a message that is not a Rich Message, rendered like the HTML reply path: Markdown becomes Telegram HTML and
+ * blank lines stay as written; text Telegram cannot parse as HTML is resent plain. `redact` runs on the source text
+ * first, because rendering escapes `&`, `<`, `>` and quotes past an exact-match secret redaction.
+ */
+export async function editAsHtml(api: Pick<TelegramApi, 'editMessageText'>, ownerChat: string, id: number,
+  text: string, redact: (text: string) => string = source => source): Promise<void> {
+  const source = redact(text)
+  try {
+    await api.editMessageText(ownerChat, id, markdownToTelegramHtml(source), { parse_mode: 'HTML' })
+  } catch (error) {
+    if (!isTelegramHtmlParseError(error)) throw error
+    await api.editMessageText(ownerChat, id, source, {})
+  }
 }
 
 export async function downloadQuotedAttachment(api: Pick<TelegramApi, 'downloadFile'>, target: Message | undefined,
@@ -140,6 +158,10 @@ type AgentChatOptions = {
   components?: AgentComponents
   // The emoji the agent may react with (KROT_REACTION_PALETTE); default DEFAULT_REACTION_PALETTE.
   reactionPalette?: readonly string[]
+  // Masks configured secrets in edit text before it is rendered to HTML (rendering escapes them past exact matching).
+  redact?: (text: string) => string
+  // Resolves once an interim reply may be sent: the HUD card of the owner's message has landed (HudAnchor.settled).
+  beforeReply?: () => Promise<void>
 }
 
 function parseAction(raw: unknown, legacy = false): ActionArguments | undefined {
@@ -334,6 +356,10 @@ export class AgentChatActions {
     return execution
   }
 
+  private async editAsHtml(id: number, text: string): Promise<void> {
+    await editAsHtml(this.api, this.ownerChat, id, text, this.options.redact)
+  }
+
   private enqueue(args: ActionArguments, current: () => boolean, details: ActionDetails,
     download?: DownloadAction): Promise<boolean> {
     const execution = this.pending.then(async () => {
@@ -351,6 +377,9 @@ export class AgentChatActions {
             (files !== undefined && (!sendFile || !Array.isArray(files) || paths.length > 10 ||
               paths.some(path => typeof path !== 'string' || path.length === 0 || path.length > 4096))) ||
             (!validText && !paths.length)) return false
+        // The answer lands below the HUD card of the message it answers, like the final reply.
+        await this.options.beforeReply?.()
+        if (!current()) return false
         if (validText) {
           const policy = this.options.replyPolicy?.(text)
           if (policy) details.hint = policy.hint.slice(0, 2048)
@@ -380,7 +409,7 @@ export class AgentChatActions {
           if (message.rich) {
             if (!this.options.editRich) return false
             await this.options.editRich(id, text)
-          } else await this.api.editMessageText(this.ownerChat, id, text, {})
+          } else await this.editAsHtml(id, text)
         } else if (action === 'pin') {
           await this.api.pinChatMessage(this.ownerChat, id, { disable_notification: true })
         } else if (action === 'unpin') {

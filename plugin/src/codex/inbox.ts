@@ -88,6 +88,11 @@ export class CodexInbox {
     return this.state.active
   }
 
+  /** Whether the message still waits in the queue (not taken, not a follow-up or side job). */
+  isQueued(id: number): boolean {
+    return this.state.ready.some(group => group.some(message => message.message_id === id))
+  }
+
   get uncertainFollowUp(): Message | undefined {
     return this.state.followUp?.[0]
   }

@@ -228,8 +228,16 @@ The only route is `POST /webhook` (`POST /` also works); everything else is
 404. The body must be `application/json`, at most 64 KB:
 
 ```json
-{"message": "task text", "chatId": 123, "agentId": "sender-agent"}
+{"message": "task text", "chatId": 123, "fromAgent": "sender-agent"}
 ```
+
+The sender shown to the owner and to Codex is `fromAgent`, else the
+`X-From-Agent` header, else a leading `[Inter-agent от <sender> → <recipient>]`
+line at the very start of `message`, else `unknown`. `agentId` is accepted and
+ignored for display: the gbrain worker puts the recipient there. A worker
+`ПОРЯДОК ДЕЙСТВИЙ:` block after a `---` line, including the ack-only variant
+`ПОРЯДОК ДЕЙСТВИЙ (ack-only fast path, без dual-report):`, is labelled for Codex
+as gbrain delivery protocol, not as the sender's request.
 
 `chatId` is accepted and ignored: the message always goes to the owner's chat
 (the first `TELEGRAM_ALLOWED_CHAT_IDS` entry). `X-Delivery-Id` is the

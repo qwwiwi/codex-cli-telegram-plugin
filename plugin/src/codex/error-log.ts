@@ -27,20 +27,37 @@ export const errorJournalPattern = 'errors-YYYY-MM-DD.jsonl'
 
 // Names whose value is a credential when they appear as a header, a key=value pair or a JSON field.
 const secretName = String.raw`[A-Za-z0-9_-]*(?:key|token|secret|password|passwd|pwd|cookie|session|signature|credential|authorization)[A-Za-z0-9_-]*`
+// The only names a credential-looking match keeps its value under, and the value shape that keeps it: token counts
+// stay numbers (`max_tokens: 5000`), `session` keeps an upper-case error code (`session: ENOENT`). Only the unquoted
+// form keeps it: a quoted value is masked under these names too. Every other credential name is masked whatever its
+// value is, numbers and upper-case strings included.
+const tokenCount = /^\d+$/u
+const diagnosticValues: Readonly<Record<string, RegExp>> = {
+  max_tokens: tokenCount, max_output_tokens: tokenCount, max_completion_tokens: tokenCount,
+  input_tokens: tokenCount, output_tokens: tokenCount, prompt_tokens: tokenCount, completion_tokens: tokenCount,
+  total_tokens: tokenCount, reasoning_tokens: tokenCount, cached_tokens: tokenCount,
+  session: /^[A-Z][A-Z_]*$/u,
+}
+const isDiagnostic = (name: string, value: string): boolean =>
+  diagnosticValues[name.toLowerCase().replaceAll('-', '_')]?.test(value) ?? false
 // `x-api-key: value`, `password="value"`, `token: 'value'`: a bare value runs to the next separator, a quoted one to
-// its closing quote; an auth scheme stays. A bare number or an upper-case error code (`max_tokens: 5000`,
-// `session: ENOENT`) is a diagnostic, not a credential.
+// its closing quote; an auth scheme stays.
 const authScheme = String.raw`(?:(?:Bearer|Basic|Token|Digest)\s+)?`
 const bareValue = String.raw`[^\s;,&"'{}]+`
-const headerValueRe = new RegExp(String.raw`(\b${secretName}\s*[:=]\s*)(?!${authScheme}\[REDACTED\])` +
+const headerValueRe = new RegExp(String.raw`(\b(${secretName})\s*[:=]\s*)(?!${authScheme}\[REDACTED\])` +
   String.raw`(${authScheme})("[^"\n]*"|'[^'\n]*'|${bareValue})`, 'giu')
-const maskHeaderValue = (match: string, name: string, scheme: string, value: string): string =>
-  /^(?:\d+|[A-Z][A-Z_]*)$/u.test(value) ? match : name + scheme + '[REDACTED]'
+const maskHeaderValue = (match: string, prefix: string, name: string, scheme: string, value: string): string =>
+  isDiagnostic(name, value) ? match : prefix + scheme + '[REDACTED]'
 // Headers whose whole value is a credential (every cookie, every Digest parameter): masked up to the next
 // `Header: ` or the end of the line.
 const wholeHeaderRe = /(\b(?:Set-)?Cookie\s*:\s*|\b(?:Proxy-)?Authorization\s*:\s*Digest\s+)(?!\s*\[REDACTED\])[^\n]*?(?=\s+[A-Za-z][A-Za-z0-9-]*:\s|\n|$)/giu
-// `"api_key":"value"` or `'token': 'value'` in an echoed JSON body.
-const jsonValueRe = new RegExp(String.raw`(["']${secretName}["']\s*:\s*)(["'])(?:\\.|(?!\2).)*\2`, 'giu')
+// `"api_key":"value"`, `'token': 'value'` or `"api_key": 12345` in an echoed JSON body. A quoted value is masked
+// under every name, diagnostic names included (`"session": "ABC…"` is a credential); only a bare number under a
+// diagnostic name (`"max_tokens": 4096`) stays.
+const jsonValueRe = new RegExp(String.raw`(["'](${secretName})["']\s*:\s*)(?:(["'])(?:\\.|(?!\3).)*\3|(-?\d[\d.eE+-]*))`, 'giu')
+const maskJsonValue = (match: string, prefix: string, name: string, quote: string | undefined,
+  bare: string | undefined): string => bare !== undefined && isDiagnostic(name, bare) ? match
+  : prefix + (quote === undefined ? '[REDACTED]' : quote + '[REDACTED]' + quote)
 // A Bearer value of any length (the shared redactor only catches 8+ characters); other schemes count only in an
 // Authorization header, so prose like "Basic plan" or "Token expired" stays.
 const schemeRe = /\b(Bearer)\s+(?!\[REDACTED\])[^\s;,"']+/giu
@@ -59,7 +76,7 @@ const maskOpaque = (run: string): string => run.split('-').some(part => part.len
 export function maskDiagnostic(value: string, secrets: readonly string[] = []): string {
   const masked = value
     .replace(urlQueryRe, '$1?[REDACTED]')
-    .replace(jsonValueRe, '$1$2[REDACTED]$2')
+    .replace(jsonValueRe, maskJsonValue)
     .replace(wholeHeaderRe, '$1[REDACTED]')
     .replace(schemeRe, '$1 [REDACTED]')
     .replace(headerValueRe, maskHeaderValue)

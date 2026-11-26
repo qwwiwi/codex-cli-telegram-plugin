@@ -98,7 +98,7 @@ Set `GROQ_API_KEY` in `plugin/.env`. A voice message is downloaded and sent to t
 
 ## How replies are formatted
 
-Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `sendRichMessage`, which renders Markdown on Telegram's side, one message up to 32768 bytes. It is used when the reply has no files, fits the limit and has no expandable quote. If Telegram rejects rich messages, the bridge switches them off for the rest of the process and uses the **HTML fallback**: Markdown converted to Telegram HTML and split into 4096-character parts; on an HTML parse error the part is resent as plain text. Turn rich messages off with `TELEGRAM_RICH_MESSAGES=0`.
+Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `sendRichMessage`, which renders Markdown on Telegram's side, one message up to 32768 bytes. It is used when the reply has no files, fits the limit, has no expandable quote and carries Markdown only Telegram renders (a table, math, a task list, `<details>` or a footnote). Any other reply goes as HTML: in a Rich Message Telegram shows paragraphs without the empty line between them. If Telegram rejects rich messages, the bridge switches them off for the rest of the process and uses the **HTML fallback**: Markdown converted to Telegram HTML and split into 4096-character parts; on an HTML parse error the part is resent as plain text. Turn rich messages off with `TELEGRAM_RICH_MESSAGES=0`.
 
 ## Commands
 

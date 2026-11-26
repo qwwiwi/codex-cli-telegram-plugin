@@ -193,3 +193,27 @@ export function fenceProtectedLines(lines: ReadonlyArray<string>): boolean[] {
   }
   return mask
 }
+
+// Markdown that only Telegram's rich renderer shows as intended; the HTML path would print it as raw text or a
+// monospace block. A GFM table (header row over a delimiter row), display or inline math, a task list item, a
+// <details> element or a footnote reference.
+const RICH_ONLY_RE = [
+  /^[^\n]*\|[^\n]*\n[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$/mu,
+  /\$\$[\s\S]+?\$\$/u,
+  /\\\([^\n]+?\\\)|\\\[[\s\S]+?\\\]/u,
+  /^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\[[ xX]\][ \t]/mu,
+  /<details\b/iu,
+  /\[\^[^\]\s]+\]/u,
+]
+
+/**
+ * True when the reply carries Markdown that needs a Rich Message (see RICH_ONLY_RE); code fences do not count.
+ * Any other reply reads better as HTML: Telegram renders the paragraphs of a Rich Message on new lines without an
+ * empty line between them, while the HTML path keeps the blank lines as written.
+ */
+export function needsRichMarkdown(text: string): boolean {
+  const lines = text.split('\n')
+  const fence = fenceProtectedLines(lines)
+  const prose = lines.filter((_, index) => !fence[index]).join('\n')
+  return RICH_ONLY_RE.some(re => re.test(prose))
+}
