@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { Bot } from 'grammy'
@@ -47,6 +47,9 @@ import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, format
   readClaudeArchive, sendConversation } from './conversation-export.js'
 import { CodexInbox, type InboxReply } from './inbox.js'
 import { startExternalTasks } from './external.js'
+import { agentWebhookSettings, routeAgentMessage, startAgentWebhook, type AgentDelivery,
+  type DeliverOutcome } from './agent-webhook.js'
+import { codexEnvironment } from './environment.js'
 import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-delivery.js'
 import { deliverReplyPart, type PartStatus } from './reply-delivery.js'
 import {
@@ -82,9 +85,6 @@ const autonomyInstructions = 'Для большой задачи составь 
   'Продолжай работу после промежуточных результатов до проверенного итога или реального блокера. ' +
   'Подтверждения и границы среды остаются обязательными.'
 
-// Keep Telegram credentials and unrelated service environment out of Codex.
-const codexEnvironment = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TMPDIR|TEMP|TMP|CODEX_HOME|USERPROFILE|LOCALAPPDATA|APPDATA|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|GH_CONFIG_DIR)$/i
-
 async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
   const env = RuntimeEnvSchema.parse(process.env)
@@ -117,7 +117,8 @@ async function main(): Promise<void> {
   if (!tokenLock.acquire(paths)) throw new Error('A bot already owns this state directory')
 
   const policyToken = process.env.KROT_CODEX_POLICY_TOKEN
-  const secrets = [env.TELEGRAM_BOT_TOKEN, env.GROQ_API_KEY ?? '', env.TELEGRAM_WEBHOOK_TOKEN ?? '', policyToken ?? ''].filter(Boolean)
+  const secrets = [env.TELEGRAM_BOT_TOKEN, env.GROQ_API_KEY ?? '', env.TELEGRAM_WEBHOOK_TOKEN ?? '', policyToken ?? '',
+    process.env.KROT_AGENT_WEBHOOK_TOKEN ?? ''].filter(Boolean)
   const log = createLogger('krot-codex', { secrets })
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
   bot.use(richInboundMiddleware(undefined, () => log.warn('Could not normalize Telegram rich content')))
@@ -227,6 +228,7 @@ async function main(): Promise<void> {
   let session: CodexSession | undefined
   let task: Promise<void> | undefined
   let externalTasks: Awaited<ReturnType<typeof startExternalTasks>> | undefined
+  let agentWebhook: ReturnType<typeof startAgentWebhook> | undefined
   let externalQuestion = false
   const inbox = new CodexInbox(paths.root, ownerId)
   const albums = new AlbumBuffer<Message>({ flushMs: config.album.flush_ms })
@@ -247,6 +249,7 @@ async function main(): Promise<void> {
     approvals?.cancelAll()
     questions.suspend()
     externalTasks?.close()
+    void agentWebhook?.stop(true)
     session?.close()
     void poller.stop()
   }
@@ -1427,7 +1430,7 @@ async function main(): Promise<void> {
           if (stopping) return
           if (result.status === 'completed' && result.text.trim()) {
             // A finished answer is delivered even if the main task was stopped meanwhile.
-            await sendFinalText(redactSecrets(hideLeaseCompletions(result.text), secrets), false, id, undefined,
+            await sendFinalText(redactSecrets(hideLeaseCompletions(result.text), secrets), false, id > 0 ? id : undefined, undefined,
               sent => sides.remember(sent, result.threadId))
             log.info('Codex side reply delivered')
           } else if (epoch === stopEpoch) {
@@ -2079,6 +2082,52 @@ async function main(): Promise<void> {
           return true
         },
       })
+    }
+    // Inbound inter-agent webhook (KROT_AGENT_WEBHOOK_LISTEN); off keeps no listener.
+    function deliverAgentMessage(delivery: AgentDelivery): DeliverOutcome {
+      if (stopping) return 'stopping'
+      const key = delivery.deliveryId ?? randomUUID()
+      const id = -1 - createHash('sha256').update('krot-agent:' + key).digest().readUIntBE(0, 6)
+      const message: Message = {
+        message_id: id, date: Math.floor(Date.now() / 1000), text: delivery.input,
+        chat: { id: Number(ownerChat), type: 'private', first_name: 'Telegram' },
+        from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
+      }
+      const notify = () => { void send(redactSecrets(delivery.notice, secrets)).catch(() => log.warn('Could not notify the owner about an agent message')) }
+      const busy = !!task || goalActive || codex.isRunning
+      const route = routeAgentMessage(delivery.input, { busy, parallel, sides })
+      // Same paths as an owner message (side thread or queue), but never a steer into the main turn.
+      if (route.route === 'side') {
+        try {
+          if (launchSide(message, route.thread)) {
+            notify()
+            return 'accepted'
+          }
+        } catch { log.warn('Could not persist the agent message for a parallel turn') }
+      }
+      const outcome = inbox.receive(message)
+      if (outcome !== 'accepted') return outcome
+      notify()
+      if (hudReady) hudAnchor.ownerMessage()
+      if (busy && parallel.enabled) {
+        startNext()
+        if (inbox.active?.messages[0]?.message_id !== id) {
+          void send(busyNotice(mainSummary(), sides.titles, parallel.maxParallel)).catch(() => undefined)
+        }
+      } else resumeInbox(message)
+      return 'accepted'
+    }
+    const agentWebhookConfig = agentWebhookSettings(process.env)
+    if (agentWebhookConfig.kind === 'invalid') {
+      log.error('Agent webhook not started', { reason: agentWebhookConfig.reason })
+    } else if (agentWebhookConfig.kind === 'on') {
+      const { hostname, port } = agentWebhookConfig.settings
+      try {
+        agentWebhook = startAgentWebhook(agentWebhookConfig.settings, deliverAgentMessage, log)
+        log.info('Agent webhook listening', { hostname, port })
+      } catch (error) {
+        log.error('Agent webhook could not listen', { hostname, port, error: error instanceof Error ? error.message : String(error) })
+      }
     }
     if (recoveringInbox) void resumeRecoveredInbox()
     startNext()
