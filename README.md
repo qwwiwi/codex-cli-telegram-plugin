@@ -87,6 +87,7 @@ Manual setup on Ubuntu or Debian: [plugin/docs/quickstart.md](plugin/docs/quicks
 - `/goal` for long tasks with a completion criterion; unfinished tasks continue in the next turn.
 - Optional pinned HUD: context window use, model, plan, autonomy mandate, Codex limits; moves to the bottom after each turn.
 - Optional parallel answers: a new question while a long task runs gets its own side conversation.
+- Widget answers: Codex can show numbers, charts, steps, plans and comparisons as a Telegram widget built from [html-components](https://github.com/qwwiwi/html-components), with a plain-text fallback ([details](docs/ARCHITECTURE.md#widget-components)).
 - Saved conversations: `/cc resume`, export to a file, model choice.
 - Optional learning memory (`/memory`), see [plugin/docs/learning.md](plugin/docs/learning.md).
 

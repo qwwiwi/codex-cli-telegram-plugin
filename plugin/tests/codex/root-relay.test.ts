@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { agentChatTool } from '../../src/codex/chat-actions.js'
+import { agentTools } from '../../src/codex/chat-actions.js'
 import { CodexSession } from '../../src/codex/session.js'
 
 const relay = join(import.meta.dir, '../../scripts/codex-root-relay.py')
@@ -67,7 +67,7 @@ assert closed
   expect(check.exitCode, check.stderr.toString()).toBe(0)
 })
 
-test('root relay admits only the owner Telegram tool and its text result', () => {
+test('[R12][R13] root relay admits only the owner Telegram tools and their text result', () => {
   const check = Bun.spawnSync(['python3', '-B', '-c', `
 import json
 import runpy
@@ -78,16 +78,17 @@ relay = runpy.run_path(sys.argv[1])
 allowed_request = relay['allowed_request']
 valid_chat_call = relay['valid_chat_call']
 valid_chat_result = relay['valid_chat_result']
-tool = json.load(sys.stdin)
+tools = json.load(sys.stdin)
+tool = tools[0]
 opened = {'thread'}
 params = {
     'cwd': config.workspace, 'approvalPolicy': 'on-request', 'sandbox': 'workspace-write',
-    'dynamicTools': [tool],
+    'dynamicTools': tools,
 }
 assert allowed_request({'method': 'thread/start', 'params': params}, opened, config)
 assert not allowed_request({'method': 'thread/start', 'params': dict(params, cwd='/srv/other/workspace')}, opened, config)
-assert not allowed_request({'method': 'thread/start', 'params': dict(params, dynamicTools=[tool, tool])}, opened, config)
-assert not allowed_request({'method': 'thread/start', 'params': dict(params, dynamicTools=[dict(tool, name='other')])}, opened, config)
+assert not allowed_request({'method': 'thread/start', 'params': dict(params, dynamicTools=tools + [tool])}, opened, config)
+assert not allowed_request({'method': 'thread/start', 'params': dict(params, dynamicTools=[dict(tool, name='other')] + tools[1:])}, opened, config)
 assert not allowed_request({'method': 'thread/resume', 'params': dict(params, threadId='thread')}, opened, config)
 resume = dict(params, threadId='thread')
 del resume['dynamicTools']
@@ -110,12 +111,19 @@ assert not valid_chat_call(dict(call, namespace='custom'), opened)
 assert not valid_chat_call(dict(call, tool='other'), opened)
 assert not valid_chat_call(dict(call, arguments={'action':'reply', 'chat_id':321}), opened)
 assert not allowed_request({'method': 'item/tool/call', 'params': call}, opened, config)
+send = dict(call, tool='send_component', arguments={'component': 'kpi', 'data': {'title': 'x'}, 'target': 5})
+assert valid_chat_call(send, opened)
+assert valid_chat_call(dict(call, tool='update_component', arguments={'message_id': 7, 'component': 'kpi', 'data': {}}), opened)
+assert valid_chat_call(dict(call, tool='component_schema', arguments={'component': 'kpi'}), opened)
+assert not valid_chat_call(dict(send, arguments={'component': 'nope', 'data': {}}), opened)
+assert not valid_chat_call(dict(send, arguments={'component': 'kpi', 'data': {}, 'chat_id': 321}), opened)
+assert not valid_chat_call(dict(call, tool='component_schema', arguments={'action': 'reply'}), opened)
 
 assert valid_chat_result({'success':True, 'contentItems':[{'type':'inputText','text':'{"ok":true}'}]})
 assert not valid_chat_result({'success':True, 'contentItems':[{'type':'inputImage','imageUrl':'https://example.com/image.jpg'}]})
 assert not valid_chat_result({'success':True, 'contentItems':[{'type':'inputText','text':'x' * 8193}]})
 assert not valid_chat_result({'success':1, 'contentItems':[{'type':'inputText','text':'sent'}]})
-`, relay], { stdin: Buffer.from(JSON.stringify(agentChatTool)), stderr: 'pipe' })
+`, relay], { stdin: Buffer.from(JSON.stringify(agentTools)), stderr: 'pipe' })
   expect(check.stderr.toString()).toBe('')
   expect(check.exitCode).toBe(0)
 })

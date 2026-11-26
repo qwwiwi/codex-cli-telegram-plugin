@@ -53,6 +53,8 @@ import {
 import { splitMessage } from '../format/chunk.js'
 import { buildRichMessagePayload, contentFitsRichLimits } from '../format/rich.js'
 import type { RichLatch } from '../safety/rich-latch.js'
+import { WidgetPreSendError } from '../safety/pre-send-error.js'
+import { checkWidgetPayload } from './widget.js'
 import { PHOTO_EXTENSIONS, assertSendableFile, isPhotoExtension } from '../security/paths.js'
 import { validateTelegramHtml } from '../safety/html-validator.js'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
@@ -181,6 +183,15 @@ export interface SendRichMessageOpts {
 // chunk path — exactly one of the two ships, so a message is never lost or
 // duplicated.
 export type SendRichMessageResult = { message_id: number } | { fallback: true }
+
+// Body of Bot API sendWidget minus chat_id. Optional fields are omitted when absent.
+export interface SendWidgetParams {
+  html: string
+  // Fallback text for clients without widget support, at most 1024 characters.
+  caption: string
+  // Thread the widget under this message (sent as reply_parameters).
+  reply_to_message_id?: number
+}
 
 export interface DownloadResult {
   path: string
@@ -407,6 +418,10 @@ export interface TelegramApi {
     rawMarkdown: string,
     opts: SendRichMessageOpts,
   ): Promise<SendRichMessageResult>
+  // Bot API sendWidget: an HTML widget (the components of send_component).
+  // Reached through grammY's raw escape hatch; sizes are checked again right
+  // before the HTTP call, redaction runs in the safe wrapper.
+  sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
   setMessageReaction(chatId: string, messageId: number, emoji: string): Promise<void>
   sendChatAction(chatId: string, action: ChatAction): Promise<void>
@@ -491,6 +506,20 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       if (typeof messageId !== 'number') {
         throw new Error('sendRichMessage returned no message_id')
       }
+      return { message_id: messageId }
+    },
+    async sendWidget(chatId, params) {
+      // Last layer before HTTP: re-check the size rules on what actually goes out.
+      const refused = checkWidgetPayload(params)
+      if (refused !== undefined) throw new WidgetPreSendError(refused)
+      const body: Record<string, unknown> = { chat_id: chatId, html: params.html, caption: params.caption }
+      if (params.reply_to_message_id !== undefined) body.reply_parameters = { message_id: params.reply_to_message_id }
+      const rawApi = bot.api.raw as unknown as Record<string, unknown>
+      const send = rawApi.sendWidget
+      if (typeof send !== 'function') throw new WidgetPreSendError('Bot API method sendWidget is not available')
+      const res = await (send as RawSendRichMessageFn)(body)
+      const messageId = res.message_id ?? res.result?.message_id
+      if (typeof messageId !== 'number') throw new Error('sendWidget returned no message_id')
       return { message_id: messageId }
     },
     async editMessageText(chatId, messageId, text, opts) {

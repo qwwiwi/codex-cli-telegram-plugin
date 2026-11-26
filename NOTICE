@@ -11,3 +11,8 @@ The list of modifications is in CHANGES.md.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this software except in compliance with the License.
 A copy of the License is in the LICENSE file.
+
+This product includes the Telegram widget packs of html-components
+(https://github.com/qwwiwi/html-components), Copyright (c) 2026
+html-components contributors, licensed under the MIT License. They are in
+plugin/vendor/html-components, with the license text in its LICENSE file.

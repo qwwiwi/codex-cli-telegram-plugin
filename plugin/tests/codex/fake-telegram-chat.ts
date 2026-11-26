@@ -34,6 +34,10 @@ export function fakeTelegramChat() {
       const at = visible.findIndex(m => m.id === id)
       if (at !== -1) visible.splice(at, 1)
     },
+    async sendWidget(_chat, params) {
+      rawCalls.push('widget: ' + params.caption)
+      return { message_id: land('widget: ' + params.caption) }
+    },
     sendRichMessage: unused,
     setMessageReaction: unused,
     sendChatAction: unused,

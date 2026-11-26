@@ -30,12 +30,14 @@ import type {
   SendMessageOpts,
   SendRichMessageOpts,
   SendRichMessageResult,
+  SendWidgetParams,
   TelegramApi,
 } from '../channel/tools.js'
 import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
 import { richErrorClass } from '../format/rich.js'
 import type { RichLatch } from './rich-latch.js'
+import { WidgetPreSendError } from './pre-send-error.js'
 
 /**
  * Walk an inline keyboard and redact every button's `text` and `url`
@@ -154,6 +156,20 @@ export function createSafeTelegramApi(
         safeOpts.reply_markup = redactReplyMarkup(safeOpts.reply_markup, extraSecrets)
       }
       return raw.sendMessage(chatId, safeText, safeOpts)
+    },
+
+    // Widget html is CODE, not prose: redaction must never silently rewrite it
+    // (a masked value inside a <script> is broken JavaScript). If the redactor
+    // would change the html, the call fails closed with the offset, never the
+    // value. The caption is plain fallback text and is redacted like a message.
+    async sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }> {
+      const redacted = redactSecrets(params.html, extraSecrets)
+      if (redacted !== params.html) {
+        let offset = 0
+        while (offset < params.html.length && params.html[offset] === redacted[offset]) offset += 1
+        throw new WidgetPreSendError(`widget html looks like it contains a secret at offset ${offset}; nothing was sent`)
+      }
+      return raw.sendWidget(chatId, { ...params, caption: redactSecrets(params.caption, extraSecrets) })
     },
 
     async sendRichMessage(

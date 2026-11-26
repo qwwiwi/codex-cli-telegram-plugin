@@ -3,7 +3,7 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { resolve as resolvePath } from 'node:path'
 import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rpc.js'
 import { sameFilePatch, type NativeFileChange } from './file-approval.js'
-import { agentChatTool, type AgentChatActions } from './chat-actions.js'
+import { agentTools, type AgentChatActions } from './chat-actions.js'
 import { isRoutineServerCommand } from './server-approval-policy.js'
 import { parseMcpApproval } from './mcp-approval.js'
 import { parseRateLimits, type CodexLimitWindow } from '../status/codex-limits.js'
@@ -68,7 +68,8 @@ type Settings = {
   riskyApprovals?: boolean
   sandbox?: CodexSandboxMode
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
-  chatAction?: (key: string, args: unknown, current: () => boolean) => ReturnType<AgentChatActions['call']>
+  // `tool` is one of agentTools: telegram_action or a component tool.
+  chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) => ReturnType<AgentChatActions['call']>
   // Operational notes without user content, e.g. a fallback the bridge took.
   onWarning?: (message: string) => void
 }
@@ -464,7 +465,7 @@ export class CodexSession {
       cwd: this.settings.cwd,
       ...this.permissions(),
       ...(model ? { model } : {}),
-      ...(this.settings.chatAction ? { dynamicTools: [agentChatTool] } : {}),
+      ...(this.settings.chatAction ? { dynamicTools: agentTools } : {}),
     })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || id === this.threadId) throw new Error('Codex did not return a side thread ID')
@@ -589,7 +590,7 @@ export class CodexSession {
       ? await this.rpc.request('thread/resume', { ...options, threadId: expected, excludeTurns: true })
       : await this.rpc.request('thread/start', {
         ...options,
-        ...(this.settings.chatAction ? { dynamicTools: [agentChatTool] } : {}),
+        ...(this.settings.chatAction ? { dynamicTools: agentTools } : {}),
       })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || (expected && id !== expected)) {
@@ -817,10 +818,11 @@ export class CodexSession {
       const { threadId, turnId, callId, namespace, tool, arguments: args } = params
       const run = this.settings.chatAction
       const turn = this.runningTurns().find(turn => turn.threadId === threadId && turn.id === turnId)
-      if (!run || !turn || turn.untrusted || namespace !== null || tool !== agentChatTool.name ||
+      if (!run || !turn || turn.untrusted || namespace !== null || typeof tool !== 'string' ||
+          !agentTools.some(entry => entry.name === tool) ||
           typeof callId !== 'string' || !/^[\w.:-]{1,128}$/u.test(callId)) return
       return this.withServerRequest(id, turn.threadId, signal =>
-        run(JSON.stringify([threadId, turnId, callId]), args, () => !signal.aborted && this.runningTurns().includes(turn)))
+        run(JSON.stringify([threadId, turnId, callId]), args, () => !signal.aborted && this.runningTurns().includes(turn), tool))
     }
     if (method === 'item/tool/requestUserInput') {
       const current = this.goalTurn?.id === params.turnId ? this.goalTurn : this.active

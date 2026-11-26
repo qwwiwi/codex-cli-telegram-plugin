@@ -60,6 +60,7 @@ import type {
   SendMessageOpts,
   SendRichMessageOpts,
   SendRichMessageResult,
+  SendWidgetParams,
   TelegramApi,
 } from '../channel/tools.js'
 
@@ -740,6 +741,11 @@ export function createRateLimitedTelegramApi(
         () => raw.sendRichMessage(chatId, rawMarkdown, richOpts),
         'sendRichMessage',
       )
+    },
+
+    async sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }> {
+      // A widget is a new message: same per-chat FIFO and token bucket as sendMessage.
+      return enqueueSend(chatId, () => raw.sendWidget(chatId, params), 'sendWidget')
     },
 
     async editMessageText(
