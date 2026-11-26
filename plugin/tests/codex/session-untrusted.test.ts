@@ -63,7 +63,8 @@ interface SessionInternals {
 
 function fixture(rpc: HeldRpc, options: {
   approve?: (request: ApprovalRequest) => Promise<'accept' | 'decline' | 'cancel'>
-  chatAction?: () => Promise<{ contentItems: [{ type: 'inputText'; text: string }]; success: boolean }>
+  chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) =>
+    Promise<{ contentItems: [{ type: 'inputText'; text: string }]; success: boolean }>
   sandbox?: 'workspace-write' | 'danger-full-access'
 } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-untrusted-'))
@@ -197,4 +198,29 @@ test('F1: in workspace-write mode the owner turn after an agent turn restores a 
   expectFullWorkspaceWrite(turnStarts(rpc)[1]!.sandboxPolicy, cwd)
   complete(thread, 'turn-2')
   await owner
+})
+
+test('[R12][R13] a trusted Codex thread is offered the component tools and their calls reach the bridge by tool name', async () => {
+  const rpc = new HeldRpc()
+  const routed: unknown[] = []
+  const { session, internals, complete } = fixture(rpc, {
+    chatAction: async (_key, args, _current, tool) => {
+      routed.push([tool, args])
+      return { contentItems: [{ type: 'inputText', text: 'ok' }], success: true }
+    },
+  })
+  const run = session.run('покажи итоги')
+  await until(() => turnStarts(rpc).length === 1)
+  const start = rpc.calls.find(call => call.method === 'thread/start')!.params as { dynamicTools: Array<{ name: string }> }
+  expect(start.dynamicTools.map(tool => tool.name))
+    .toEqual(['telegram_action', 'send_component', 'update_component', 'component_schema'])
+  const threadId = String(turnStarts(rpc)[0]!.threadId)
+  await until(() => session.steerableTurn === 'turn-1')
+  const call = (tool: string, id: number) => internals.requestApproval({ id, method: 'item/tool/call', params: {
+    threadId, turnId: 'turn-1', callId: 'c' + id, namespace: null, tool, arguments: { component: 'kpi' } } })
+  expect(await call('component_schema', 1)).toEqual({ contentItems: [{ type: 'inputText', text: 'ok' }], success: true })
+  expect(await call('unknown_tool', 2)).toBeUndefined()
+  expect(routed).toEqual([['component_schema', { component: 'kpi' }]])
+  complete(threadId, 'turn-1')
+  expect((await run).status).toBe('completed')
 })

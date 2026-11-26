@@ -64,6 +64,7 @@ import { BridgeRestartHandoff, isRestartVerificationMessage } from './restart-ha
 import { readHandoffContext } from './handoff-context.js'
 import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   downloadQuotedAttachment, safeActionTarget, type ChatAction } from './chat-actions.js'
+import { AgentComponents, isComponentTool } from './components.js'
 import { InboundWatcher } from '../telegram/watcher.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
 import { LearningMemory } from './learning.js'
@@ -184,6 +185,9 @@ async function main(): Promise<void> {
     },
     async sendRichMessage(chat, text, options) {
       return trackDelivery(chat, await reliableTelegram.sendRichMessage(chat, text, options))
+    },
+    async sendWidget(chat, params) {
+      return trackDelivery(chat, await reliableTelegram.sendWidget(chat, params))
     },
     async sendDocument(chat, path, options) {
       return trackDelivery(chat, await reliableTelegram.sendDocument(chat, path, options))
@@ -471,8 +475,9 @@ async function main(): Promise<void> {
       ...sessionApprovalOptions(approvalSetup, approvals),
       ...(env.KROT_CODEX_SANDBOX ? { sandbox: env.KROT_CODEX_SANDBOX } : {}),
       ask: (input, signal) => questions.ask(input, signal),
-      chatAction: (key, args, current) => {
+      chatAction: (key, args, current, tool) => {
         const epoch = stopEpoch
+        if (isComponentTool(tool)) return agentChat.component(key, tool, args, () => !stopping && epoch === stopEpoch && current())
         return agentChat.call(key, args, () => !stopping && epoch === stopEpoch && current(),
           id => downloadQuotedAttachment(telegram, quotedAttachments.get(id), ownerChat, paths.inbox))
       },
@@ -673,6 +678,11 @@ async function main(): Promise<void> {
       unpinChatMessage: async (chatId: string, id: number) => { await bot.api.unpinChatMessage(chatId, id) },
     }
     const agentChat = new AgentChatActions(actionApi, ownerChat, {
+      // Components go through the same rate-limited chain and, like every answer, wait for the HUD card first.
+      components: new AgentComponents(telegram, ownerChat, {
+        beforeSend: (): Promise<void> => hudAnchor.settled(),
+        redact: (text: string): string => redactSecrets(text, secrets),
+      }),
       replyPolicy: text => leases.replyPolicy(redactSecrets(text, secrets), resolveAskGuardMode(config, log)),
       root: paths.root,
       sendFile: (path, target) => sendAttachment(telegram, ownerChat, workspace, path, target),

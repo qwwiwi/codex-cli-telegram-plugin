@@ -47,6 +47,56 @@ CHAT_TOOL = {
         },
     },
 }
+# Widget component tools. Match components.ts (componentTools).
+COMPONENT_NAMES = [
+    "kpi", "bars", "progress", "steps", "compare", "pros-cons", "faq", "status",
+    "flowchart", "architecture", "line-area", "donut", "timeline-roadmap", "radar", "bars3d", "network3d",
+]
+COMPONENT_FIELD = {"type": "string", "enum": COMPONENT_NAMES}
+COMPONENT_TOOLS = [
+    {
+        "type": "function",
+        "name": "send_component",
+        "description": "Send data to the Telegram owner as a visual widget instead of a wall of text. "
+                       "Call component_schema first for the exact data fields. At most one component per answer. "
+                       "If the widget cannot be shown, the data is sent as plain text and the result says so: then do not resend it.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False, "required": ["component", "data"],
+            "properties": {
+                "component": COMPONENT_FIELD,
+                "data": {"type": "object"},
+                "caption": {"type": "string", "maxLength": 1024},
+                "target": {"type": "integer", "minimum": 1},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "update_component",
+        "description": "Show new data for a component sent earlier: sends a new widget and deletes the old one. "
+                       "message_id must come from send_component or update_component of this bridge run.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False, "required": ["message_id", "component", "data"],
+            "properties": {
+                "message_id": {"type": "integer", "minimum": 1},
+                "component": COMPONENT_FIELD,
+                "data": {"type": "object"},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "component_schema",
+        "description": "Return the JSON schema of the data and a working example for one component. Sends nothing.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False, "required": ["component"],
+            "properties": {"component": COMPONENT_FIELD},
+        },
+    },
+]
+# The exact dynamicTools list a trusted thread is opened with. Match chat-actions.ts (agentTools).
+CHAT_TOOLS = [CHAT_TOOL, *COMPONENT_TOOLS]
+CHAT_TOOLS_BY_NAME = {tool["name"]: tool for tool in CHAT_TOOLS}
 ALLOWED = {
     "initialize": {"clientInfo", "capabilities"},
     "initialized": set(),
@@ -281,13 +331,20 @@ def valid_chat_call(params, opened):
         return False
     thread = params["threadId"]
     args = params["arguments"]
-    properties = CHAT_TOOL["inputSchema"]["properties"]
+    tool = CHAT_TOOLS_BY_NAME.get(params["tool"]) if isinstance(params["tool"], str) else None
+    if tool is None or not isinstance(args, dict):
+        return False
+    properties = tool["inputSchema"]["properties"]
+    if tool is CHAT_TOOL:
+        known_choice = args.get("action") in properties["action"]["enum"]
+    else:
+        known_choice = (args.get("component") in COMPONENT_NAMES
+                        and ("data" not in args or isinstance(args["data"], dict)))
     return (
         isinstance(thread, str) and thread in opened
         and all(isinstance(params[key], str) and 0 < len(params[key]) <= 128 for key in ("turnId", "callId"))
-        and params["namespace"] is None and params["tool"] == CHAT_TOOL["name"]
-        and isinstance(args, dict) and args.keys() <= properties.keys()
-        and args.get("action") in properties["action"]["enum"]
+        and params["namespace"] is None
+        and args.keys() <= properties.keys() and known_choice
         and len(json.dumps(args, ensure_ascii=False)) <= 65536
     )
 
@@ -352,7 +409,7 @@ def allowed_request(message, opened, config, approval_threads=(), observed_worke
             params.get("cwd") == config.workspace
             and params.get("approvalPolicy") == "on-request"
             and params.get("sandbox") == "workspace-write"
-            and ("dynamicTools" not in params or params["dynamicTools"] == [CHAT_TOOL])
+            and ("dynamicTools" not in params or params["dynamicTools"] == CHAT_TOOLS)
             and (method == "thread/start" or
                  (isinstance(params.get("threadId"), str) and 0 < len(params["threadId"]) <= 128
                   and params.get("excludeTurns") is True))

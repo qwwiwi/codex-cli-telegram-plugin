@@ -49,6 +49,7 @@ The live product. `rpc.ts` starts app-server and speaks JSON-RPC. `session.ts` m
 - `parallel.ts`: routing rule and registry for side threads
 - `work-status.ts`, `mirror.ts`: the status bubble and the optional live mirror
 - `commands.ts`, `chat-actions.ts`, `lease.ts`, `learning.ts`: commands and their helpers
+- `components.ts`: widget components for the model (`send_component`, `update_component`, `component_schema`), see [Widget components](#widget-components)
 - `restart-bridge.ts`, `restart-handoff.ts`, `continuation.ts`: self-restart and continuation of unfinished tasks
 - `pin-service.ts`: deletes the bot's own "pinned a message" service messages
 - `external.ts`: optional local HTTP server on `127.0.0.1` for external tasks and policy cards
@@ -63,9 +64,10 @@ Owner-granted autonomy mandates ("leases") and the open-question registry, one J
 
 ### `channel/`
 
-The MCP tool surface of the Claude version (reply, react, edit, pin). Codex does not register these tools. The bridge uses only `createTelegramApi` from `tools.ts`, which wraps grammY and sends `sendRichMessage` through the raw API.
+The MCP tool surface of the Claude version (reply, react, edit, pin). Codex does not register these tools. The bridge uses only `createTelegramApi` from `tools.ts`, which wraps grammY and sends `sendRichMessage` and `sendWidget` through the raw API, and the widget limits in `widget.ts`.
 
 - `tools.ts`: `TelegramApi` and `createTelegramApi` (used); the rest is legacy
+- `widget.ts`: size and chat checks for `sendWidget`
 
 ### `chats/`
 
@@ -170,6 +172,7 @@ Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, 
 - `plugin/scripts/codex-permission-hook.ts`: YAML policy hook run inside Codex (see [plugin/docs/claude-compatibility.md](../plugin/docs/claude-compatibility.md))
 - `plugin/scripts/codex-root-relay.py`, `root_backend.py`, `codex-root-health.py`: relay to a separate app-server (see [plugin/docs/root-backend.md](../plugin/docs/root-backend.md))
 - `examples/`: systemd units and a relay config example
+- `plugin/vendor/html-components/`: the vendored Telegram widget packs (MIT, see its `LICENSE` and `VENDOR.md`)
 - `plugin/tests/`: `bun test` suite with a fake app-server (`plugin/tests/codex/fake-app-server.ts`)
 
 ## The path of one message
@@ -314,6 +317,33 @@ Limits come from `account/rateLimits/read`, cached for 60 s and refreshed in the
 - **Retire cleanup.** When Telegram refuses to delete a retired card, it is unpinned and its ID is kept; the next `bump` or `retire` tries the delete again, at most twice more.
 
 Each pin makes Telegram post a "pinned a message" service line. `codex/pin-service.ts` deletes those lines when the bot itself is the sender; pins made by the owner are not touched.
+
+## Widget components
+
+The model can answer with a visual widget instead of a wall of text: key numbers, a chart, steps, a plan with dates, a comparison. The widgets are the Telegram packs of [qwwiwi/html-components](https://github.com/qwwiwi/html-components), vendored in `plugin/vendor/html-components` at a pinned commit (see its `VENDOR.md`). Nothing is fetched at runtime.
+
+**Tools.** A trusted thread (`thread/start`) gets three dynamic tools next to `telegram_action` (`agentTools` in `codex/chat-actions.ts`):
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `component_schema` | `component` | returns the pack's JSON schema and a working example; sends nothing |
+| `send_component` | `component`, `data`, optional `caption`, optional `target` (a known message to reply to) | renders the pack and sends it with Bot API `sendWidget` |
+| `update_component` | `message_id`, `component`, `data` | sends a new widget with the new data and deletes the old one; only an id this bridge run sent as a component is accepted |
+
+There are 16 packs: `kpi`, `bars`, `progress`, `steps`, `compare`, `pros-cons`, `faq`, `status`, `flowchart`, `architecture`, `line-area`, `donut`, `timeline-roadmap`, `radar`, `bars3d`, `network3d`. The turn instructions (`componentInstructions` in `codex/components.ts`) tell the model when to use one and to add 1–2 lines of text about it.
+
+**Path of a component call.** App-server sends `item/tool/call`; `CodexSession` accepts only the names in `agentTools`, only for a trusted running turn, and passes the tool name to the bridge. `AgentChatActions.component` runs the call on the same queue as `telegram_action`, so a component and an interim reply keep their order, and returns one result per call ID, so a replayed call never sends a second widget. `AgentComponents` (`codex/components.ts`) then:
+
+1. waits for the HUD card (`hudAnchor.settled()`), like every answer, so the chat reads owner message, HUD card, widget;
+2. renders the pack. A chart pack (`flowchart`, `architecture`, `line-area`, `radar`, `donut`, `bars3d`, `network3d`, `timeline-roadmap`) over the size budget is rendered again as its **static variant** without the chart script; the result then carries `"variant":"static"`;
+3. checks the payload (`channel/widget.ts`: html ≤ 32768 bytes and ≤ 4096 bytes after zlib, caption ≤ 1024 characters) and sends it through the usual safe → rate-limited → reliable chain. `sendWidget` uses the chat's send queue and token bucket like `sendMessage`, is never retried (a retry could show it twice), and its html is never rewritten by redaction: html that looks like it carries a secret is refused before sending;
+4. when the widget cannot be shown (data does not match the schema, still over the budget, Telegram refuses it), sends the same data **once as plain text** and tells the model not to resend it. When a send fails after Telegram may have taken it (timeout, 5xx), nothing else is sent and the result says the delivery status is unknown.
+
+A sent component becomes a known message for `telegram_action`, so the model can pin it or react to it. The IDs `update_component` may replace live in memory; after a restart the model sends a new component.
+
+**Result.** The tool returns JSON such as `{"tool":"send_component","ok":true,"message_ids":[77],"delivery":"widget"}`; `delivery` is `widget`, `text` or `unknown`, and `hint` explains a fallback.
+
+**Root relay.** `plugin/scripts/codex-root-relay.py` admits exactly this tool list (`CHAT_TOOLS`) on `thread/start` and checks each call's arguments against it. When the tools change, update both catalogs; a test compares them.
 
 ## Parallel threads
 
