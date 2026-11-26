@@ -120,7 +120,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 | `/react <emoji>` | put a reaction on the message you reply to |
 | `/edit <text>` | replace the text of a bot message you reply to |
 | `/get` | hand an attachment from the quoted message to Codex |
-| `/doctor` | self-check: runs `doctor`, fetches the GitHub repository (`KROT_UPDATE_REMOTE`, default `public` if present else `origin`; `KROT_UPDATE_BRANCH`, default `main`) and reports commits behind/ahead, local edits (file names only), `bun.lock` vs `node_modules` drift and the Codex CLI version; `/doctor fix` hands the report to Codex to fix what is safe, without restarting the bridge mid-turn |
+| `/doctor` | self-check: runs `doctor`, fetches the GitHub repository (`KROT_UPDATE_REMOTE`, default `public` if present else `origin`; `KROT_UPDATE_BRANCH`, default `main`) and reports commits behind/ahead, local edits (file names only), `bun.lock` vs `node_modules` drift, the Codex CLI version and the [error journal](#error-journal) (errors of the last 24 hours and 7 days, the last 5); `/doctor fix` hands the report to Codex to fix what is safe, without restarting the bridge mid-turn |
 
 `/help`, `/status`, `/stop`, `/reset` and `/new` can be switched off in `config.json` (`commands` block). Unknown `/cc <name>` commands are read from `KROT_CODEX_COMMANDS_DIR` when it is set.
 
@@ -156,7 +156,7 @@ Side conversations do not touch the main conversation, the HUD or the status mes
 
 ## Configuration
 
-Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`, `TELEGRAM_STATUS_THOUGHTS`, `KROT_ACK_REACTION=off`. `doctor` prints the active approval mode, whether thoughts are shown and the reaction settings. `KROT_REACTION_PALETTE` sets the emoji the agent may react with (up to 10, default `👍,❤,🔥,🎉,😁,🤔,👏,🙏,💯,🤝`). Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every owner turn carries a short Telegram format reminder (paragraphs of 1-3 sentences, headings and list items on their own lines); `KROT_FORMAT_REMINDER=off` turns it off. A final answer that still arrives as one long block without blank lines is split into paragraphs at sentence ends before sending; code blocks, lists and links stay as written. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
+Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`, `TELEGRAM_STATUS_THOUGHTS`, `KROT_ACK_REACTION=off`. `doctor` prints the active approval mode, whether thoughts are shown and the reaction settings. `KROT_REACTION_PALETTE` sets the emoji the agent may react with (up to 10, default `👍,❤,🔥,🎉,😁,🤔,👏,🙏,💯,🤝`). Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every owner turn carries a short Telegram format reminder (paragraphs of 1-3 sentences, headings and list items on their own lines); `KROT_FORMAT_REMINDER=off` turns it off. A final answer that still arrives as one long block without blank lines is split into paragraphs at sentence ends before sending, and short lines separated by single line breaks are grouped into paragraphs of 1-3 sentences (a bold first line becomes a heading); code blocks, lists and links stay as written. `KROT_ERROR_LOG_DAYS` sets how long the [error journal](#error-journal) is kept. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
 
 ## Update and uninstall
 
@@ -188,6 +188,15 @@ Then delete the clone, the state directory and, if you no longer need it, the wo
 | `/help` works, ordinary messages get no answer | Check `codex login status` as the service user and `journalctl --user -u krotov-telegram.service -n 50`. |
 
 Run `bun run doctor` in `plugin/` to check the environment at any time.
+
+### Error journal
+
+Every warning and error the bridge logs is also written, one JSON line each, to a daily file in the state directory: `<state dir>/errors-YYYY-MM-DD.jsonl` (UTC date; default state directory `~/.local/state/krotov-plugin`). A line holds the time, level, area, message, the error's name, code and description, and the turn, thread and chat message IDs, redacted; never message text, request payloads or environment values. Files are kept for `KROT_ERROR_LOG_DAYS` days (default 14, at least 7) under a 50 MB total cap (the oldest day goes first, never today). `/doctor` reports a problem only for an error in the last 24 hours or a warning from the same area repeating 5 or more times in 24 hours, and then shows the last 5 such entries; `/doctor fix` hands only those to the agent, quoted as journal data, not instructions. Otherwise `/doctor` shows the counts for 24 hours and 7 days as an info line. The agent can read the journal itself, for example:
+
+```sh
+tail -n 20 ~/.local/state/krotov-plugin/errors-$(date -u +%F).jsonl
+grep -h '"level":"error"' ~/.local/state/krotov-plugin/errors-*.jsonl | tail -n 20
+```
 
 ## Documentation
 

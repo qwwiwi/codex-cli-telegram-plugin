@@ -14,6 +14,8 @@ import { TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
 import { WidgetPreSendError } from '../safety/pre-send-error.js'
 import { redactSecrets } from '../safety/redact.js'
 import { classifySendError } from '../safety/reliable-telegram-api.js'
+import type { Logger } from '../log.js'
+import { errorDetail } from './error-log.js'
 import { object } from './rpc.js'
 
 // The 16 vendored packs (a test pins this list to the packs/ folder).
@@ -198,6 +200,10 @@ type ComponentOptions = {
   beforeSend?: () => Promise<void>
   // Configured redaction for the plain-text version. Default: the built-in patterns.
   redact?: (text: string) => string
+  // Where a widget Telegram refused is reported (error code and redacted description, never the payload).
+  log?: Pick<Logger, 'warn'>
+  // Configured secret values, masked in the logged description.
+  secrets?: readonly string[]
 }
 
 export type ComponentOutcome = {
@@ -357,6 +363,9 @@ export class AgentComponents {
             const sent = await this.api.sendWidget(this.ownerChat, attempt)
             return { kind: 'widget', messageId: sent.message_id, ...(rendered.variant ? { variant: rendered.variant } : {}) }
           } catch (error) {
+            this.options.log?.warn('Telegram did not accept a widget', {
+              component, error: errorDetail(error, this.options.secrets), ambiguous: isAmbiguous(error),
+            })
             if (isAmbiguous(error)) return { kind: 'unknown', reason: `отправка виджета прервалась (${errorText(error)})` }
             // A flood wait is still running: any text copy now would be one more send into it.
             if (classifySendError(error, 0).kind === 'rate_limited') {

@@ -352,6 +352,10 @@ export function createReliableTelegramApi(
       chat_id: d.chatId,
       attempts,
       error_class: errorClass,
+      // The Telegram error itself (redacted by the logger), so the journal says why the send failed.
+      error: record.error,
+      ...(typeof (err as { error_code?: unknown } | null)?.error_code === 'number'
+        ? { code: (err as { error_code: number }).error_code } : {}),
     })
   }
 

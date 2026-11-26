@@ -118,9 +118,14 @@ export function taskTitle(text: string | undefined): string {
   return clip(text ?? '', 80) || 'сообщение с вложением'
 }
 
+/** What a queued message hears at once: which task it waits for. */
+export function queuedNotice(title: string): string {
+  return 'В очереди: возьму после «' + clip(title, 80) + '».'
+}
+
 export function busyNotice(main: RunningSummary, sides: readonly string[], maxParallel: number): string {
-  const lines = ['Все потоки заняты (' + maxParallel + '). Сообщение в очереди, возьму его после основной задачи.',
-    'Основная задача: «' + clip(main.title, 80) + '», идёт ' + minutes(main.elapsedMs) + '.']
+  const lines = [queuedNotice(main.title),
+    'Все потоки заняты (' + maxParallel + '), основная задача идёт ' + minutes(main.elapsedMs) + '.']
   if (sides.length) lines.push('Параллельно: ' + sides.map(title => '«' + clip(title, 60) + '»').join(', ') + '.')
   return lines.join('\n')
 }

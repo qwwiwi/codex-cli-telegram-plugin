@@ -477,3 +477,27 @@ test('[R12][R13] the final answer after a component: an empty one is dropped, re
   const { actions } = bridge()
   expect(actions.componentDelivery(['turn-1'])).toBeUndefined()
 })
+
+test('[R85] a widget Telegram refuses is logged at warn with its error code and redacted description, no payload', async () => {
+  const token = '123456789:' + 'A'.repeat(35)
+  const warnings: Array<[string, Record<string, unknown> | undefined]> = []
+  const components = new AgentComponents({
+    async sendWidget() {
+      throw Object.assign(new Error(`Call to 'sendWidget' failed! (400: Bad Request: WIDGET_HTML_INVALID ${token})`),
+        { error_code: 400, description: `Bad Request: WIDGET_HTML_INVALID ${token}` })
+    },
+    async sendMessage() { return { message_id: 6 } },
+    async deleteMessage() {},
+  }, OWNER, { log: { warn: (message, context) => { warnings.push([message, context]) } } })
+  const outcome = await components.run('send_component', { component: 'kpi', data: pack('kpi', 'example.json') }, () => true)
+  expect(outcome.delivery).toBe('text')
+  expect(warnings).toHaveLength(1)
+  const [message, context] = warnings[0]!
+  expect(message).toContain('widget')
+  expect(context).toMatchObject({ component: 'kpi', error: { code: 400 } })
+  const logged = JSON.stringify(context)
+  expect(logged).toContain('WIDGET_HTML_INVALID')
+  expect(logged).not.toContain(token)
+  // The rendered widget never reaches the log.
+  expect(logged).not.toContain('<')
+})

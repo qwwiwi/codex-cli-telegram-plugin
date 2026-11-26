@@ -176,7 +176,7 @@ test('switches back to a known conversation and reads its turns and account meta
   expect(state.readThread()).not.toBe(original)
   await session.resume(original)
   expect(state.readThread()).toBe(original)
-  expect(await session.models()).toEqual([{ name: 'gpt-test', default: true }])
+  expect(await session.models()).toEqual([{ name: 'gpt-test', default: true, efforts: ['low', 'medium'], defaultEffort: 'medium' }])
   expect(await session.usageLimits()).toEqual([{ used: 17, minutes: 300 }])
   expect(await session.recentTurns()).toMatchObject({ partial: false, turns: [{ items: [{ text: 'Example' }] }] })
 })
@@ -348,4 +348,25 @@ test('[R02] asks Codex for reasoning summaries on every owner turn only when tho
   }
   expect(await starts(true)).toEqual(['auto', 'auto'])
   expect(await starts(false)).toEqual([undefined, undefined])
+})
+
+test('[R76] sends the owner-chosen reasoning effort with every turn and nothing when none is chosen', async () => {
+  const starts = async (effort: string | undefined) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-effort-'))
+    dirs.push(cwd)
+    const log = join(cwd, 'requests.jsonl')
+    const session = new CodexSession({
+      cwd: import.meta.dir, stateFile: join(cwd, 'thread.json'), env: { ...process.env, KROT_FAKE_LOG: log },
+      selectedEffort: () => effort,
+      command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'],
+    }, () => {})
+    sessions.push(session)
+    await session.initialize()
+    expect((await session.run('first')).status).toBe('completed')
+    expect((await session.run('second')).status).toBe('completed')
+    return readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { method: string; params: Record<string, unknown> })
+      .filter(entry => entry.method === 'turn/start').map(entry => entry.params.effort)
+  }
+  expect(await starts('low')).toEqual(['low', 'low'])
+  expect(await starts(undefined)).toEqual([undefined, undefined])
 })

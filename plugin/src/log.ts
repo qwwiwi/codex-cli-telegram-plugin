@@ -19,6 +19,9 @@ export interface CreateLoggerOptions {
   // (Telegram bot token, Groq key, Bearer/query tokens). Useful for the
   // configured TELEGRAM_WEBHOOK_TOKEN which has no public pattern.
   secrets?: ReadonlyArray<string>
+  // Also receives every warn and error line, whatever LOG_LEVEL says (the bridge's error journal).
+  // It must not throw; a throw is swallowed like a failed write.
+  sink?: (level: 'warn' | 'error', name: string, msg: string, ctx: Record<string, unknown> | undefined) => void
 }
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
@@ -60,6 +63,13 @@ export function createLogger(name: string, opts: CreateLoggerOptions = {}): Logg
   const threshold = LEVEL_ORDER[envLevel()]
   const secrets: ReadonlyArray<string> = opts.secrets ?? []
   const emit = (level: LogLevel, msg: string, ctx?: Record<string, unknown>): void => {
+    if (opts.sink && (level === 'warn' || level === 'error')) {
+      try {
+        opts.sink(level, name, msg, ctx)
+      } catch {
+        // never let logging throw
+      }
+    }
     if (LEVEL_ORDER[level] < threshold) return
     try {
       stream.write(formatLine(name, level, msg, ctx, secrets))

@@ -118,6 +118,8 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   without sending the reply. `off` disables the check. Tool approvals and
   question cards follow their existing rules.
 - `/cc model [name]` lists and selects models available to the account.
+  Without a name it shows one button per model (the current one marked ✓); after a tap
+  it offers the reasoning efforts that model supports (not behind the root relay).
   Use `/cc model default` for `KROT_CODEX_MODEL` or the catalog default.
   The selected model applies to subsequent turns without losing the conversation.
 - `/cc resume [number or ID]` lists or switches between up to ten

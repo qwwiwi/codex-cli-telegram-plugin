@@ -10,7 +10,7 @@ const REPOST_DELAY_MS = 120
 const REASONING_PART = 'item/reasoning/summaryPartAdded'
 const REASONING_DELTA = 'item/reasoning/summaryTextDelta'
 
-function activityCall(item: ReturnType<typeof object>, clean: (text: string) => string): ActivityCall | undefined {
+export function activityCall(item: ReturnType<typeof object>, clean: (text: string) => string): ActivityCall | undefined {
   const tool = typeof item.tool === 'string' ? clean(item.tool) : ''
   switch (item.type) {
     case 'commandExecution': {

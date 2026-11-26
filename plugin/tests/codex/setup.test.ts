@@ -175,6 +175,19 @@ test('[R18] the generated agent profile explains subagents and parallel side thr
   expect(section).toMatch(/параллельн\S* поток/)
 })
 
+test('[R90] the generated agent profile says where the bridge error journal lives and how to read it', () => {
+  const { repo, env, home } = checkout()
+  const result = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321', '--agent-name', 'Helper')
+  expect(result.code, result.text).toBe(0)
+  const profile = readFileSync(join(home, 'krotov-workspace/AGENTS.md'), 'utf8')
+  const section = profile.slice(profile.indexOf('## Журнал ошибок моста'))
+  expect(section.startsWith('## Журнал ошибок моста')).toBe(true)
+  expect(section).toContain(join(home, '.local/state/krotov-plugin') + '/errors-ГГГГ-ММ-ДД.jsonl')
+  // The path is quoted in the commands, so a state directory with a space still works.
+  expect(section).toContain(`'${join(home, '.local/state/krotov-plugin')}'/errors-$(date -u +%F).jsonl`)
+  expect(section).toContain(`grep -h '"level":"error"'`)
+})
+
 test('an agent can pair a new bot without requesting an ID and opt into service startup', () => {
   const { root, repo, env } = checkout()
   const secret = join(root, 'token')

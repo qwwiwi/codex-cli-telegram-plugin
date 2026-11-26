@@ -47,6 +47,7 @@ import {
   takeContinuation, unfinishedOwnerTask, type ContinuationContext,
 } from './continuation.js'
 import { ControlState } from './control-state.js'
+import { MODEL_MENU_CALLBACK, ModelMenu } from './model-menu.js'
 import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, formatConversation,
   readClaudeArchive, sendConversation } from './conversation-export.js'
 import { CodexInbox, type InboxReply } from './inbox.js'
@@ -58,7 +59,7 @@ import { agentBody, agentProvenance, agentTurnInstructions, ownerProvenance, tur
   type Provenance } from './provenance.js'
 import { recoverInterruptedWork } from './side-recovery.js'
 import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-delivery.js'
-import { deliverReplyPart, type PartStatus } from './reply-delivery.js'
+import { deliverReplyPart, plannedTextParts, type PartStatus } from './reply-delivery.js'
 import {
   BridgeRestart, bridgeRestartDirectInstructions, bridgeRestartInstructions, bridgeRestartReply,
   bridgeRestartVerificationInstructions, ownerRequestedBridgeRestart, restartOwnerText,
@@ -75,7 +76,12 @@ import { LearningMemory } from './learning.js'
 import { requestStructured, reviewLearning } from './learning-review.js'
 import { legacyCommand } from './legacy-command.js'
 import { sideQuestion, sideReply, sideReplySchema } from './side-reply.js'
-import { busyNotice, parallelSettings, routeWhileBusy, SideRegistry, sideInstructions, taskTitle } from './parallel.js'
+import { SideDeliveries, sideEndNotice } from './side-delivery.js'
+import { errorDetail, ErrorJournal, errorLogDays } from './error-log.js'
+import {
+  busyNotice, parallelSettings, queuedNotice, routeWhileBusy, SideRegistry, sideInstructions, taskTitle,
+} from './parallel.js'
+import { SideStatusCard, sideActivityLine, sideFirstStage, sideThinking } from './side-status.js'
 import { hasMedia, prepareInbound, type MediaInput } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { CodexSession } from './session.js'
@@ -136,7 +142,14 @@ async function main(): Promise<void> {
   const policyToken = process.env.KROT_CODEX_POLICY_TOKEN
   // Exact values of every credential the bridge holds or forwards to Codex (GBRAIN_BEARER).
   const secrets = exactSecrets(process.env)
-  const log = createLogger('krot-codex', { secrets })
+  // Every warn and error line also lands in <state dir>/errors-YYYY-MM-DD.jsonl (see error-log.ts).
+  const errorJournal = new ErrorJournal({ dir: paths.root, days: errorLogDays(process.env.KROT_ERROR_LOG_DAYS), secrets })
+  const log = createLogger('krot-codex', {
+    secrets, sink: (level, name, message, context) => errorJournal.record(level, name, message, context),
+  })
+  // A caught error logged at warn with its name, code and redacted description.
+  const warnError = (error: unknown, message: string, context: Record<string, unknown> = {}): void =>
+    log.warn(message, { ...context, error: errorDetail(error, secrets) })
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
   bot.use(richInboundMiddleware(undefined, () => log.warn('Could not normalize Telegram rich content')))
   const safeTelegram = createSafeTelegramApi(
@@ -308,7 +321,7 @@ async function main(): Promise<void> {
         learning = new LearningMemory(root, interval, secrets,
           prompt => reviewLearning(root, codexEnv, prompt, learningAbort.signal, process.env.KROT_CODEX_LEARNING_MODEL),
           autoSaveLearning)
-      } catch { log.warn('Could not start Codex learning. Check the learning state directory and interval.') }
+      } catch (error) { warnError(error, 'Could not start Codex learning. Check the learning state directory and interval.') }
     }
     const quotedAttachments = new Map<number, Message>()
     let goalActive = Boolean(controls.goalThread)
@@ -322,6 +335,10 @@ async function main(): Promise<void> {
     // Parallel side threads (KROT_CODEX_PARALLEL=1); off keeps the single-thread flow.
     const parallel = parallelSettings(process.env)
     const sides = new SideRegistry()
+    // What each Codex thread put in the chat through its tools: a side turn that answered that way ends silently.
+    const sideDeliveries = new SideDeliveries()
+    // Status cards of running owner side turns, by side thread: they show that side thread's progress.
+    const sideCards = new Map<string, SideStatusCard>()
     let mainStartedAt = 0
     let milestoneThread = ''
     let lastNativePlan: { turnId: string; pending: boolean } | undefined
@@ -353,12 +370,14 @@ async function main(): Promise<void> {
       env: codexEnv,
       ...(process.env.KROT_CODEX_MODEL ? { model: process.env.KROT_CODEX_MODEL } : {}),
       selectedModel: () => controls.model,
+      // The root relay refuses `effort` on turn/start; there the model default stays.
+      ...(proxy ? {} : { selectedEffort: () => controls.effort }),
       // The root relay admits a fixed turn/start key set without `summary`; there the
       // server's own Codex config decides whether summaries stream.
       reasoningSummary: !proxy && config.status.thoughts?.enabled === true,
       onWarning: message => log.warn(message),
       onThread: id => {
-        try { controls.remember(id) } catch { log.warn('Could not remember the Codex conversation') }
+        try { controls.remember(id) } catch (error) { warnError(error, 'Could not remember the Codex conversation') }
       },
       onProgress: kind => {
         if (controls.mirror) {
@@ -368,6 +387,10 @@ async function main(): Promise<void> {
       },
       onActivity: (event, thread) => {
         work.receive(event, thread)
+        const sideThread = event.params.threadId
+        const card = typeof sideThread === 'string' ? sideCards.get(sideThread) : undefined
+        const line = card ? sideActivityLine(event, secrets) : undefined
+        if (card && line) card.show(sideThinking + '\n' + line)
         if (!thread || event.params.threadId !== thread) return
         if (controls.mirror && event.method === 'item/commandExecution/outputDelta' &&
             typeof event.params.delta === 'string' && typeof event.params.itemId === 'string') {
@@ -418,7 +441,7 @@ async function main(): Promise<void> {
               Array.isArray(item.questions) && item.questions.length) {
             if (untrusted) return
             void answerAsyncQuestion(thread, item.questions, stopEpoch)
-              .catch(() => log.warn('Could not relay the async Codex question'))
+              .catch((error: unknown) => warnError(error, 'Could not relay the async Codex question'))
             return
           }
           if (item.type === 'agentMessage' && item.phase === 'commentary' && typeof item.text === 'string') {
@@ -439,7 +462,7 @@ async function main(): Promise<void> {
                 }, result => codex.steer('Служебный результат действия Telegram. Не показывай его владельцу.\n' +
                   JSON.stringify(result), Date.now(), [], turnId))
               if (action) {
-                void action.catch(() => log.warn('Telegram declined a Codex chat action'))
+                void action.catch((error: unknown) => warnError(error, 'Telegram declined a Codex chat action'))
                 return
               }
             }
@@ -472,8 +495,8 @@ async function main(): Promise<void> {
             await agentChat.flush()
             await deliverGoalOutcome(thread, goal, result.text)
           }
-        })().catch(() => {
-          log.warn('Could not deliver the Codex goal outcome')
+        })().catch((error: unknown) => {
+          warnError(error, 'Could not deliver the Codex goal outcome', { area: 'delivery', threadId: thread })
           if (!stopping && controls.goalThread === thread && controls.goalDeliveryPending) {
             recoveringGoal = thread
             goalRecoveryTimer = setTimeout(() => { void recoverGoal(thread) }, 3000)
@@ -490,9 +513,13 @@ async function main(): Promise<void> {
       ask: (input, signal) => questions.ask(input, signal),
       chatAction: (key, args, current, tool) => {
         const epoch = stopEpoch
-        if (isComponentTool(tool)) return agentChat.component(key, tool, args, () => !stopping && epoch === stopEpoch && current())
-        return agentChat.call(key, args, () => !stopping && epoch === stopEpoch && current(),
-          id => downloadQuotedAttachment(telegram, quotedAttachments.get(id), ownerChat, paths.inbox))
+        const result = isComponentTool(tool)
+          ? agentChat.component(key, tool, args, () => !stopping && epoch === stopEpoch && current())
+          : agentChat.call(key, args, () => !stopping && epoch === stopEpoch && current(),
+            id => downloadQuotedAttachment(telegram, quotedAttachments.get(id), ownerChat, paths.inbox))
+        // Counted before Codex sees the result, so before the turn that made the call can finish.
+        void result.then(value => sideDeliveries.record(key, value), () => undefined)
+        return result
       },
       ...(proxy ? { command: ['/usr/bin/sudo', '-n', '--', proxy] } : {}),
     }, () => {
@@ -500,6 +527,10 @@ async function main(): Promise<void> {
       shutdown()
     })
     if (codex.currentThread) controls.remember(codex.currentThread)
+    const modelMenu = new ModelMenu({
+      ownerId, chat: ownerChat, telegram, controls, models: () => codex.models(), efforts: !proxy,
+      ...(process.env.KROT_CODEX_MODEL ? { defaultModel: process.env.KROT_CODEX_MODEL } : {}),
+    })
     await codex.initialize()
     workerStatusTimer = setInterval(() => {
       if (!stopping) {
@@ -565,6 +596,12 @@ async function main(): Promise<void> {
       await hudAnchor.settled()
       await telegram.sendMessage(ownerChat, text, {})
     }
+    // A status line about one owner message (queued): a silent reply to it, so it is no extra ping.
+    const sendStatusReply = async (text: string, replyTo: number): Promise<void> => {
+      await hudAnchor.settled()
+      await withoutDeletedQuote(id => telegram.sendMessage(ownerChat, text,
+        { ...(id === undefined ? {} : { reply_to_message_id: id }), disable_notification: true }), replyTo > 0 ? replyTo : undefined)
+    }
     let learningRetryAfter = 0
     function runLearning(force = false): void {
       if (!learning || stopping || !force && Date.now() < learningRetryAfter) return
@@ -575,25 +612,26 @@ async function main(): Promise<void> {
         if (count) log.info('Codex learning saved entries', { count })
         if (force) return send('Новых записей нет или разбор уже выполняется.')
         return undefined
-      }, () => {
+      }, (error: unknown) => {
         if (stopping) return undefined
         learningRetryAfter = Date.now() + 10 * 60_000
-        log.warn('Codex learning review failed; check the local CLI, ChatGPT login and App Server capability.')
+        warnError(error, 'Codex learning review failed; check the local CLI, ChatGPT login and App Server capability.')
         if (force) return send('Не удалось разобрать диалог. Проверьте вход в локальный Codex CLI и журнал моста.')
         return undefined
-      }).catch(() => log.warn('Could not send learning status'))
+      }).catch((error: unknown) => warnError(error, 'Could not send learning status'))
     }
     async function recordMemory(sessionId: string | null, userText: string, agentText: string, durationMs: number): Promise<void> {
       try {
         await memory?.recordTurn({
           sessionId, userText: redactSecrets(userText, secrets), agentText: redactSecrets(agentText, secrets), durationMs,
         })
-      } catch { log.warn('Could not write agent memory') }
+      } catch (error) { warnError(error, 'Could not write agent memory') }
     }
 
     async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number,
       onSent?: (id: number) => void): Promise<void> {
-      text = splitLongBlock(normalizeChatReply(text))
+      const normalized = normalizeChatReply(text)
+      text = splitLongBlock(normalized)
       if (!text) return
       await hudAnchor.settled()
       const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
@@ -602,7 +640,7 @@ async function main(): Promise<void> {
         if (question) {
           questionStore.set({ chatId: ownerChat, messageId, askedAtMs: Date.now(),
             code: question.code, snippet: question.snippet, remindersSent: 0 })
-          await leases.recordQuestion(messageId, question.snippet).catch(() => log.warn('Could not save an open question'))
+          await leases.recordQuestion(messageId, question.snippet).catch((error: unknown) => warnError(error, 'Could not save an open question'))
         }
         else if (questionStore.get(ownerChat)?.code !== 'AQ_CARD') questionStore.clear(ownerChat)
       }
@@ -622,7 +660,8 @@ async function main(): Promise<void> {
           }
           if (result.state !== 'fallback') return
         } else inbox.setReplyPart(messageId, 'rich', 'fallback')
-        for (const [index, part] of splitMessage(markdownToTelegramHtml(text)).entries()) {
+        // The saved chunk plan keeps `text:N` receipts pointing at the chunks they were counted for.
+        for (const [index, part] of plannedTextParts(inbox, messageId, normalized).entries()) {
           const key = 'text:' + index
           const result = await deliverReplyPart(inbox.replyPart(messageId, key),
             state => inbox.setReplyPart(messageId, key, state),
@@ -697,6 +736,7 @@ async function main(): Promise<void> {
       components: new AgentComponents(telegram, ownerChat, {
         beforeSend: (): Promise<void> => hudAnchor.settled(),
         redact: (text: string): string => redactSecrets(text, secrets),
+        log, secrets,
       }),
       reactionPalette,
       replyPolicy: text => leases.replyPolicy(redactSecrets(text, secrets), resolveAskGuardMode(config, log)),
@@ -740,7 +780,7 @@ async function main(): Promise<void> {
       if (questionConfig.enabled && item.question) {
         const { code, snippet } = item.question
         questionStore.set({ chatId: ownerChat, messageId: id, askedAtMs: Date.now(), code, snippet, remindersSent: 0 })
-        void leases.recordQuestion(id, snippet).catch(() => log.warn('Could not save an open question'))
+        void leases.recordQuestion(id, snippet).catch((error: unknown) => warnError(error, 'Could not save an open question'))
       }
     }
     function chatContext(messages: readonly Message[]): string {
@@ -805,7 +845,8 @@ async function main(): Promise<void> {
       }
       try {
         await send(await executeChatAction(actionApi, ownerChat, bot.botInfo.id, action, target, args))
-      } catch {
+      } catch (error) {
+        warnError(error, 'Telegram declined an owner chat action', { area: 'telegram' })
         await send('Telegram отклонил действие с этим сообщением.')
       }
     }
@@ -885,8 +926,8 @@ async function main(): Promise<void> {
           if (selected()) await deliverGoalOutcome(thread, goal, answer)
         }
         if (selected()) setGoalActive(false)
-      } catch {
-        log.warn('Could not yet reconcile the Codex goal after reconnect')
+      } catch (error) {
+        warnError(error, 'Could not yet reconcile the Codex goal after reconnect')
         if (!stopping) goalRecoveryTimer = setTimeout(() => { void recoverGoal(thread) }, 3000)
         return
       }
@@ -1009,7 +1050,8 @@ async function main(): Promise<void> {
         }
         await send(mode === 'resume' ? 'Продолжаю работу по цели.' :
           '🎯 Цель принята. Продолжу работу самостоятельно и сообщу о вехах. /stop ставит цель на паузу.')
-      } catch {
+      } catch (error) {
+        warnError(error, 'Codex could not run /goal')
         await send('Codex не смог выполнить команду /goal.')
       }
     }
@@ -1060,21 +1102,8 @@ async function main(): Promise<void> {
           return
         }
         if (action === 'model') {
-          const models = await codex.models()
-          if (!value) {
-            await send(['Доступные модели Codex', ...models.slice(0, 30).map(x => x.name + (x.default ? ' (по умолчанию)' : '')),
-              'Выбрать: /cc model <имя>'].join('\n'))
-            return
-          }
-          const name = value === 'default'
-            ? process.env.KROT_CODEX_MODEL ?? models.find(x => x.default)?.name
-            : models.find(x => x.name === value)?.name
-          if (!name) {
-            await send('Такой модели нет в списке /cc model.')
-            return
-          }
-          controls.selectModel(name)
-          await send('Модель для следующих запросов: ' + name)
+          if (!value) await modelMenu.open()
+          else await send(await modelMenu.choose(value))
           return
         }
         if (action === 'resume') {
@@ -1124,7 +1153,8 @@ async function main(): Promise<void> {
         if (messageId && await enqueueCustomCommand(action, value, messageId)) return
         await send(['Команды Codex', '/cc compact', '/cc context', '/cc status', '/cc model [имя]',
           '/cc resume [номер или ID]', '/cc export', '/cc cost', '/cc clear'].join('\n'))
-      } catch {
+      } catch (error) {
+        warnError(error, 'Codex could not run a /cc command')
         await send('Codex не смог выполнить /cc ' + action + '.')
       } finally { startNext() }
     }
@@ -1151,6 +1181,7 @@ async function main(): Promise<void> {
       collect: () => collectDoctorReport({
         repo: bridgeRepo, env: process.env,
         doctor: () => runDoctorScript(join(import.meta.dir, '..', '..', 'scripts', 'doctor.ts'), process.env),
+        errors: () => errorJournal.recent(),
       }),
       send, repo: bridgeRepo, selfRestart: selfRestartEnabled, secrets,
     })
@@ -1185,7 +1216,7 @@ async function main(): Promise<void> {
 
     function cancelPendingBridgeRestart(): void {
       bridgeRestart.cancel()
-      try { restartHandoff?.cancel() } catch { log.warn('Could not cancel saved restart verification') }
+      try { restartHandoff?.cancel() } catch (error) { warnError(error, 'Could not cancel saved restart verification') }
     }
 
     async function cancelCurrentTurn(): Promise<boolean> {
@@ -1200,8 +1231,8 @@ async function main(): Promise<void> {
         await codex.setGoal(controls.goalThread, 'paused')
         setGoalActive(false)
       }
-      const sideStopped = sides.size > 0 && await codex.stopSide().catch(() => {
-        log.warn('Could not stop a parallel Codex turn')
+      const sideStopped = sides.size > 0 && await codex.stopSide().catch((error: unknown) => {
+        warnError(error, 'Could not stop a parallel Codex turn', { area: 'side-turn' })
         return true
       })
       return (cancelMedia ? (cancelMedia(), true) : await codex.stop()) || sideStopped
@@ -1218,7 +1249,8 @@ async function main(): Promise<void> {
           await Promise.race([notice.catch(() => undefined), new Promise<void>(resolve => setTimeout(resolve, 750))])
           if (!await codex.stopBackground()) await send('Не удалось остановить фоновые задачи.')
         } else await notice
-      } catch {
+      } catch (error) {
+        warnError(error, 'Could not stop the Codex task')
         await send('Не удалось остановить задачу Codex.')
       }
     }
@@ -1235,7 +1267,7 @@ async function main(): Promise<void> {
         void doctor.handle(args, async text => {
           if (messageId === undefined) throw new Error('/doctor fix needs the owner message ID')
           await enqueueOwnerTurn(text, messageId)
-        }).catch(() => log.warn('Could not finish /doctor'))
+        }).catch((error: unknown) => warnError(error, 'Could not finish /doctor'))
         return
       }
       if (name === 'cc') return handleCc(args, messageId)
@@ -1360,6 +1392,19 @@ async function main(): Promise<void> {
       if (command) await handleCommand(command.name, command.args)
     })
 
+    bot.callbackQuery(MODEL_MENU_CALLBACK, async ctx => {
+      if (stopping) return
+      let text: string | undefined
+      try {
+        text = await modelMenu.answer({ data: ctx.callbackQuery.data, fromId: ctx.from.id, chatId: ctx.chat?.id,
+          chatType: ctx.chat?.type, messageId: ctx.callbackQuery.message?.message_id })
+      } catch {
+        log.warn('Could not apply the /cc model menu choice')
+        text = 'Codex не смог выполнить /cc model.'
+      }
+      if (text !== undefined) await ctx.answerCallbackQuery({ text }).catch(() => undefined)
+    })
+
     const knownOwnerMessages = new Set<number>()
 
     function acknowledge(message: Message): void {
@@ -1377,8 +1422,11 @@ async function main(): Promise<void> {
       const waiting = !!task || goalActive || externalQuestion
       startNext()
       if (!waiting) return
-      const notice = () => stopping ? undefined :
-        send('Сообщение в очереди. Возьму его после текущей задачи.').catch(() => undefined)
+      // Built when it is sent: if this message was taken meanwhile, it waits for nothing and gets no notice.
+      const notice = () => stopping || (message && inbox.active?.messages[0]?.message_id === message.message_id)
+        ? undefined : (message && message.message_id > 0
+        ? sendStatusReply(queuedNotice(mainSummary().title), message.message_id)
+        : send(queuedNotice(mainSummary().title))).catch(() => undefined)
       if (!message || message.message_id <= 0) { void notice(); return }
       void watcher.maybeAutoReply({ chatId: ownerChat, messageId: message.message_id }).then(result => {
         if (!result.replied && result.reason !== 'debounced') void notice()
@@ -1391,11 +1439,11 @@ async function main(): Promise<void> {
           const turnId = codex.steerableTurn
           const batch = !stopping && !recoveringInbox && turnId ? inbox.claimAlbumFollowUp(id) : undefined
           if (batch && turnId) {
-            void steerClaimed(batch, turnId).catch(() => log.warn('Could not route Telegram album'))
+            void steerClaimed(batch, turnId).catch((error: unknown) => warnError(error, 'Could not route Telegram album'))
             return
           }
           if (inbox.sealAlbum(id)) resumeInbox(message)
-        } catch { log.warn('Could not persist the assembled Telegram album') }
+        } catch (error) { warnError(error, 'Could not persist the assembled Telegram album') }
       })
     }
 
@@ -1430,7 +1478,7 @@ async function main(): Promise<void> {
           if (enqueue) resumeInbox(message)
           else startNext()
         }
-      })().catch(() => log.warn('Could not finish a Telegram side question'))
+      })().catch((error: unknown) => warnError(error, 'Could not finish a Telegram side question'))
       return true
     }
 
@@ -1465,8 +1513,14 @@ async function main(): Promise<void> {
       const agent = provenance.origin === 'agent'
       sides.begin(id, redactSecrets(taskTitle(agentBody(message.text) ?? message.caption), secrets), reuse)
       const settleSide = () => {
-        try { inbox.finishSide(id) } catch { log.warn('Could not clear a finished parallel turn') }
+        try { inbox.finishSide(id) } catch (error) { warnError(error, 'Could not clear a finished parallel turn') }
       }
+      // The owner sees at once that the message went to a parallel turn, not to the queue: a silent reply card,
+      // updated with the side turn's progress and removed once its answer is delivered or it ended.
+      const card = agent || id <= 0 ? undefined : new SideStatusCard(telegram, ownerChat, id,
+        { onError: (error, text) => warnError(error, text, { area: 'side-turn', messageId: id }) })
+      card?.show(sideFirstStage(message))
+      let cardThread: string | undefined
       void (async () => {
         let started = false
         // `thread` set: Codex accepted the turn, keep it as a side job; unset: drop the follow-up.
@@ -1496,8 +1550,13 @@ async function main(): Promise<void> {
             ? [sideInstructions(mainSummary(), provenance), input.text].filter(Boolean).join('\n\n')
             : sideOwnerTurn(formatReminderOn,
               [sideInstructions(mainSummary(), provenance), agentChatInstructions, chatContext([message]), input.text])
+          card?.show(sideThinking)
           const result = await codex.runSide(prompt, agent ? [] : input.images, reuse, thread => {
             sides.attach(id, thread)
+            if (card) {
+              cardThread = thread
+              sideCards.set(thread, card)
+            }
             release(thread)
           }, { untrusted: agent })
           if (stopping) return
@@ -1509,12 +1568,19 @@ async function main(): Promise<void> {
               sent => sides.remember(sent, result.threadId))
             settleSide()
             log.info('Codex side reply delivered')
-          } else if (epoch === stopEpoch) {
-            await send(result.status === 'interrupted' ? 'Параллельная задача остановлена.'
-              : 'Параллельный поток не вернул ответ. Отправь сообщение ещё раз.')
+          } else {
+            // A turn that answered through its tools (reaction, component, interim reply) ends silently.
+            // Counted for this turn's ID: a late receipt of an earlier turn on a reused thread is not this turn's.
+            const delivered = sideDeliveries.count(result.threadId, result.turnId)
+            // A failed side turn is an error worth the journal; a finished or stopped one is not.
+            const ended = { area: 'side-turn', status: result.status, delivered, threadId: result.threadId, messageId: id }
+            if (result.status === 'failed') log.warn('Codex side turn ended without text', ended)
+            else log.info('Codex side turn ended without text', ended)
+            const notice = sideEndNotice(result.status, delivered)
+            if (notice && epoch === stopEpoch) await send(notice)
           }
-        } catch {
-          log.warn('Could not finish a parallel Codex turn')
+        } catch (error) {
+          warnError(error, 'Could not finish a parallel Codex turn', { area: 'side-turn', messageId: id })
           if (stopping) return
           if (!started && inbox.uncertainFollowUp?.message_id === id) {
             // Codex never took it: queue it for the main thread as before.
@@ -1528,9 +1594,12 @@ async function main(): Promise<void> {
           // On shutdown the side job stays saved for recovery after the restart.
           if (!stopping) settleSide()
           sides.end(id)
+          if (cardThread !== undefined && sideCards.get(cardThread) === card) sideCards.delete(cardThread)
           sideDone()
+          // The answer (or the notice) is in the chat now: the status card goes away.
+          await card?.close()
         }
-      })().catch(() => log.warn('Could not finish a parallel Codex turn'))
+      })().catch((error: unknown) => warnError(error, 'Could not finish a parallel Codex turn'))
       return true
     }
 
@@ -1546,9 +1615,10 @@ async function main(): Promise<void> {
         if (hudReady) hudAnchor.ownerMessage()
         startNext()
         if (inbox.active?.messages[0]?.message_id !== message.message_id) {
-          await send(busyNotice(mainSummary(), sides.titles, parallel.maxParallel))
+          await sendStatusReply(busyNotice(mainSummary(), sides.titles, parallel.maxParallel), message.message_id)
         }
-      } catch {
+      } catch (error) {
+        warnError(error, 'Could not queue an owner message', { messageId: message.message_id })
         await send('Не удалось сохранить сообщение. Отправь его ещё раз.')
       }
     }
@@ -1595,7 +1665,8 @@ async function main(): Promise<void> {
           if (message.media_group_id) bufferAlbum(message.media_group_id, message)
           else resumeInbox(message)
         }
-      } catch {
+      } catch (error) {
+        warnError(error, 'Could not save an owner message', { messageId: message.message_id })
         await send('Не удалось сохранить сообщение. Отправь его ещё раз.')
       }
     }
@@ -1693,7 +1764,7 @@ async function main(): Promise<void> {
         if (decision.route === 'side') {
           try {
             if (launchSide(ctx.message, decision.thread, ownerProvenance)) return
-          } catch { log.warn('Could not persist the Telegram message for a parallel turn') }
+          } catch (error) { warnError(error, 'Could not persist the Telegram message for a parallel turn') }
         }
       }
       if (!action && text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
@@ -1704,7 +1775,7 @@ async function main(): Promise<void> {
           if (outcome === 'duplicate') return
           if (outcome === 'accepted' && hudReady) hudAnchor.ownerMessage()
           if (outcome === 'accepted' && launchSideReply(ctx.message, stopEpoch)) return
-        } catch { log.warn('Could not persist the Telegram side question') }
+        } catch (error) { warnError(error, 'Could not persist the Telegram side question') }
       }
       if (!action && !ctx.message.media_group_id && turnId &&
           (text || hasMedia(ctx.message) || hasRichBody(ctx.message) || unhandledContentKeys(ctx.message).length)) {
@@ -1715,7 +1786,7 @@ async function main(): Promise<void> {
             if (hudReady) hudAnchor.ownerMessage()
             return await steerClaimed([ctx.message], turnId)
           }
-        } catch { log.warn('Could not persist the Telegram follow-up') }
+        } catch (error) { warnError(error, 'Could not persist the Telegram follow-up') }
       }
       if (ctx.message.media_group_id || text || hasMedia(ctx.message) || hasRichBody(ctx.message) ||
           unhandledContentKeys(ctx.message).length > 0) {
@@ -1799,8 +1870,8 @@ async function main(): Promise<void> {
           const result = await requestStructured(room, codexEnv, prompt, schema,
             AbortSignal.any([learningAbort.signal, AbortSignal.timeout(20_000)]))
           if (object(JSON.parse(result)).resume !== true) return undefined
-        } catch {
-          log.warn('Could not match a status report to its saved task')
+        } catch (error) {
+          warnError(error, 'Could not match a status report to its saved task')
           return undefined
         }
       }
@@ -1814,7 +1885,7 @@ async function main(): Promise<void> {
       const id = first.message_id
       inbox.start(id)
       const result = await codex.run([agentTurnInstructions(agent), text].join('\n\n'), [], turnId => {
-        try { inbox.assignTurn(id, turnId) } catch { log.warn('Could not persist the Codex turn ID') }
+        try { inbox.assignTurn(id, turnId) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
       }, { untrusted: true })
       if (stopping) return
       if (result.status !== 'completed' || !result.text.trim()) {
@@ -1882,10 +1953,10 @@ async function main(): Promise<void> {
     function startNext(): void {
       if (task || stopping || resetting || recoveringInbox || recoveringGoal || deliveringGoal ||
           goalActive || externalQuestion || codex.isRunning) return
-      try { restartHandoff?.recover(inbox) } catch { log.warn('Could not restore a saved restart verification') }
+      try { restartHandoff?.recover(inbox) } catch (error) { warnError(error, 'Could not restore a saved restart verification') }
       let messages: Message[] | undefined
-      try { messages = inbox.take() } catch {
-        log.warn('Could not claim the next Telegram message')
+      try { messages = inbox.take() } catch (error) {
+        warnError(error, 'Could not claim the next Telegram message')
         return
       }
       const first = messages?.[0]
@@ -1956,7 +2027,7 @@ async function main(): Promise<void> {
           const saveTurn = (turnId: string) => {
             latestTurnId = turnId
             turnIds.push(turnId)
-            try { inbox.assignTurn(first.message_id, turnId) } catch { log.warn('Could not persist the Codex turn ID') }
+            try { inbox.assignTurn(first.message_id, turnId) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
           }
           const handoff = memory && config.memory.workspace_path && !codex.status.hasThread
             ? await readHandoffContext(config.memory.workspace_path, secrets).catch(() => '') : ''
@@ -2014,6 +2085,10 @@ async function main(): Promise<void> {
             return
           }
           if (result.status !== 'completed' || !result.text.trim()) {
+            // An owner /stop is not an error: only a failed or empty turn goes to the error journal.
+            const ended = { area: 'codex-turn', status: result.status, messageId: first.message_id }
+            if (result.status === 'interrupted') log.info('Codex turn ended without an answer', ended)
+            else log.warn('Codex turn ended without an answer', ended)
             progressResult = result.status === 'interrupted' ? 'Задача остановлена' : 'Ответ не получен'
             await send(result.status === 'interrupted' ? 'Задача остановлена.' : 'Codex не вернул готовый ответ.')
             inbox.finish(first.message_id)
@@ -2052,13 +2127,14 @@ async function main(): Promise<void> {
             try {
               learning.observe(ownerText, reply.text)
               runLearning()
-            } catch { log.warn('Could not retain the turn for learning') }
+            } catch (error) { warnError(error, 'Could not retain the turn for learning') }
           }
           if (interim !== undefined) progressResult = 'Продолжаю работу'
           const inputType = messages.length > 1 ? 'album' : first.voice ? 'voice' : first.photo ? 'photo'
             : first.document ? 'document' : hasMedia(first) ? 'media' : 'text'
           log.info('Codex reply delivered', { input_type: inputType })
-        } catch {
+        } catch (error) {
+          warnError(error, 'Codex turn failed', { area: 'codex-turn', messageId: first.message_id })
           progressResult = 'Работа завершилась с ошибкой'
           if (!stopping && inbox.active?.outcome.stage !== 'ready') await send('Не удалось завершить задачу Codex.')
         } finally {
@@ -2070,7 +2146,7 @@ async function main(): Promise<void> {
           // Turn done: refresh the HUD card in place; it already sits above the reply.
           if (!stopping) hudAnchor.refresh()
         }
-      })().catch(() => log.warn('Could not deliver the turn status')).finally(() => {
+      })().catch((error: unknown) => warnError(error, 'Could not deliver the turn status')).finally(() => {
         task = undefined
         if (inbox.active && !stopping) {
           recoveringInbox = true
@@ -2091,9 +2167,9 @@ async function main(): Promise<void> {
           recoveringGoal = thread
           void recoverGoal(thread)
         }
-      } catch {
+      } catch (error) {
         setGoalActive(false)
-        log.warn('Could not restore the Codex goal status')
+        warnError(error, 'Could not restore the Codex goal status')
       }
     } else setGoalActive(false)
     function inboxRetryDelay(): number {
@@ -2170,8 +2246,8 @@ async function main(): Promise<void> {
           startNext()
           return
         }
-      } catch {
-        log.warn('Could not yet verify the previous Codex turn before resuming the inbox')
+      } catch (error) {
+        warnError(error, 'Could not yet verify the previous Codex turn before resuming the inbox')
       }
       if (!stopping) recoveryTimer = setTimeout(() => { void resumeRecoveredInbox() }, inboxRetryDelay())
     }
@@ -2230,7 +2306,7 @@ async function main(): Promise<void> {
         from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
       }
       const provenance = agentProvenance(delivery.agentId)
-      const notify = () => { void send(redactSecrets(delivery.notice, secrets)).catch(() => log.warn('Could not notify the owner about an agent message')) }
+      const notify = () => { void send(redactSecrets(delivery.notice, secrets)).catch((error: unknown) => warnError(error, 'Could not notify the owner about an agent message')) }
       const busy = !!task || goalActive || codex.isRunning
       const route = routeAgentMessage(delivery.input, { busy, parallel, sides })
       // Same paths as an owner message (side thread or queue), but never a steer into the main turn.
@@ -2240,7 +2316,7 @@ async function main(): Promise<void> {
             notify()
             return 'accepted'
           }
-        } catch { log.warn('Could not persist the agent message for a parallel turn') }
+        } catch (error) { warnError(error, 'Could not persist the agent message for a parallel turn') }
       }
       const outcome = inbox.receive(message, provenance)
       if (outcome !== 'accepted') return outcome

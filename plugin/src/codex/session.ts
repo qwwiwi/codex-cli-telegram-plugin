@@ -47,6 +47,16 @@ export interface TurnOptions {
   untrusted?: boolean
 }
 
+// A model from the App Server's model/list with the reasoning efforts it accepts.
+export interface CodexModel {
+  name: string
+  default: boolean
+  efforts: string[]
+  defaultEffort?: string
+}
+
+const effortName = /^[a-z]{1,16}$/
+
 export type PolicyApprovalRequest = ApprovalRequest & {
   kind: 'command' | 'file'
   operation?: { threadId: string; turnId: string; itemId: string }
@@ -59,6 +69,8 @@ type Settings = {
   command?: readonly [string, ...string[]]
   model?: string
   selectedModel?: () => string | undefined
+  // Owner-chosen reasoning effort (turn/start `effort`); undefined: the model default.
+  selectedEffort?: () => string | undefined
   // Ask for reasoning summaries (turn/start `summary: "auto"`) so the working bubble can show them.
   reasoningSummary?: boolean
   onThread?: (threadId: string) => void
@@ -299,11 +311,21 @@ export class CodexSession {
     }
   }
 
-  async models(): Promise<Array<{ name: string; default: boolean }>> {
+  async models(): Promise<CodexModel[]> {
     const reply = await this.rpc.request('model/list', { limit: 100, includeHidden: false })
     return Array.isArray(reply.data) ? reply.data.map(object)
       .filter(x => typeof x.model === 'string' && x.hidden !== true)
-      .map(x => ({ name: x.model as string, default: x.isDefault === true })) : []
+      .map(x => {
+        // Only short lowercase names: they go into Telegram callback data and back to turn/start.
+        const efforts = Array.isArray(x.supportedReasoningEfforts) ? [...new Set(x.supportedReasoningEfforts
+          .map(option => object(option).reasoningEffort)
+          .filter((effort): effort is string => typeof effort === 'string' && effortName.test(effort)))] : []
+        const fallback = x.defaultReasoningEffort
+        return {
+          name: x.model as string, default: x.isDefault === true, efforts,
+          ...(typeof fallback === 'string' && efforts.includes(fallback) ? { defaultEffort: fallback } : {}),
+        }
+      }) : []
   }
 
   async usageLimits(): Promise<CodexLimitWindow[]> {
@@ -345,10 +367,13 @@ export class CodexSession {
     return this.withTurn(async (threadId, turn) => {
       if (options.untrusted) turn.untrusted = true
       const model = this.settings.selectedModel?.() ?? this.settings.model
+      const effort = this.settings.selectedEffort?.()
       const response = await this.rpc.request('turn/start', {
         threadId,
         // A turn override stays for later turns; resending an unchanged model is noise.
         ...(model && model !== this.model ? { model } : {}),
+        // The effort is sent with every turn: a fresh or resumed thread would otherwise fall back to the model default.
+        ...(effort ? { effort } : {}),
         ...(this.settings.reasoningSummary ? { summary: 'auto' } : {}),
         ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
@@ -406,11 +431,14 @@ export class CodexSession {
   // thread and an untrusted (agent) side starts a fresh one.
   // `onStarted` fires once Codex accepted the turn.
   async runSide(text: string, imagePaths: readonly string[] = [], reuse?: string,
-    onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string }> {
+    onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string; turnId?: string }> {
     if (reuse !== undefined && (!this.sideThreads.has(reuse) || this.sides.has(reuse))) {
       throw new Error('This side thread is not available')
     }
+    // Model and effort are read together before the thread opens: a switch meanwhile never pairs one model with
+    // another model's effort; it applies from the next turn.
     const model = this.settings.selectedModel?.() ?? this.settings.model
+    const effort = this.settings.selectedEffort?.()
     // Registered before thread/start so a stop during start-up is never missed.
     const starting = { stop: false }
     this.startingSides.add(starting)
@@ -433,6 +461,7 @@ export class CodexSession {
       const response = await this.rpc.request('turn/start', {
         threadId,
         ...(sendModel ? { model } : {}),
+        ...(effort ? { effort } : {}),
         ...this.turnPermissions(threadId, !!options.untrusted),
         input: [
           { type: 'text', text, text_elements: [] },
@@ -444,7 +473,7 @@ export class CodexSession {
       if (sendModel && this.sideThreads.has(threadId)) this.sideThreads.set(threadId, model)
       if (!turn.id) this.setTurnId(turn, id)
       onStarted?.(threadId)
-      return { ...await completed, threadId }
+      return { ...await completed, threadId, turnId: id }
     } finally {
       if (this.sides.get(threadId) === turn) this.sides.delete(threadId)
     }

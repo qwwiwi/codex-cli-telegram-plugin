@@ -14,7 +14,7 @@ const sessions: CodexSession[] = []
 
 type Logged = { method: string; params: Record<string, unknown> }
 
-function fixture(options: { noFork?: boolean; model?: () => string | undefined } = {}) {
+function fixture(options: { noFork?: boolean; model?: () => string | undefined; effort?: () => string | undefined } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-fork-'))
   dirs.push(cwd)
   const log = join(cwd, 'requests.jsonl')
@@ -24,6 +24,7 @@ function fixture(options: { noFork?: boolean; model?: () => string | undefined }
     env: { ...process.env, KROT_FAKE_LOG: log, ...(options.noFork ? { KROT_FAKE_NO_FORK: '1' } : {}) },
     command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'],
     ...(options.model ? { selectedModel: options.model } : {}),
+    ...(options.effort ? { selectedEffort: options.effort } : {}),
     onWarning: message => { warnings.push(message) },
   }, () => {})
   sessions.push(session)
@@ -57,7 +58,7 @@ test('[R14] an owner side thread is an ephemeral fork of the main thread and a r
   const { main } = await mainBusy(session)
   const mainThread = session.currentThread
   const side = await session.runSide('Какая погода?')
-  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId })
+  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId, turnId: expect.any(String) })
   expect(side.threadId).not.toBe(mainThread)
   expect(session.currentThread).toBe(mainThread)
   const forks = requests('thread/fork')
@@ -79,7 +80,7 @@ test('after a resume an owner side forks at the last finished turn of the resume
   await session.resume('saved-thread')
   const { main } = await mainBusy(session)
   const side = await session.runSide('Какая погода?')
-  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId })
+  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId, turnId: expect.any(String) })
   // Not a fresh thread: the fork keeps the resumed context up to its last finished turn.
   expect(requests('thread/start')).toHaveLength(0)
   expect(requests('thread/fork')).toHaveLength(1)
@@ -105,7 +106,7 @@ test('a side during the first main turn starts a fresh thread instead of forking
   await session.initialize()
   const { main } = await mainBusy(session)
   const side = await session.runSide('Какая погода?')
-  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId })
+  expect(side).toEqual({ status: 'completed', text: 'side: Какая погода?', threadId: side.threadId, turnId: expect.any(String) })
   expect(requests('thread/fork')).toHaveLength(0)
   expect(requests('thread/start')).toHaveLength(2)
   // Not a refusal: later sides may still fork once a main turn has finished.
@@ -120,7 +121,7 @@ test('without fork support a side thread falls back to thread/start once and say
   await session.run('один')
   const { main } = await mainBusy(session)
   const first = await session.runSide('раз')
-  expect(first).toEqual({ status: 'completed', text: 'side: раз', threadId: first.threadId })
+  expect(first).toEqual({ status: 'completed', text: 'side: раз', threadId: first.threadId, turnId: expect.any(String) })
   const second = await session.runSide('два')
   expect(second.status).toBe('completed')
   // One refused fork is enough: later sides go straight to thread/start.
@@ -156,4 +157,25 @@ test('[R14] the HUD shows the cache share of the last main request and omits it 
   await session.run('usage:plain')
   expect(session.status.usage).toEqual({ usedTokens: 5000, windowTokens: 100000 })
   expect(renderHud(session.status.usage ?? null, 100000).text).toBe('🧠 <b>Контекст</b>: ▰▱▱▱▱▱▱▱▱▱ 5% (5k / 100k)')
+})
+
+test('[R93] a side turn keeps the model and effort pair it started with when the owner switches both while the thread opens', async () => {
+  const controls = { model: 'gpt-a', effort: 'low' }
+  const { session, requests } = fixture({ model: () => controls.model, effort: () => controls.effort })
+  await session.initialize()
+  // The owner picks another model and its effort while the side thread is being opened.
+  const rpc = (session as unknown as { rpc: { request: (method: string, params: unknown) => Promise<unknown> } }).rpc
+  const request = rpc.request.bind(rpc)
+  rpc.request = async (method, params) => {
+    const reply = await request(method, params)
+    if (method === 'thread/start') Object.assign(controls, { model: 'gpt-b', effort: 'xhigh' })
+    return reply
+  }
+  const side = await session.runSide('Verify the summary.', [], undefined, undefined, { untrusted: true })
+  expect(side.status).toBe('completed')
+  expect(controls).toEqual({ model: 'gpt-b', effort: 'xhigh' })
+  expect(requests('thread/start').at(-1)?.params.model).toBe('gpt-a')
+  const turn = requests('turn/start').at(-1)?.params ?? {}
+  expect(turn.model ?? 'gpt-a').toBe('gpt-a')
+  expect(turn.effort).toBe('low')
 })

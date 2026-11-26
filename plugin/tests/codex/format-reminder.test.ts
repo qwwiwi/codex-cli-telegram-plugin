@@ -131,3 +131,83 @@ test('[R02] initials and short abbreviations do not end a sentence', () => {
   expect(split).toContain('А. С. Петровым прошла в г. Казани')
   expect(split.split('\n\n').join(' ')).toBe(text)
 })
+
+// The live «текст в кучку» answer: a bold first line, then short sentences each on its own line, no blank line.
+const pileLines = [
+  '**Итог по серверу**',
+  'Проверил журнал моста за последние сутки, ошибок доставки там нет.',
+  'Параллельный поток отработал штатно и поставил реакцию на сообщение.',
+  'Виджет со статусом не принят Telegram, поэтому данные ушли обычным текстом.',
+  'Это ожидаемое поведение для старых клиентов Telegram на телефоне.',
+  'Повторно отправлять ничего не нужно, всё уже дошло до чата.',
+  'Очередь сообщений пуста, новых задач от владельца пока нет.',
+  'Память агента обновлена, новые записи сохранены на диске.',
+  'Самопроверка /doctor прошла без замечаний и предупреждений.',
+  'Следующая проверка запланирована на завтрашнее утро.',
+  'Если появятся новые ошибки, я напишу об этом отдельно.',
+]
+const pile = pileLines.join('\n')
+
+test('[R81] single-newline prose lines are grouped into paragraphs with a bold heading on top', () => {
+  expect(pile.length).toBeGreaterThan(600)
+  const split = splitLongBlock(pile)
+  const blocks = split.split('\n\n')
+  expect(blocks[0]).toBe('**Итог по серверу**')
+  expect(blocks.length).toBeGreaterThan(3)
+  for (const paragraph of blocks.slice(1)) {
+    expect(paragraph.length).toBeLessThanOrEqual(450)
+    expect(paragraph.split('\n').length).toBeLessThanOrEqual(3)
+  }
+  // Only line breaks between groups become blank lines: every word stays in its place.
+  expect(split.replace(/\n\n/gu, '\n')).toBe(pile)
+})
+
+test('[R82] a list in a single-newline answer stays contiguous with a blank line around it, code stays as written', () => {
+  const list = ['- первый пункт списка проверен', '- второй пункт списка проверен', '- третий пункт списка проверен']
+  const code = '```sh\necho one\necho two\n```'
+  const text = [...pileLines.slice(1, 6), ...list, ...pileLines.slice(6), code].join('\n')
+  expect(text.length).toBeGreaterThan(600)
+  const split = splitLongBlock(text)
+  expect(split).toContain('\n\n' + list.join('\n') + '\n\n')
+  expect(split).toContain('\n' + code)
+  expect(split).not.toContain('\n\n' + code)
+  expect(split.replace(/\n\n/gu, '\n')).toBe(text)
+  // An answer that already has a blank line in the middle is left alone.
+  const spaced = pileLines.slice(0, 5).join('\n') + '\n\n' + pileLines.slice(5).join('\n')
+  expect(splitLongBlock(spaced)).toBe(spaced)
+})
+
+test('[R91] a hard-wrapped sentence stays in one paragraph, a bold title mid-answer stands apart, a trailing newline does not block grouping', () => {
+  const wrappedStart = 'Мост проверил журнал за сутки и нашёл несколько предупреждений о доставке, которые'
+  const wrappedEnd = 'повторялись каждые десять минут, пока Telegram не ответил на запрос.'
+  const text = ['**Итог по серверу**', wrappedStart, wrappedEnd, ...pileLines.slice(1, 4), '**Что дальше**',
+    ...pileLines.slice(4, 8)].join('\n') + '\n'
+  expect(text.length).toBeGreaterThan(600)
+  const split = splitLongBlock(text)
+  expect(split).toContain(wrappedStart + '\n' + wrappedEnd)
+  expect(split).toContain('\n\n**Что дальше**\n\n')
+  expect(split.startsWith('**Итог по серверу**\n\n')).toBe(true)
+  expect(split.endsWith('\n')).toBe(true)
+  expect(split.replace(/\n\n/gu, '\n')).toBe(text)
+})
+
+test('[R91] a table without outer pipes and a multi-line <blockquote> keep every line together; a <pre> block and a fence too', () => {
+  const table = ['Сервер | Статус | Задержка', ':--- | :---: | ---:', 'Alpha | Работает. | Норма.', 'Beta | Работает. | Норма.',
+    'Backup | Остановлен. | Нет данных.', 'Mirror | Работает. | Норма.']
+  const quote = ['<blockquote>Мост проверил журнал за сутки.', 'Ошибок доставки там нет.', 'Повторять ничего не нужно.',
+    'Всё уже дошло до чата.</blockquote>']
+  const pre = ['<pre>Первая строка вывода.', 'Вторая строка вывода.', 'Третья строка вывода.', 'Четвёртая строка.</pre>']
+  const fence = ['```', 'Первая строка кода.', 'Вторая строка кода.', 'Третья строка кода.', '```']
+  const text = [...pileLines.slice(1, 6), ...table, ...pileLines.slice(6, 8), ...quote, ...pileLines.slice(8, 10), ...pre,
+    ...pileLines.slice(10), ...fence].join('\n')
+  expect(text.length).toBeGreaterThan(600)
+  const split = splitLongBlock(text)
+  // Prose next to a table or a quote keeps its single line break, like next to a code block.
+  expect(split).toContain(pileLines[5] + '\n' + table.join('\n') + '\n' + pileLines[6])
+  expect(split).toContain(quote.join('\n'))
+  expect(split).toContain(pre.join('\n'))
+  expect(split).toContain(fence.join('\n'))
+  expect(split.replace(/\n\n/gu, '\n')).toBe(text)
+  // The prose around them is still grouped.
+  expect(split).toContain('\n\n')
+})
