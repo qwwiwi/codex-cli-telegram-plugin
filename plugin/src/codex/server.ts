@@ -62,9 +62,10 @@ import {
 } from './restart-bridge.js'
 import { BridgeRestartHandoff, isRestartVerificationMessage } from './restart-handoff.js'
 import { readHandoffContext } from './handoff-context.js'
-import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
+import { AgentChatActions, agentChatInstructions as baseChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   downloadQuotedAttachment, safeActionTarget, type ChatAction } from './chat-actions.js'
 import { AgentComponents, isComponentTool } from './components.js'
+import { ackInbound, ackReactionMode, parseReactionPalette, reactionInstructions } from './reactions.js'
 import { InboundWatcher } from '../telegram/watcher.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
 import { LearningMemory } from './learning.js'
@@ -94,6 +95,10 @@ async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
   const env = RuntimeEnvSchema.parse(process.env)
   const config = loadConfig(process.env)
+  // KROT_ACK_REACTION=off: no automatic 👀 on inbound messages; the agent reacts itself from the palette.
+  const ackMode = ackReactionMode(env)
+  const reactionPalette = parseReactionPalette(env.KROT_REACTION_PALETTE)
+  const agentChatInstructions = baseChatInstructions + ' ' + reactionInstructions(reactionPalette)
   // Throws on KROT_CODEX_APPROVAL_MODE=risky without KROT_CODEX_APPROVALS=1.
   const approvalSetup = resolveApprovalSetup({
     KROT_CODEX_APPROVALS: process.env.KROT_CODEX_APPROVALS,
@@ -683,6 +688,7 @@ async function main(): Promise<void> {
         beforeSend: (): Promise<void> => hudAnchor.settled(),
         redact: (text: string): string => redactSecrets(text, secrets),
       }),
+      reactionPalette,
       replyPolicy: text => leases.replyPolicy(redactSecrets(text, secrets), resolveAskGuardMode(config, log)),
       root: paths.root,
       sendFile: (path, target) => sendAttachment(telegram, ownerChat, workspace, path, target),
@@ -731,10 +737,11 @@ async function main(): Promise<void> {
       const ids: string[] = []
       for (const message of messages) {
         if (message.message_id <= 0) continue
-        agentChat.remember(message.message_id, false)
+        agentChat.rememberOwner(message.message_id)
         const quote = message.reply_to_message
         if (safeActionTarget(quote) && quote.chat.type === 'private' && quote.chat.id === ownerId) {
-          agentChat.remember(quote.message_id, quote.from?.id === bot.botInfo.id && !!quote.text)
+          if (quote.from?.id === ownerId) agentChat.rememberOwner(quote.message_id)
+          else agentChat.remember(quote.message_id, quote.from?.id === bot.botInfo.id && !!quote.text)
           if (hasMedia(quote)) {
             quotedAttachments.set(quote.message_id, quote)
             if (quotedAttachments.size > 100) quotedAttachments.delete(quotedAttachments.keys().next().value!)
@@ -1329,7 +1336,7 @@ async function main(): Promise<void> {
         if (knownOwnerMessages.size > 300) knownOwnerMessages.delete(knownOwnerMessages.values().next().value!)
       }
       if (!stopping && message.message_id > 0 && !agentChat.hasReacted(message.message_id)) {
-        void telegram.setMessageReaction(ownerChat, message.message_id, '👀').catch(() => undefined)
+        void ackInbound(telegram, ownerChat, message.message_id, ackMode).catch(() => undefined)
       }
     }
 
@@ -2156,11 +2163,11 @@ async function main(): Promise<void> {
             }
           },
         } } : {}),
-        async react(id) {
+        // The legacy /hooks/react read receipt is an automatic 👀 too: KROT_ACK_REACTION=off answers it 503.
+        ...(ackMode === 'eyes' ? { async react(id: number) {
           if (stopping || !knownOwnerMessages.has(id) || agentChat.hasReacted(id)) return false
-          await telegram.setMessageReaction(ownerChat, id, '👀')
-          return true
-        },
+          return ackInbound(telegram, ownerChat, id, ackMode)
+        } } : {}),
       })
     }
     // Inbound inter-agent webhook (KROT_AGENT_WEBHOOK_LISTEN); off keeps no listener.

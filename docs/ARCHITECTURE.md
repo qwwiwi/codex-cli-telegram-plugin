@@ -339,7 +339,7 @@ There are 16 packs: `kpi`, `bars`, `progress`, `steps`, `compare`, `pros-cons`, 
 3. checks the payload (`channel/widget.ts`: html ≤ 32768 bytes and ≤ 4096 bytes after zlib, caption ≤ 1024 characters) and sends it through the usual safe → rate-limited → reliable chain. `sendWidget` uses the chat's send queue and token bucket like `sendMessage`, is never retried (a retry could show it twice), and its html is never rewritten by redaction: html that looks like it carries a secret is refused before sending;
 4. when the widget cannot be shown (data does not match the schema, still over the budget, Telegram refuses it), sends the same data **once as plain text** and tells the model not to resend it. When a send fails after Telegram may have taken it (timeout, 5xx), nothing else is sent and the result says the delivery status is unknown.
 
-A sent component becomes a known message for `telegram_action`, so the model can pin it or react to it. The IDs `update_component` may replace live in memory; after a restart the model sends a new component.
+A sent component becomes a known message for `telegram_action`, so the model can pin it (reactions go only on inbound owner messages). The IDs `update_component` may replace live in memory; after a restart the model sends a new component.
 
 **Result.** The tool returns JSON such as `{"tool":"send_component","ok":true,"message_ids":[77],"delivery":"widget"}`; `delivery` is `widget`, `text` or `unknown`, and `hint` explains a fallback.
 
@@ -459,6 +459,8 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_CODEX_MAX_PARALLEL` | `codex/parallel.ts` | maximum threads at once, main included (1 to 8, default 2) |
 | `KROT_CODEX_CORRECTION_WORDS` | `codex/parallel.ts` | CSV of words that mark a message as a correction of the main task |
 | `KROT_CODEX_SIDE_REPLY` | `codex/server.ts` | `1` turns on the older one-off side replies |
+| `KROT_ACK_REACTION` | `codex/reactions.ts` | `off`: no automatic 👀 on inbound owner messages, nor on the legacy `/hooks/react` receipt (the installer writes it for a fresh install); `eyes` or unset: 👀 on every inbound message, as before. Typing and the status bubble do not change; `doctor` shows it |
+| `KROT_REACTION_PALETTE` | `codex/reactions.ts` | comma-separated emoji (up to 10) the agent may react with through `telegram_action` `react`: only on an inbound owner message, one per message, each a Telegram reaction emoji (checked at startup). Default `👍,❤,🔥,🎉,😁,🤔,👏,🙏,💯,🤝` |
 | `KROT_AGENT_WEBHOOK_LISTEN` | `codex/agent-webhook.ts` | `host:port` of the inter-agent webhook; unset keeps it off |
 | `KROT_AGENT_WEBHOOK_TOKEN` | `codex/agent-webhook.ts` | bearer token the sending agents must present |
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |

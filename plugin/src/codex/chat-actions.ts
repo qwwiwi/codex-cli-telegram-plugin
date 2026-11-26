@@ -6,6 +6,7 @@ import type { DownloadResult, TelegramApi } from '../channel/tools.js'
 import { stripAgentAddress } from './commands.js'
 import { componentInstructions, componentTools, type AgentComponents } from './components.js'
 import { normalizeChatReply } from './continuation.js'
+import { DEFAULT_REACTION_PALETTE, reactionHints, telegramReaction } from './reactions.js'
 import { object } from './rpc.js'
 
 export type ChatAction = 'pin' | 'unpin' | 'react' | 'edit' | 'get'
@@ -78,6 +79,10 @@ type AgentAction = typeof agentActions[number]
 const targetLimit = 1000
 const targetState = 'codex-chat-targets.json'
 
+// The palette itself is configurable, so it reaches the model through reactionInstructions, not this fixed schema.
+const reactEmojiDescription = 'For react: one emoji from the reaction palette in your instructions, only on an inbound owner ' +
+  'message, at most one per message. React rarely and only when it fits the dialogue (a joke, good news, thanks), never on every message.'
+
 // Keep the root relay's validated catalog in sync with this tool.
 export const agentChatTool = {
   type: 'function',
@@ -89,7 +94,7 @@ export const agentChatTool = {
       action: { type: 'string', enum: agentActions },
       target: { anyOf: [{ type: 'integer', minimum: 1 }, { type: 'string', enum: ['last_reply'] }] },
       text: { type: 'string', maxLength: 3900 },
-      emoji: { type: 'string' },
+      emoji: { type: 'string', description: reactEmojiDescription },
       files: { type: 'array', maxItems: 10, items: { type: 'string', maxLength: 4096 } },
       id: { type: 'string', maxLength: 256 },
       resolution: { type: 'string', enum: ['answered'] },
@@ -117,7 +122,8 @@ export const agentTools = [agentChatTool, ...componentTools] as const
 export const chatContextPrefix = 'ID входящих сообщений Telegram: '
 
 // A transient target (a component message) is known for this bridge run only and never persisted.
-type Target = { editable: boolean; reacted: boolean; rich?: true; transient?: true }
+// owner: an inbound owner message, the only kind the agent may react to.
+type Target = { editable: boolean; reacted: boolean; owner?: true; rich?: true; transient?: true }
 type ActionDetails = { message_ids: number[]; hint?: string; attachment?: DownloadResult }
 type ActionReceipt = Omit<ActionDetails, 'attachment'> & { request_id: string; action: AgentAction; ok: boolean }
 type ActionArguments = ReturnType<typeof object> & { action: AgentAction }
@@ -131,6 +137,8 @@ type AgentChatOptions = {
   autonomy?: (action: string, id: string, resolution?: string) => Promise<boolean>
   replyPolicy?: (text: string) => { blocked: boolean; hint: string } | undefined
   components?: AgentComponents
+  // The emoji the agent may react with (KROT_REACTION_PALETTE); default DEFAULT_REACTION_PALETTE.
+  reactionPalette?: readonly string[]
 }
 
 function parseAction(raw: unknown, legacy = false): ActionArguments | undefined {
@@ -166,7 +174,8 @@ export class AgentChatActions {
         if (!Array.isArray(raw) || !Number.isSafeInteger(raw[0]) || raw[0] <= 0) continue
         const target = object(raw[1])
         this.targets.set(raw[0], {
-          editable: target.editable === true, reacted: target.reacted === true, ...(target.rich === true ? { rich: true } : {}),
+          editable: target.editable === true, reacted: target.reacted === true,
+          ...(target.owner === true ? { owner: true } : {}), ...(target.rich === true ? { rich: true } : {}),
         })
       }
       if (typeof state.lastReply === 'number' && this.targets.has(state.lastReply)) this.lastReply = state.lastReply
@@ -180,11 +189,20 @@ export class AgentChatActions {
     this.targets.delete(id)
     this.targets.set(id, {
       editable: editable || previous?.editable === true, reacted: previous?.reacted === true,
-      ...(rich || previous?.rich ? { rich: true } : {}), ...(keepTransient ? { transient: true } : {}),
+      ...(previous?.owner ? { owner: true } : {}), ...(rich || previous?.rich ? { rich: true } : {}), ...(keepTransient ? { transient: true } : {}),
     })
     if (this.targets.size > targetLimit) this.targets.delete(this.targets.keys().next().value!)
     if (lastReply) this.lastReply = id
     if (!keepTransient) this.saveTargets()
+  }
+
+  // An inbound owner message: a target the agent may react to, once.
+  rememberOwner(id: number): void {
+    this.remember(id, false)
+    const target = this.targets.get(id)
+    if (!target || target.owner) return
+    target.owner = true
+    this.saveTargets()
   }
 
   private saveTargets(): void {
@@ -330,9 +348,22 @@ export class AgentChatActions {
           if (typeof result === 'boolean') return result
           if (!result || !current()) return false
           details.attachment = result
-        } else if (action === 'react' && typeof emoji === 'string' &&
-                   /^\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier})?$/u.test(emoji)) {
-          await this.api.setMessageReaction(this.ownerChat, id, emoji)
+        } else if (action === 'react') {
+          const palette = this.options.reactionPalette ?? DEFAULT_REACTION_PALETTE
+          const reaction = typeof emoji === 'string' ? telegramReaction(emoji) : undefined
+          if (!reaction || !palette.includes(reaction)) {
+            details.hint = reactionHints.palette(palette)
+            return false
+          }
+          if (!message.owner) {
+            details.hint = reactionHints.ownerOnly
+            return false
+          }
+          if (message.reacted) {
+            details.hint = reactionHints.once
+            return false
+          }
+          await this.api.setMessageReaction(this.ownerChat, id, reaction)
           const currentTarget = this.targets.get(id)
           if (currentTarget) currentTarget.reacted = true
           this.saveTargets()

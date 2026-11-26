@@ -101,6 +101,24 @@ test('[R01] doctor reports the active approval mode, including never', async () 
     .toContain('KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1')
 })
 
+test('[R02] doctor shows the automatic inbound reaction and the agent reaction palette', async () => {
+  const line = async (env: Record<string, string>) => {
+    const { checks } = await checkInstallation({ env })
+    return checks.filter(check => check.message.startsWith('Реакции:'))
+  }
+  const off = await line({ KROT_ACK_REACTION: 'off' })
+  expect(off).toHaveLength(1)
+  expect(off[0]!.status).toBe('ok')
+  expect(off[0]!.message).toContain('KROT_ACK_REACTION=off')
+  expect(off[0]!.message).toContain('👍 ❤ 🔥 🎉 😁 🤔 👏 🙏 💯 🤝')
+  const unset = await line({})
+  expect(unset[0]!.message).toContain('KROT_ACK_REACTION=eyes')
+  expect((await line({ KROT_REACTION_PALETTE: '🔥,👍' }))[0]!.message).toContain('🔥 👍')
+  const { checks } = await checkInstallation({ env: { KROT_REACTION_PALETTE: '🔥,🦖' } })
+  expect(checks.filter(check => check.status === 'error').map(check => check.message).join('\n'))
+    .toContain('KROT_REACTION_PALETTE')
+})
+
 test('[R01] doctor fails a proxy setup whose approval mode is never, as startup does, without probing the proxy', async () => {
   const probed: string[] = []
   const probe = async (workspace: string): Promise<{ status: 'ok'; message: string }> => {

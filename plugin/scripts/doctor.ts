@@ -1,7 +1,8 @@
 import { accessSync, constants, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, sep } from 'node:path'
-import { loadConfig, RuntimeEnvSchema } from '../src/config.js'
+import { loadConfig, type RuntimeEnv, RuntimeEnvSchema } from '../src/config.js'
 import { type ApprovalSetup, resolveApprovalSetup } from '../src/codex/approval-mode.js'
+import { ackReactionMode, parseReactionPalette } from '../src/codex/reactions.js'
 import { CodexRpc, object } from '../src/codex/rpc.js'
 
 type Check = { status: 'ok' | 'warning' | 'error'; message: string }
@@ -92,6 +93,14 @@ async function telegram(method: TelegramMethod, token: string): Promise<Record<s
   return data.ok ? data.result ?? null : null
 }
 
+// The reaction settings; the schema has already validated both, so this only reports them.
+function reactionCheck(env: RuntimeEnv): Check {
+  const ack = ackReactionMode(env) === 'off'
+    ? 'автоматической 👀 на входящие нет (KROT_ACK_REACTION=off)'
+    : 'мост ставит 👀 на каждое входящее (KROT_ACK_REACTION=eyes)'
+  return { status: 'ok', message: `Реакции: ${ack}; агент сам выбирает из палитры ${parseReactionPalette(env.KROT_REACTION_PALETTE).join(' ')}.` }
+}
+
 // The approval mode the bridge will run with, as resolveApprovalSetup decides it.
 function approvalModeCheck(env: NodeJS.ProcessEnv): Check {
   let setup: ApprovalSetup
@@ -128,7 +137,7 @@ export async function runDoctor(
     const fields = [...new Set(parsed.error.issues.map(issue => issue.path.join('.')))]
     checks.push({ status: 'error', message: `Проверьте переменные в plugin/.env: ${fields.join(', ')}.` })
   }
-  if (parsed.success) checks.push(approvalModeCheck(env))
+  if (parsed.success) checks.push(approvalModeCheck(env), reactionCheck(parsed.data))
   let config: ReturnType<typeof loadConfig> | undefined
   if (parsed.success) {
     try {
