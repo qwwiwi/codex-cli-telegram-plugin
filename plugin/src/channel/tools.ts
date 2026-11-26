@@ -127,6 +127,12 @@ export interface SendMessageOpts {
   // silently reset the silence window the outbound clock measures. Consumed and
   // STRIPPED by createReliableTelegramApi; never reaches the wire.
   skipOutboundStamp?: boolean
+  // Cancels the send (the context HUD card whose hang guard expired). While
+  // queued it rejects with SendCancelledError and never reaches Telegram; once
+  // in flight it frees the chat's send queue at once, and the caller still
+  // gets the late result. Consumed by the rate-limited layer; the raw layer
+  // copies only Telegram fields, so it never reaches the wire.
+  signal?: AbortSignal
 }
 
 export interface EditOpts {

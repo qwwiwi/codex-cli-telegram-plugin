@@ -282,6 +282,10 @@ export interface ContextHudOptions {
   render?: () => ReturnType<typeof renderHud>
 }
 
+// Extra delete tries for a retired card Telegram refused to delete (the
+// first try is retire's own). Small: a refusal that persists is permanent.
+const LEFTOVER_DELETE_RETRIES = 2
+
 interface EnsuredMessage {
   id: number
   created: boolean
@@ -316,6 +320,10 @@ export class ContextHud {
   // create the card below the reply; the next bump (the next owner message)
   // puts it back in place.
   private readonly bumpFailed = new Set<string>()
+  // Retired cards Telegram refused to delete: still visible in the chat, so
+  // the id is kept and the delete retried at the start of the next bump or
+  // retire, a bounded number of times. Per chat: message id -> tries left.
+  private readonly leftovers = new Map<string, Map<number, number>>()
   // FIX-9 (both reviews): per-chat serialization. A concurrent SessionStart +
   // Stop (both firing before the first send persists an id) would each see an
   // empty cache and sendFresh → TWO pinned HUDs. Chaining every HUD operation
@@ -445,11 +453,13 @@ export class ContextHud {
   // pins can never coexist. Every bump moves the card: a card reused from an
   // earlier owner message would sit above the newest one, not under it. Bursts
   // are coalesced by the caller (HudAnchor), not dropped here. Serialized and
-  // best-effort like every other HUD op.
-  bump(chatId: string): Promise<void> {
+  // best-effort like every other HUD op. `signal` cancels the card's send
+  // (HudAnchor's hang guard expired; see SendMessageOpts.signal).
+  bump(chatId: string, signal?: AbortSignal): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     return this.runSerialized(chatId, async () => {
       try {
+        await this.retryLeftovers(chatId)
         const { text, keyboard } = await this.renderCurrent(chatId)
         const old = this.messageIds.get(chatId) ?? this.loadPersisted(chatId)
         if (old !== undefined) {
@@ -493,7 +503,7 @@ export class ContextHud {
           }
         }
         // sendFresh persists the new id (overwriting the stale one) and pins.
-        if (await this.sendFresh(chatId, text, keyboard) === undefined) this.bumpFailed.add(chatId)
+        if (await this.sendFresh(chatId, text, keyboard, signal) === undefined) this.bumpFailed.add(chatId)
         else this.bumpFailed.delete(chatId)
       } catch (err) {
         this.log.warn('context hud bump failed (ignored)', {
@@ -514,6 +524,7 @@ export class ContextHud {
     return this.runSerialized(chatId, async () => {
       this.bumpFailed.add(chatId)
       try {
+        await this.retryLeftovers(chatId)
         const id = this.messageIds.get(chatId) ?? this.loadPersisted(chatId)
         if (id === undefined) return
         this.messageIds.delete(chatId)
@@ -521,12 +532,14 @@ export class ContextHud {
         try {
           await this.api.deleteMessage(chatId, id)
         } catch (err) {
-          // Cannot delete: at least drop its pin so a later card is the only pinned one.
+          // Cannot delete: at least drop its pin so a later card is the only
+          // pinned one, and keep the id so a later bump/retire deletes it.
           this.log.warn('context hud retire delete failed (will unpin instead)', {
             chat_id: chatId,
             message_id: id,
             error: err instanceof Error ? err.message : String(err),
           })
+          this.leftoversOf(chatId).set(id, LEFTOVER_DELETE_RETRIES)
           await this.api.unpinChatMessage(chatId, id)
         }
       } catch (err) {
@@ -562,6 +575,41 @@ export class ContextHud {
   }
 
   // ─── internals ────────────────────────────────────────────────────
+
+  private leftoversOf(chatId: string): Map<number, number> {
+    let ids = this.leftovers.get(chatId)
+    if (ids === undefined) {
+      ids = new Map<number, number>()
+      this.leftovers.set(chatId, ids)
+    }
+    return ids
+  }
+
+  // One more delete try for each retired card still in the chat. Runs inside
+  // the chat's serialized op; never throws. A card is forgotten once deleted
+  // or once its tries are spent (logged: it stays visible, unpinned).
+  private async retryLeftovers(chatId: string): Promise<void> {
+    const ids = this.leftovers.get(chatId)
+    if (ids === undefined) return
+    for (const [id, triesLeft] of [...ids]) {
+      try {
+        await this.api.deleteMessage(chatId, id)
+        ids.delete(id)
+      } catch (err) {
+        if (triesLeft > 1) {
+          ids.set(id, triesLeft - 1)
+          continue
+        }
+        ids.delete(id)
+        this.log.warn('context hud gave up deleting a retired card', {
+          chat_id: chatId,
+          message_id: id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+    if (ids.size === 0) this.leftovers.delete(chatId)
+  }
 
   // Render the HUD for the chat's CURRENT session facts. Reads the transcript
   // (best-effort — a null usage renders «Контекст: —»).
@@ -629,12 +677,14 @@ export class ContextHud {
     chatId: string,
     text: string,
     keyboard: InlineKeyboardLike,
+    signal?: AbortSignal,
   ): Promise<number | undefined> {
     let messageId: number
     try {
       const sent = await this.api.sendMessage(chatId, text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
+        ...(signal === undefined ? {} : { signal }),
       })
       messageId = sent.message_id
     } catch (err) {

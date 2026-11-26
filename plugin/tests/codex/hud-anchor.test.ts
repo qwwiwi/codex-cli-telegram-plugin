@@ -1,6 +1,13 @@
 import { expect, test } from 'bun:test'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { HudAnchor, type HudCard } from '../../src/codex/hud-anchor.js'
+import { createLogger } from '../../src/log.js'
+import { createRateLimitedTelegramApi } from '../../src/safety/rate-limited-telegram-api.js'
+import { ContextHud } from '../../src/status/context-hud.js'
+import { fakeTelegramChat } from './fake-telegram-chat.js'
 
 const OWNER = '123'
 
@@ -9,9 +16,11 @@ const OWNER = '123'
 function fakeHud(options: { bumpFails?: boolean; bumpHangs?: boolean } = {}) {
   const calls: string[] = []
   const releases: Array<() => void> = []
+  const signals: Array<AbortSignal | undefined> = []
   const hud: HudCard = {
-    bump(chatId) {
+    bump(chatId, signal) {
       calls.push('bump:' + chatId)
+      signals.push(signal)
       if (options.bumpHangs) return new Promise<void>(() => undefined)
       return new Promise<void>((resolve, reject) => {
         releases.push(() => {
@@ -27,7 +36,7 @@ function fakeHud(options: { bumpFails?: boolean; bumpHangs?: boolean } = {}) {
     async updateNow(chatId) { calls.push('edit:' + chatId) },
     async retire(chatId) { calls.push('retire:' + chatId) },
   }
-  return { hud, calls, release: () => { for (const release of releases.splice(0)) release() } }
+  return { hud, calls, signals, release: () => { for (const release of releases.splice(0)) release() } }
 }
 
 test('an accepted owner message moves the HUD card to the bottom', () => {
@@ -147,6 +156,59 @@ test('[R04] a card that hangs past the guard is retired once it lands, so it nev
   // ContextHud serializes per chat: the retire queued at the guard runs right
   // after the late card lands and deletes it.
   expect(calls).toEqual(['bump:' + OWNER, 'retire:' + OWNER, 'reply', 'hud-sent'])
+})
+
+test('[R04] an owner message accepted while a card hangs past the guard sends no card after the answer', async () => {
+  const { hud, calls, signals, release } = fakeHud()
+  const anchor = new HudAnchor(hud, OWNER, 20)
+  anchor.ownerMessage()
+  anchor.ownerMessage()
+  await anchor.settled()
+  calls.push('reply')
+  release()
+  await Bun.sleep(5)
+  // No trailing move for the second message: its card would land below the answer.
+  expect(calls).toEqual(['bump:' + OWNER, 'retire:' + OWNER, 'reply', 'hud-sent'])
+  // The expired move cancelled its card so the answer was not queued behind it.
+  expect(signals[0]?.aborted).toBe(true)
+})
+
+test('[R04] retirement with the real HUD and limiter: a card that hangs past the guard never ends up below the answer', async () => {
+  const chat = fakeTelegramChat()
+  const limited = createRateLimitedTelegramApi(chat.raw, createLogger('hud-anchor-test'), { jitterMaxMs: 0 })
+  let renders = 0
+  const hud = new ContextHud({
+    api: {
+      sendMessage: limited.sendMessage,
+      editMessageText: limited.editMessageText,
+      deleteMessage: chat.raw.deleteMessage,
+      async pinChatMessage() {},
+      async unpinChatMessage() {},
+    },
+    log: createLogger('hud-anchor-test'), sessionInfo: { get: () => ({}) }, windowTokens: 0,
+    ownerChatIds: [OWNER], stateDir: mkdtempSync(join(tmpdir(), 'hud-anchor-')), enabled: true,
+    render: () => ({ text: 'HUD ' + ++renders, keyboard: { inline_keyboard: [] } }),
+  })
+  const anchor = new HudAnchor(hud, OWNER, 20)
+
+  // Owner message A; Telegram does not answer the send of card A.
+  chat.hold('HUD')
+  chat.owner('owner A')
+  anchor.ownerMessage()
+  await Bun.sleep(5)
+  // Owner message B arrives while card A still hangs.
+  chat.owner('owner B')
+  anchor.ownerMessage()
+  // The guard expires and B's answer goes out through the same limiter.
+  const answer = anchor.settled().then(() => limited.sendMessage(OWNER, 'answer B', {}))
+  await Bun.sleep(60)
+  expect(chat.rawCalls).toEqual(['HUD 1', 'answer B'])
+  // Card A finally lands, below the answer.
+  chat.releaseAll()
+  await answer
+  await Bun.sleep(20)
+
+  expect(chat.texts()).toEqual(['owner A', 'owner B', 'answer B'])
 })
 
 test('[R04] rapid owner messages never reuse an older card: a burst ends with a fresh move after the last message', async () => {

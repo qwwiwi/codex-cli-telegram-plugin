@@ -118,6 +118,42 @@ test('[R04] retire removes a card that landed below the answer and the turn-end 
   expect([...messages.values()].at(-1)).toStartWith('HUD ')
 })
 
+test('[R04] a retired card whose delete failed is deleted by the next HUD move instead of staying in the chat', async () => {
+  const failures = { delete: false }
+  const { hud, messages, calls, owner, persisted } = fixture(failures)
+  setSystemTime(new Date(1_000_000))
+  owner('owner message')
+  await hud.bump(OWNER)
+  const late = persisted()
+  owner('agent reply')
+  failures.delete = true
+  await hud.retire(OWNER)
+  // Telegram refused the delete: the card is still visible.
+  expect(messages.has(late)).toBe(true)
+
+  failures.delete = false
+  owner('next owner message')
+  calls.length = 0
+  await hud.bump(OWNER)
+
+  expect(messages.has(late)).toBe(false)
+  expect(calls).toContain('delete:' + late)
+  expect([...messages.values()].at(-1)).toStartWith('HUD ')
+})
+
+test('[R04] cleanup of a retired card that cannot be deleted stops after a bounded number of tries', async () => {
+  const { hud, calls, owner, persisted } = fixture({ delete: true })
+  setSystemTime(new Date(1_000_000))
+  await hud.bump(OWNER)
+  const late = persisted()
+  owner('agent reply')
+  await hud.retire(OWNER)
+  for (let i = 0; i < 5; i++) await hud.retire(OWNER)
+
+  // One try at retirement plus two cleanup retries, then it gives up.
+  expect(calls.filter(call => call === 'delete:' + late)).toHaveLength(3)
+})
+
 test('a refused delete falls back to unpin and still sends a fresh card at the bottom', async () => {
   const { hud, messages, calls, owner, persisted } = fixture({ delete: true })
   setSystemTime(new Date(1_000_000))

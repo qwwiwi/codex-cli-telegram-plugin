@@ -246,6 +246,32 @@ function rawRetryAfter(err: unknown): number | undefined {
   return typeof after === 'number' && Number.isFinite(after) ? after : undefined
 }
 
+/**
+ * A send cancelled through `SendMessageOpts.signal` before it left the process:
+ * Telegram never saw it. No status code and no network wording, so the
+ * reliable layer treats it as permanent (no retry, no dead letter).
+ */
+export class SendCancelledError extends Error {
+  constructor() {
+    super('send cancelled before it left the process')
+    this.name = 'SendCancelledError'
+  }
+}
+
+// Settle with `p`, or reject with SendCancelledError as soon as `signal` aborts.
+function unlessCancelled<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return p
+  if (signal.aborted) return Promise.reject(new SendCancelledError())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new SendCancelledError())
+    signal.addEventListener('abort', onAbort, { once: true })
+    p.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value) },
+      (err: unknown) => { signal.removeEventListener('abort', onAbort); reject(err) },
+    )
+  })
+}
+
 export function createRateLimitedTelegramApi(
   raw: TelegramApi,
   log: Logger,
@@ -333,7 +359,12 @@ export function createRateLimitedTelegramApi(
     if (kind === 'edit' && cfg.perChatEditsMaxPerMinute > 0) state.editWindowTimes.pop()
   }
 
-  async function waitForCapacity(state: ChatState, kind: 'send' | 'edit'): Promise<number> {
+  // A cancelled `signal` stops the wait before any slot is taken.
+  async function waitForCapacity(
+    state: ChatState,
+    kind: 'send' | 'edit',
+    signal?: AbortSignal,
+  ): Promise<number> {
     const startedAt = now()
     // Loop because after waking from sleep, another global consumer may
     // have stolen the token we expected. Recompute and re-sleep if so.
@@ -360,7 +391,7 @@ export function createRateLimitedTelegramApi(
         }
         return t - startedAt
       }
-      await sleep(w)
+      await unlessCancelled(sleep(w), signal)
     }
   }
 
@@ -377,6 +408,7 @@ export function createRateLimitedTelegramApi(
     minRetryWaitMs = 0,
     chatId?: string,
     waitedMs = 0,
+    signal?: AbortSignal,
   ): Promise<T> {
     let attempt = 0
     let lastErr: unknown
@@ -420,7 +452,8 @@ export function createRateLimitedTelegramApi(
         // freeze the turn. Surface the 429 now so the caller tells the agent
         // "not delivered, end your turn". Only brief burst-429s are retried.
         if (r.retryAfter > cfg.failFastRetryAfterS) throw err
-        if (attempt >= cfg.maxRetries) break
+        // A cancelled send is not retried: its caller has stopped waiting.
+        if (attempt >= cfg.maxRetries || signal?.aborted === true) break
         const jitter =
           cfg.jitterMaxMs > 0 ? Math.floor(Math.random() * cfg.jitterMaxMs) : 0
         const waitTotalMs = Math.max(r.retryAfter * 1000, minRetryWaitMs) + jitter
@@ -430,7 +463,12 @@ export function createRateLimitedTelegramApi(
           attempt,
           wait_ms: waitTotalMs,
         })
-        await sleep(waitTotalMs)
+        try {
+          await unlessCancelled(sleep(waitTotalMs), signal)
+        } catch {
+          // Cancelled during the backoff: report the 429 that stopped it.
+          break
+        }
       }
     }
     throw lastErr
@@ -438,22 +476,44 @@ export function createRateLimitedTelegramApi(
 
   // Serialize per-chat outbound work: each new op awaits the previous op
   // (without inheriting its error), then runs under the rate-limit gate.
+  //
+  // `signal` (the context HUD card's hang guard) cancels the op. While it is
+  // still queued or waiting for capacity it rejects with SendCancelledError
+  // and never reaches Telegram. Once in flight the call cannot be taken back,
+  // so a cancel only frees the queue: the next op stops waiting for it (it
+  // still waits for its own rate-limit capacity), and the caller still gets
+  // the late result, so the HUD can delete a card that landed late.
   async function enqueueSend<T>(
     chatId: string,
     op: () => Promise<T>,
     label = 'send',
     minRetryWaitMs = 0,
+    signal?: AbortSignal,
   ): Promise<T> {
     const state = getChatState(chatId)
-    const prev = state.tail
+    const prev = state.tail.catch(() => {})
     let release!: () => void
-    state.tail = new Promise<void>((r) => {
+    const mine = new Promise<void>((r) => {
       release = r
     })
+    // The next op waits for everything ahead of this one AND for this one, so a
+    // cancelled op leaves the queue without letting the next op overtake the
+    // ops that were ahead of it.
+    state.tail = Promise.all([prev, mine]).then(() => undefined)
     try {
-      await prev.catch(() => {})
-      const waited = await waitForCapacity(state, 'send')
-      return await withRetry(label, op, minRetryWaitMs, chatId, waited)
+      await unlessCancelled(prev, signal)
+      const waited = await waitForCapacity(state, 'send', signal)
+      if (signal?.aborted === true) {
+        // Cancelled between taking the slot and the call: hand the slot back.
+        refundCapacity(state, 'send')
+        throw new SendCancelledError()
+      }
+      signal?.addEventListener('abort', release, { once: true })
+      try {
+        return await withRetry(label, op, minRetryWaitMs, chatId, waited, signal)
+      } finally {
+        signal?.removeEventListener('abort', release)
+      }
     } finally {
       release()
     }
@@ -662,7 +722,9 @@ export function createRateLimitedTelegramApi(
       text: string,
       sendOpts: SendMessageOpts,
     ): Promise<{ message_id: number }> {
-      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, sendOpts), 'sendMessage')
+      // The signal is this layer's business (see enqueueSend); it never travels on.
+      const { signal, ...rest } = sendOpts
+      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, rest), 'sendMessage', 0, signal)
     },
 
     async sendRichMessage(

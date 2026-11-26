@@ -203,7 +203,7 @@ Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, 
    App-server requests that need an answer become cards (see [Approval and question cards](#approval-and-question-cards)).
 8. **Status and mirror.** Each event goes to `CodexWorkStatus` (`codex/work-status.ts`), which edits the status bubble: `working -- Ns` and up to three lines of current activity. When the bot sends a new message, the bubble is reposted below it. The mirror (`codex/mirror.ts`) edits one silent message with the stage and the last lines of command output, at most once per second.
 9. **Reply.** On `turn/completed` the final text goes through `deliverReply` and `sendFinalText`. The bridge tries a Rich Message first (`sendRichMessage`, Markdown rendered by Telegram, up to 32768 bytes) when the reply has no files, fits the limit and has no expandable quote. Otherwise, or after the rich latch has switched off, it converts Markdown to Telegram HTML, splits it into parts and sends them with `parse_mode: 'HTML'`, falling back to plain text on a parse error. Each part's delivery is saved in `codex-inbox.json`. Files follow as attachments.
-10. **HUD.** After the turn `hud.bump` deletes the old HUD card, sends a fresh one at the bottom and pins it. The bot's own pin service message is deleted. Then `startNext` takes the next queued message.
+10. **HUD.** After the turn the HUD card is refreshed in place (`updateNow`); it does not move. The card was already moved under the owner's message when that message was accepted (step 3), and the reply waited for it to land. Then `startNext` takes the next queued message.
 
 ```mermaid
 sequenceDiagram
@@ -219,6 +219,7 @@ sequenceDiagram
     T-->>P: update
     P->>S: owner + private chat check, route
     S->>S: save to codex-inbox.json
+    S->>W: hud.bump (card moves under the owner's message, pinned)
     S->>C: run(input)
     C->>A: thread/resume or thread/start
     C->>A: turn/start
@@ -230,8 +231,8 @@ sequenceDiagram
     C->>A: decision
     A-->>C: turn/completed
     C-->>S: final answer
-    S->>T: sendRichMessage or HTML parts
-    S->>W: hud.bump (new card at the bottom, pinned)
+    S->>T: sendRichMessage or HTML parts (after the card landed)
+    S->>W: hud.updateNow (card refreshed in place)
     T-->>U: reply
 ```
 
@@ -302,10 +303,15 @@ Limits come from `account/rateLimits/read`, cached for 60 s and refreshed in the
 
 **Two update paths** (`status/context-hud.ts`):
 
-- `updateNow` edits the card in place. It runs on plan changes, milestones, limit changes and commands.
-- `bump` moves the card to the bottom: it deletes the old card (or unpins it when Telegram refuses the delete), sends a new one and pins it. Bumps are debounced per chat (1.5 s); a bump inside the window only edits in place.
+- `updateNow` edits the card in place. It runs on plan changes, milestones, limit changes, commands and at the end of a turn, a compact, a side turn or a goal outcome. It never moves the card.
+- `bump` moves the card to the bottom: it deletes the old card (or unpins it when Telegram refuses the delete), sends a new one and pins it.
 
-`bump` runs when an owner message is accepted or queued, and when a turn, a compact, a side turn or a goal outcome ends.
+`bump` runs only when an owner message is accepted or queued, through `HudAnchor` (`codex/hud-anchor.ts`), so the chat reads owner message, HUD card, reply:
+
+- **Reply after the card.** Every reply waits (`hudAnchor.settled()`) until the card of the latest owner message has landed or Telegram refused it.
+- **Burst coalescing.** An owner message that arrives while a move is in flight does not start a second move and is not dropped: the move in flight is followed by exactly one more, so the card ends up under the newest message. There is no time-based debounce.
+- **Hang guard (30 s).** If Telegram does not answer the card's send within 30 s, the reply goes out without it. The move is then over: its send is cancelled (a send still queued never leaves; one already in flight stops holding the chat's send queue, while the reply still waits for its own rate-limit slot), an owner message that arrived during it gets no trailing move, and the card is retired (`ContextHud.retire`) once it lands, so it never stays below the reply. The next owner message brings a fresh card back.
+- **Retire cleanup.** When Telegram refuses to delete a retired card, it is unpinned and its ID is kept; the next `bump` or `retire` tries the delete again, at most twice more.
 
 Each pin makes Telegram post a "pinned a message" service line. `codex/pin-service.ts` deletes those lines when the bot itself is the sender; pins made by the owner are not touched.
 

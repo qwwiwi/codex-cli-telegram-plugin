@@ -13,15 +13,20 @@
 //
 // Hangs: Telegram normally answers in well under a second, and a failed call
 // resolves the move at once (the answer still goes out; ContextHud logs the
-// failure). Only a call that hangs past the guard lets the answer go first;
-// the card is then retired (ContextHud.retire, serialized behind the late
-// move) so it never stays below the answer.
+// failure). Only a call that hangs past the guard lets the answer go first.
+// The move is then over: its card send is cancelled (a queued send never
+// leaves; one in flight stops holding the chat's send queue, so the answer is
+// not stuck behind it), an owner message that arrived during it gets no
+// trailing move (that card would land below the answer), and the card is
+// retired (ContextHud.retire, serialized behind the late move) so it never
+// stays below the answer. The next owner message starts a fresh move.
 //
 // Best-effort like every HUD operation: nothing here throws or rejects into the
 // reply path.
 
 export interface HudCard {
-  bump(chatId: string): Promise<void>
+  // `signal` aborts when the hang guard gives up on this move.
+  bump(chatId: string, signal?: AbortSignal): Promise<void>
   updateNow(chatId: string): Promise<void>
   retire(chatId: string): Promise<void>
 }
@@ -39,6 +44,8 @@ interface Move {
   done: Promise<void>
   // An owner message arrived while this move was in flight.
   again: boolean
+  // Aborted when the hang guard expired: the move is invalid from then on.
+  cancel: AbortController
 }
 
 export class HudAnchor {
@@ -57,7 +64,7 @@ export class HudAnchor {
       this.current.again = true
       return
     }
-    const move: Move = { done: Promise.resolve(), again: false }
+    const move: Move = { done: Promise.resolve(), again: false, cancel: new AbortController() }
     this.current = move
     move.done = this.run(move)
   }
@@ -90,8 +97,9 @@ export class HudAnchor {
     try {
       do {
         move.again = false
-        await attempt(() => this.hud.bump(this.chatId))
-      } while (move.again)
+        await attempt(() => this.hud.bump(this.chatId, move.cancel.signal))
+        // An expired move sends nothing more: its answer may already be out.
+      } while (move.again && !move.cancel.signal.aborted)
     } finally {
       // Cleared in the same step that saw no burst, so no owner message is lost.
       if (this.current === move) this.current = undefined
@@ -111,6 +119,8 @@ export class HudAnchor {
       if (expired) {
         // The next owner message starts a fresh move with its own guard.
         if (this.current === move) this.current = undefined
+        // Free the chat's send queue for the answer and drop the trailing move.
+        move.cancel.abort()
         this.log?.warn('context hud card did not land in time; the reply goes out without it', {
           chat_id: this.chatId,
           guard_ms: this.guardMs,
