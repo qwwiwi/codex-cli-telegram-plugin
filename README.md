@@ -4,11 +4,15 @@
 
 > **Read in your language:** English (this page) · [**Русская версия →**](README.ru.md)
 
+> **По-русски:** личный агент OpenAI Codex в приватном чате Telegram, на вашем сервере и с вашим входом ChatGPT.
+
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](LICENSE)
 [![Bun](https://img.shields.io/badge/Bun-TypeScript-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](https://bun.com/docs/installation)
 [![Codex CLI](https://img.shields.io/badge/Codex_CLI-app--server-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](https://developers.openai.com/codex/cli)
 [![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux_%7C_macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#requirements)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#license-and-credits)
+
+**Releases:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · current: v0.1.0 (pre-release), [release notes](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
 
 ## Your own Codex agent in a private Telegram chat.
 

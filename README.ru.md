@@ -10,6 +10,8 @@
 [![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux_%7C_macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#что-нужно)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#лицензия-и-авторы)
 
+**Релизы:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · сейчас v0.1.0 (pre-release), [заметки к релизу](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
+
 ## Свой агент Codex в личке Telegram.
 
 **Это небольшая программа-мост между вашим Telegram-ботом и Codex CLI от OpenAI.** Вы пишете боту, мост передаёт сообщение Codex, Codex выполняет работу на вашем сервере, а ответ приходит обратно в чат. Один бот служит одному владельцу, только в личке, на вашем сервере и с вашим входом в ChatGPT.

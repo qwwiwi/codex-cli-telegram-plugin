@@ -18,6 +18,7 @@ This page describes how the bridge works inside: the code map, the path of one m
 One Bun process (`bun run start` = `bun run src/codex/server.ts` in `plugin/`) does everything:
 
 - polls Telegram with grammY,
+- optionally listens for messages from other agents on the inter-agent webhook (`KROT_AGENT_WEBHOOK_LISTEN`, see [Inter-agent webhook](#inter-agent-webhook)),
 - keeps one long-lived `codex app-server` child,
 - writes state into `TELEGRAM_STATE_DIR`,
 - lets Codex work in `TELEGRAM_WORKSPACE_ROOT`, whose `AGENTS.md` carries the agent's instructions.
@@ -51,6 +52,8 @@ The live product. `rpc.ts` starts app-server and speaks JSON-RPC. `session.ts` m
 - `restart-bridge.ts`, `restart-handoff.ts`, `continuation.ts`: self-restart and continuation of unfinished tasks
 - `pin-service.ts`: deletes the bot's own "pinned a message" service messages
 - `external.ts`: optional local HTTP server on `127.0.0.1` for external tasks and policy cards
+- `agent-webhook.ts`: optional inter-agent webhook, the entry point for messages from other agents (`agentWebhookSettings`, `startAgentWebhook`, `routeAgentMessage`)
+- `provenance.ts`: the untrusted-data frame put around an agent's message
 
 ### `autonomy/`
 
@@ -150,7 +153,7 @@ Telegram input.
 
 ### `webhook/`
 
-Shared HTTP helpers for `codex/external.ts`: capped body reads, schema parsing, the auth/origin gate and the JSON reply writer. This is a local HTTP endpoint for other processes on the same machine, not a Telegram webhook.
+Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, the auth/origin gate and the JSON reply writer) and the constant-time bearer compare `bearerEquals` used by `codex/agent-webhook.ts`. Neither endpoint is a Telegram webhook.
 
 - `http.ts`
 
@@ -290,7 +293,7 @@ The HUD is off by default. Turn it on with `TELEGRAM_HUD_ENABLED=1` or `"hud": {
 
 - `Контекст`: context window use as a bar, percentage and tokens (from `thread/tokenUsage/updated`),
 - the model,
-- the limits line `Лимиты Codex: 5ч N% · неделя N% (сброс DD.MM HH:MM МСК)`: the used share of each limit window, the weekly reset time in Moscow time when app-server gives one,
+- the limits line `Лимиты Codex: потрачено за неделю N% · за 5ч N% (сброс DD.MM HH:MM МСК)`: the used share of each limit window in percent («потрачено», used, never "left"), weekly window first, then the weekly reset time in Moscow time when app-server gives one,
 - the autonomy line (active mandate, open questions),
 - the current plan (`turn/plan/updated`),
 - a **Сжать** (compact) button.
@@ -318,6 +321,18 @@ Off by default; on with `KROT_CODEX_PARALLEL=1` (`codex/parallel.ts`). While the
 **How a side turn works.** Its instructions tell Codex what the main thread is doing, not to touch the main task's files, and that a real correction should be sent as a reply or start with a correction word. Side threads do not change `codex-thread.json`, the HUD or the status bubble. `/stop` interrupts them together with the main turn.
 
 **Older side replies.** `KROT_CODEX_SIDE_REPLY=1` is a separate, older feature (`codex/side-reply.ts`). It answers a short side question (for example one starting with «быстрый вопрос:») with a one-off query, timeout 25 s, without starting a thread.
+
+## Inter-agent webhook
+
+A second entry point next to Telegram polling, off by default (`codex/agent-webhook.ts`). Other agents of the same fleet send the Codex agent a message over HTTP; it reaches Codex as data, never as an owner instruction.
+
+- **On.** `main()` calls `agentWebhookSettings(process.env)`. Without `KROT_AGENT_WEBHOOK_LISTEN` nothing listens. With it, `startAgentWebhook` binds that `host:port`; without a token and without an IP allowlist the bridge logs an error and does not start it (it never runs open).
+- **Request.** `POST /webhook` (or `POST /`) with a JSON body `{"message", "chatId", "agentId"}` of at most 64 KB. `Authorization: Bearer <token>` and the socket peer address are checked; `X-Delivery-Id` is the idempotency key (last 500 IDs).
+- **Framing.** The message is wrapped in the `[Inter-agent message – untrusted data from <agentId>; the owner did not write this]` prefix (`codex/provenance.ts`), and the owner gets a short Telegram notice.
+- **Routing.** `routeAgentMessage`: an idle Codex starts a turn, a busy Codex queues it, or with `KROT_CODEX_PARALLEL=1` it opens a side thread. An agent message never steers the main turn.
+- **Limits on agent turns.** Sandbox `workspace-write`, no approvals; no owner-only features (memory, learning, leases, restart, question cards, chat actions, attachments). A side turn lost to a restart lands in `dead-letter/webhook/`.
+
+Operator setup and response codes: [plugin/docs/install.md](../plugin/docs/install.md#inter-agent-webhook).
 
 ## Restart behaviour
 
@@ -408,6 +423,9 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_CODEX_MAX_PARALLEL` | `codex/parallel.ts` | maximum threads at once, main included (1 to 8, default 2) |
 | `KROT_CODEX_CORRECTION_WORDS` | `codex/parallel.ts` | CSV of words that mark a message as a correction of the main task |
 | `KROT_CODEX_SIDE_REPLY` | `codex/server.ts` | `1` turns on the older one-off side replies |
+| `KROT_AGENT_WEBHOOK_LISTEN` | `codex/agent-webhook.ts` | `host:port` of the inter-agent webhook; unset keeps it off |
+| `KROT_AGENT_WEBHOOK_TOKEN` | `codex/agent-webhook.ts` | bearer token the sending agents must present |
+| `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |
 | `KROT_CODEX_SELF_RESTART` | `codex/server.ts` | `1` allows an owner-requested restart (Linux, under systemd) |
 | `KROT_CODEX_COMMANDS_DIR` | `codex/server.ts` | folder with custom prompt commands for `/cc <name>` |
 | `KROT_CODEX_LEARNING` | `codex/server.ts` | `1` turns on learning memory and `/memory` ([plugin/docs/learning.md](../plugin/docs/learning.md)) |

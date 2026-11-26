@@ -89,6 +89,19 @@ test('install configures a private owner and checks doctor without starting the 
   expect(readFileSync(profile, 'utf8')).toBe('A custom profile\n')
 })
 
+test('[R18] the generated agent profile explains subagents and parallel side threads', () => {
+  const { repo, env, home } = checkout()
+  const result = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321', '--agent-name', 'Helper')
+  expect(result.code, result.text).toBe(0)
+  const profile = readFileSync(join(home, 'krotov-workspace/AGENTS.md'), 'utf8')
+  const section = profile.slice(profile.indexOf('## Субагенты и параллельные потоки'))
+  expect(section.startsWith('## Субагенты и параллельные потоки')).toBe(true)
+  for (const word of ['multi_agent_v2', 'spawn_agent', 'wait', 'close_agent', 'KROT_CODEX_PARALLEL']) {
+    expect(section).toContain(word)
+  }
+  expect(section).toMatch(/параллельн\S* поток/)
+})
+
 test('an agent can pair a new bot without requesting an ID and opt into service startup', () => {
   const { root, repo, env } = checkout()
   const secret = join(root, 'token')
