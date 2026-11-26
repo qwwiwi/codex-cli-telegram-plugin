@@ -17,7 +17,8 @@ type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string } |
     delivery?: Record<string, PartStatus> }
 type Active = { messages: Message[]; outcome: Outcome; work?: Work }
 // A side turn Codex accepted (turn/start answered); kept until the side turn finishes.
-export type SideJob = { messages: Message[]; thread?: string }
+// `unconfirmed`: a follow-up held by recovery because its dead letter could not be written.
+export type SideJob = { messages: Message[]; thread?: string; unconfirmed?: true }
 type Pending = { ready: Message[][]; albums: Record<string, Message[]>; accepted: number[]; active?: Active;
   followUp?: Message[]; followUpIndex?: number; sides?: Record<string, SideJob>;
   // Who wrote each held message, keyed by message id. Missing means "not the owner".
@@ -43,9 +44,21 @@ export class CodexInbox {
         throw new Error('Invalid Codex inbox')
       }
       // A file saved before provenance existed: only the webhook framed its input this way.
+      const legacy = !state.origins
       if (!state.origins) {
         state.origins = Object.fromEntries(groups(state).flat().map(msg => [String(msg.message_id),
           msg.message_id < 0 && (msg.text ?? '').startsWith(agentFramePrefix) ? agentProvenance('unknown') : ownerProvenance]))
+      }
+      // Recovery acts on the active record's continuation, restart, lease,
+      // task text and attachments for the owner. Only a saved owner provenance
+      // earns them; a legacy record in flight has none and is treated as an
+      // agent's (fail closed). A merely claimed record is re-run from the queue.
+      const first = state.active?.messages[0]
+      if (legacy && first && state.active?.outcome.stage !== 'claimed') {
+        state.origins[String(first.message_id)] = agentProvenance('unknown')
+      }
+      if (state.active && (!first || state.origins[String(first.message_id)]?.origin !== 'owner')) {
+        state.active = withoutOwnerMetadata(state.active)
       }
       this.state = state
     } catch (error) {
@@ -93,6 +106,13 @@ export class CodexInbox {
     const { followUp, followUpIndex: _index, ...pending } = this.state
     if (followUp?.[0]?.message_id !== id) return
     this.save({ ...pending, sides: { ...pending.sides, [String(id)]: { messages: followUp, thread } } })
+  }
+
+  /** Moves the uncertain follow-up out of the queue's way, keeping its record as a side job. */
+  holdFollowUp(id: number): void {
+    const { followUp, followUpIndex: _index, ...pending } = this.state
+    if (followUp?.[0]?.message_id !== id) return
+    this.save({ ...pending, sides: { ...pending.sides, [String(id)]: { messages: followUp, unconfirmed: true } } })
   }
 
   finishSide(id: number): void {
@@ -246,6 +266,17 @@ export class CodexInbox {
     atomicWriteInRoot({ root: this.root }, filename, JSON.stringify(state) + '\n')
     this.state = state
   }
+}
+
+// The active record as an agent's: the reply and its delivery state stay,
+// everything that acts on the owner's behalf goes.
+function withoutOwnerMetadata(active: Active): Active {
+  const { work: _work, ...rest } = active
+  const outcome: Outcome = active.outcome.stage === 'ready'
+    ? { stage: 'ready', reply: active.outcome.reply,
+      ...(active.outcome.delivery ? { delivery: active.outcome.delivery } : {}) }
+    : active.outcome
+  return { ...rest, outcome }
 }
 
 function groups(state: Pending): Message[][] {

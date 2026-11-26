@@ -97,3 +97,52 @@ test('F3: an owner side job is quoted, and a finished side job leaves no record'
   expect(notices.map(notice => notice.replyTo)).toEqual([11])
   expect(inbox.sideJobs).toEqual([])
 })
+
+// The dead-letter store refuses the write (EACCES); Telegram itself works.
+function deniedDeadLetter() {
+  const notices: RecoveryNotice[] = []
+  const deps: RecoveryDeps = {
+    send: async notice => { notices.push(notice) },
+    deadLetter: () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }) },
+    log: silent,
+  }
+  return { deps, notices }
+}
+
+test('a side job whose dead letter cannot be written keeps its record and does not block the queue', async () => {
+  const { dir, inbox } = crashedInbox(inbox => {
+    inbox.beginFollowUp(message(-8, frameAgentMessage('Собери отчёт', 'swarm')), agentProvenance('swarm'))
+    inbox.startSide(-8, 'side-thread')
+    inbox.receive(message(9, 'следующая задача'), ownerProvenance)
+  })
+  const { deps, notices } = deniedDeadLetter()
+  await recoverInterruptedWork(inbox, deps)
+  // The agent's text is not stored anywhere else yet: the record stays, also on disk.
+  expect(inbox.sideJobs.map(job => job.id)).toEqual([-8])
+  expect(new CodexInbox(dir, OWNER).sideJobs.map(job => job.id)).toEqual([-8])
+  expect(notices.length).toBe(1)
+  expect(notices[0]!.text).not.toContain('Текст сохранён')
+  expect(inbox.take()?.[0]?.message_id).toBe(9)
+  // Next recovery with a working store keeps the text and clears the record.
+  const letters: Parameters<RecoveryDeps['deadLetter']>[0][] = []
+  await recoverInterruptedWork(new CodexInbox(dir, OWNER), { ...deps, deadLetter: record => { letters.push(record) } })
+  expect(letters.map(letter => [letter.messageId, letter.stage])).toEqual([[-8, 'interrupted']])
+  expect(new CodexInbox(dir, OWNER).sideJobs).toEqual([])
+})
+
+test('an unconfirmed agent follow-up whose dead letter cannot be written is kept without blocking the queue', async () => {
+  const { dir, inbox } = crashedInbox(inbox => {
+    inbox.beginFollowUp(message(-5, frameAgentMessage('Verify the summary.', 'swarm')), agentProvenance('swarm'))
+    inbox.receive(message(6, 'следующая задача'), ownerProvenance)
+  })
+  const { deps } = deniedDeadLetter()
+  await recoverInterruptedWork(inbox, deps)
+  expect(inbox.uncertainFollowUp).toBeUndefined()
+  expect(new CodexInbox(dir, OWNER).sideJobs.map(job => job.id)).toEqual([-5])
+  expect(inbox.take()?.[0]?.message_id).toBe(6)
+  const letters: Parameters<RecoveryDeps['deadLetter']>[0][] = []
+  await recoverInterruptedWork(new CodexInbox(dir, OWNER), { ...deps, deadLetter: record => { letters.push(record) } })
+  expect(letters).toEqual([{ agent: 'swarm', messageId: -5, stage: 'unconfirmed',
+    text: frameAgentMessage('Verify the summary.', 'swarm') }])
+  expect(new CodexInbox(dir, OWNER).sideJobs).toEqual([])
+})

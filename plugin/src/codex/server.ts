@@ -1785,8 +1785,13 @@ async function main(): Promise<void> {
     async function finishOrdinaryReply(epoch: number, recovering = false): Promise<void> {
       const active = inbox.active
       if (active?.outcome.stage !== 'ready') return
-      const { reply, continueGoal, restartBridge, restartVerification } = active.outcome
       const id = active.messages[0]!.message_id
+      // Continuation and restart act for the owner: never for an agent's or an unknown record.
+      const fromOwner = inbox.provenance(id).origin === 'owner'
+      const { reply } = active.outcome
+      const continueGoal = fromOwner && active.outcome.continueGoal === true
+      const restartBridge = fromOwner && active.outcome.restartBridge === true
+      const restartVerification = fromOwner && active.outcome.restartVerification === true
       let delivered: boolean
       try {
         delivered = await deliverReply(reply, id)
@@ -2039,7 +2044,11 @@ async function main(): Promise<void> {
             await withoutDeletedQuote(id => telegram.sendMessage(ownerChat, notice.text,
               id === undefined ? {} : { reply_to_message_id: id }), notice.replyTo)
           },
-          deadLetter: record => { writeDeadLetter(paths, 'webhook', { type: 'agent-message-lost', ...record }) },
+          // Exact-value redaction of known secrets: the agent name and body are untrusted text.
+          deadLetter: record => {
+            writeDeadLetter(paths, 'webhook', { type: 'agent-message-lost', ...record,
+              agent: redactSecrets(record.agent, secrets), text: redactSecrets(record.text, secrets) })
+          },
           log,
         })
         const active = inbox.active
@@ -2054,20 +2063,22 @@ async function main(): Promise<void> {
             if (typeof answer === 'string') {
               for (const message of active.messages) acknowledge(message)
               const targetId = active.messages[0]?.reply_to_message?.message_id
-              const context = active.work?.continuation
-              const mayRestart = selfRestartEnabled && active.work?.mayRestartBridge === true
-              const mayVerify = !!restartHandoff && active.work?.verificationEligible === true
+              const original = active.messages[0]!
+              // Every saved owner capability below needs a saved owner origin; no origin means an agent.
+              const fromOwner = inbox.provenance(original.message_id).origin === 'owner'
+              const work = fromOwner ? active.work : undefined
+              const context = work?.continuation
+              const mayRestart = selfRestartEnabled && work?.mayRestartBridge === true
+              const mayVerify = !!restartHandoff && work?.verificationEligible === true
               const requestedRestart = bridgeRestartReply(answer, mayRestart, false, mayVerify).requested
               const interim = requestedRestart ? undefined : await continuationReply(context, answer, epoch)
-              const original = active.messages[0]!
-              const fromOwner = inbox.provenance(original.message_id).origin === 'owner'
               const ownerTaskText = !fromOwner || isRestartVerificationMessage(original.message_id) ? undefined
-                : active.work?.voiceTaskText ?? directOwnerTask(original)
+                : work?.voiceTaskText ?? directOwnerTask(original)
               if (fromOwner && interim === undefined && !context?.statusQuestion) {
                 rememberBlocker(original, ownerTaskText, answer, epoch)
               }
-              const completed = interim === undefined && active.work?.lease
-                ? await leases.completion(active.work.lease).complete(answer) : hideLeaseCompletions(interim ?? answer)
+              const completed = interim === undefined && work?.lease
+                ? await leases.completion(work.lease).complete(answer) : hideLeaseCompletions(interim ?? answer)
               const restart = bridgeRestartReply(completed, mayRestart, interim !== undefined, mayVerify)
               const visible = hideQuestionMarker(hideContinuationMarker(restart.text))
               // An agent turn never sends workspace files.
@@ -2077,7 +2088,7 @@ async function main(): Promise<void> {
               inbox.complete(original.message_id, { ...reply, text: redactSecrets(reply.text, secrets) },
                 interim !== undefined, restart.requested && epoch === stopEpoch, restart.verify)
               await finishOrdinaryReply(epoch, true)
-              if (!active.work?.continuation && hideContinuationMarker(answer) !== answer) {
+              if (!context && hideContinuationMarker(answer) !== answer) {
                 await send('Сохранил промежуточный ответ. Автоматическое продолжение этой задачи не удалось восстановить.')
               }
             } else {

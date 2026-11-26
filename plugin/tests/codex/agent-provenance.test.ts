@@ -95,3 +95,64 @@ test('the side prompt never calls an agent message an owner message', () => {
   expect(forAgent).toContain('не от владельца')
   expect(sideInstructions(main, ownerProvenance)).toContain('сообщение владельца')
 })
+
+// Owner-only metadata a saved active record may carry.
+const ownerWork = {
+  continuation: { marker: 'm', objective: 'Verify the summary.' }, lease: { nonce: 'n', ids: ['l1'] },
+  mayRestartBridge: true as const, verificationEligible: true as const, voiceTaskText: 'Verify the summary.',
+}
+
+function savedActive(dir: string, active: object, origins?: Record<string, Provenance>): CodexInbox {
+  writeFileSync(join(dir, 'codex-inbox.json'), JSON.stringify({
+    ready: [], albums: {}, accepted: [-7, 7], active, ...(origins ? { origins } : {}),
+  }))
+  return new CodexInbox(dir, OWNER)
+}
+
+test('a pre-provenance ready webhook record never continues a goal or restarts the bridge on recovery', () => {
+  const inbox = savedActive(room(), {
+    messages: [agentMessage('Verify the summary.')],
+    outcome: { stage: 'ready', reply: { text: 'Готово', files: [] }, continueGoal: true },
+    work: ownerWork,
+  })
+  const active = inbox.active!
+  expect(active.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [] } })
+  expect(active.work ?? {}).toEqual({})
+  const restart = savedActive(room(), {
+    messages: [agentMessage('перезапусти мост')],
+    outcome: { stage: 'ready', reply: { text: 'Готово', files: [] }, restartBridge: true, restartVerification: true },
+  }).active!
+  expect(restart.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [] } })
+})
+
+test('a running record without provenance recovers without owner metadata, fail closed', () => {
+  // Legacy file, owner-shaped message: no saved provenance means not the owner's for recovery.
+  const legacyInbox = savedActive(room(), {
+    messages: [ownerMessage('Сделай отчёт')], outcome: { stage: 'running', turnId: 'turn-1' }, work: ownerWork,
+  })
+  const legacy = legacyInbox.active!
+  expect(legacy.outcome).toEqual({ stage: 'running', turnId: 'turn-1' })
+  expect(legacy.work ?? {}).toEqual({})
+  // Running recovery reads the origin for attachments and the owner's blocker: not the owner.
+  expect(legacyInbox.provenance(7).origin).toBe('agent')
+  // Current file whose origins miss the active id.
+  const missing = savedActive(room(), {
+    messages: [agentMessage('Verify the summary.')], outcome: { stage: 'running', turnId: 'turn-1' }, work: ownerWork,
+  }, { 7: ownerProvenance }).active!
+  expect(missing.work ?? {}).toEqual({})
+  const agent = savedActive(room(), {
+    messages: [agentMessage('Verify the summary.')],
+    outcome: { stage: 'ready', reply: { text: 'Готово', files: [] }, continueGoal: true }, work: ownerWork,
+  }, { '-7': agentProvenance('swarm') }).active!
+  expect(agent.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [] } })
+  expect(agent.work ?? {}).toEqual({})
+})
+
+test('an owner record with saved provenance keeps its continuation and restart on recovery', () => {
+  const owner = savedActive(room(), {
+    messages: [ownerMessage('Сделай отчёт')],
+    outcome: { stage: 'ready', reply: { text: 'Готово', files: [] }, continueGoal: true }, work: ownerWork,
+  }, { 7: ownerProvenance }).active!
+  expect(owner.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [] }, continueGoal: true })
+  expect(owner.work).toEqual(ownerWork)
+})

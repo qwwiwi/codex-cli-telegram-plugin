@@ -4,7 +4,8 @@
 // Rules: a notice never quotes a synthetic (non-positive) message id, so it is
 // sent as plain text; a notice Telegram refuses is logged and never blocks
 // clearing the record or draining the queue; the body of a lost agent message
-// is kept in the dead-letter store instead of being dropped.
+// is kept in the dead-letter store instead of being dropped, and its inbox
+// record is removed only once that store accepted it.
 
 import type { Message } from 'grammy/types'
 
@@ -27,31 +28,42 @@ export interface RecoveryDeps {
 
 /** Settles follow-ups and side turns that were in flight when the bridge stopped. */
 export async function recoverInterruptedWork(inbox: CodexInbox, deps: RecoveryDeps): Promise<void> {
+  // Snapshot first: a follow-up held below becomes a side job and waits for the next recovery.
+  const jobs = inbox.sideJobs
   const followUp = inbox.uncertainFollowUp
   if (followUp) {
-    await settle(inbox, followUp, 'unconfirmed', deps)
-    inbox.finishFollowUp(followUp.message_id)
+    if (await settle(inbox, followUp, 'unconfirmed', deps)) inbox.finishFollowUp(followUp.message_id)
+    else inbox.holdFollowUp(followUp.message_id)
   }
-  for (const job of inbox.sideJobs) {
+  for (const job of jobs) {
     const first = job.messages[0]
-    if (first) await settle(inbox, first, 'interrupted', deps)
-    inbox.finishSide(job.id)
+    if (!first || await settle(inbox, first, job.unconfirmed ? 'unconfirmed' : 'interrupted', deps)) {
+      inbox.finishSide(job.id)
+    }
   }
 }
 
+// False when an agent message could not be kept in the dead-letter store:
+// its inbox record is then the only copy and must stay.
 async function settle(inbox: CodexInbox, message: Message, stage: 'unconfirmed' | 'interrupted',
-  deps: RecoveryDeps): Promise<void> {
+  deps: RecoveryDeps): Promise<boolean> {
   const id = message.message_id
   const provenance = inbox.provenance(id)
   let text: string
+  let kept = true
   if (provenance.origin === 'agent') {
-    const what = 'Сообщение от агента ' + provenance.agent + ' («' + taskTitle(agentBody(message.text)) + '»)'
-    text = stage === 'unconfirmed'
-      ? what + ': после перезапуска не удалось подтвердить, взял ли его Codex. Текст сохранён в журнале недоставленных.'
-      : what + ': после перезапуска параллельная задача прервалась, результат не получен. Текст сохранён в журнале недоставленных.'
     try {
       deps.deadLetter({ agent: provenance.agent, messageId: id, text: message.text ?? '', stage })
-    } catch { deps.log.warn('Could not keep a lost agent message') }
+    } catch {
+      kept = false
+      deps.log.warn('Could not keep a lost agent message; its record stays for the next recovery')
+    }
+    const what = 'Сообщение от агента ' + provenance.agent + ' («' + taskTitle(agentBody(message.text)) + '»)'
+    const where = kept ? ' Текст сохранён в журнале недоставленных.'
+      : ' Сохранить текст в журнал недоставленных не удалось, запись оставлена до следующего перезапуска.'
+    text = (stage === 'unconfirmed'
+      ? what + ': после перезапуска не удалось подтвердить, взял ли его Codex.'
+      : what + ': после перезапуска параллельная задача прервалась, результат не получен.') + where
   } else {
     text = stage === 'unconfirmed'
       ? 'После перезапуска не удалось подтвердить, дошло ли это уточнение до Codex.'
@@ -62,4 +74,5 @@ async function settle(inbox: CodexInbox, message: Message, stage: 'unconfirmed' 
   } catch {
     deps.log.warn('Could not send a recovery notice; clearing the record anyway')
   }
+  return kept
 }
