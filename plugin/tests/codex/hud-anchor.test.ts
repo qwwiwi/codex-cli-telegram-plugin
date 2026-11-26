@@ -211,6 +211,52 @@ test('[R04] retirement with the real HUD and limiter: a card that hangs past the
   expect(chat.texts()).toEqual(['owner A', 'owner B', 'answer B'])
 })
 
+test('[R04] a card the owner deleted, whose replacement send hangs past the guard, does not hold the answer back', async () => {
+  const chat = fakeTelegramChat()
+  // Burst room for every call here, so only the chat's send queue can hold the answer.
+  const limited = createRateLimitedTelegramApi(chat.raw, createLogger('hud-anchor-test'), {
+    jitterMaxMs: 0, perChatBurstCapacity: 10,
+  })
+  const telegram = { refusesCleanup: false }
+  const refused = (): Promise<void> => Promise.reject(new Error("Bad Request: message can't be deleted"))
+  let renders = 0
+  const hud = new ContextHud({
+    api: {
+      sendMessage: limited.sendMessage,
+      editMessageText: limited.editMessageText,
+      deleteMessage: (chatId, id) => telegram.refusesCleanup ? refused() : chat.raw.deleteMessage(chatId, id),
+      async pinChatMessage() {},
+      unpinChatMessage: () => telegram.refusesCleanup ? refused() : Promise.resolve(),
+    },
+    log: createLogger('hud-anchor-test'), sessionInfo: { get: () => ({}) }, windowTokens: 0,
+    ownerChatIds: [OWNER], stateDir: mkdtempSync(join(tmpdir(), 'hud-anchor-')), enabled: true,
+    render: () => ({ text: 'HUD ' + ++renders, keyboard: { inline_keyboard: [] } }),
+  })
+  const anchor = new HudAnchor(hud, OWNER, 20)
+  chat.owner('owner A')
+  anchor.ownerMessage()
+  await anchor.settled()
+  // The owner deletes the tracked card; Telegram then refuses both delete and unpin.
+  chat.ownerDeletes('HUD 1')
+  telegram.refusesCleanup = true
+
+  // Owner message B: the in-place edit finds no message, and the replacement send hangs.
+  chat.hold('HUD')
+  chat.owner('owner B')
+  anchor.ownerMessage()
+  const answer = anchor.settled().then(() => limited.sendMessage(OWNER, 'answer B', {}))
+  await Bun.sleep(60)
+
+  // The guard expired and cancelled the replacement send, so the answer went out.
+  expect(chat.rawCalls).toEqual(['HUD 1', 'HUD 2', 'answer B'])
+  // The replacement card lands late, below the answer, and is retired.
+  telegram.refusesCleanup = false
+  chat.releaseAll()
+  await answer
+  await Bun.sleep(20)
+  expect(chat.texts()).toEqual(['owner A', 'owner B', 'answer B'])
+})
+
 test('[R04] rapid owner messages never reuse an older card: a burst ends with a fresh move after the last message', async () => {
   const { hud, calls, release } = fakeHud()
   const anchor = new HudAnchor(hud, OWNER)

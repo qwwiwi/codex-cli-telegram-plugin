@@ -47,6 +47,11 @@ export function fakeTelegramChat() {
     rawCalls,
     /** An inbound message from the owner: it lands without any API call. */
     owner(text: string): void { land(text) },
+    /** The owner deletes the visible message whose text starts with `prefix`. */
+    ownerDeletes(prefix: string): void {
+      const at = visible.findIndex(m => m.text.startsWith(prefix))
+      if (at !== -1) visible.splice(at, 1)
+    },
     /** The next raw send whose text starts with `prefix` hangs until releaseAll(). */
     hold(prefix: string): void { holds.push(prefix) },
     releaseAll(): void { for (const release of held.splice(0)) release() },

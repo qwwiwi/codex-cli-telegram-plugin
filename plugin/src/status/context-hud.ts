@@ -498,7 +498,7 @@ export class ContextHud {
             // refresh it in place instead of risking a second pin; edit()
             // recreates the card once if it turns out to be gone already.
             this.messageIds.set(chatId, old)
-            await this.edit(chatId, old, text, keyboard)
+            await this.edit(chatId, old, text, keyboard, signal)
             return
           }
         }
@@ -723,11 +723,14 @@ export class ContextHud {
   // reject as "not modified" and that still burns the per-chat flood budget.
   // The skip is side-effect-safe: it never touches the persisted message id or
   // the pin, it only avoids re-editing identical content.
+  //
+  // `signal` (from bump) cancels the replacement send, like bump's own send.
   private async edit(
     chatId: string,
     messageId: number,
     text: string,
     keyboard: InlineKeyboardLike,
+    signal?: AbortSignal,
   ): Promise<void> {
     const fingerprint = this.renderFingerprint(text, keyboard)
     if (this.lastRendered.get(chatId) === fingerprint) return
@@ -748,7 +751,7 @@ export class ContextHud {
         // once — sendFresh persists + pins the replacement and does NOT call
         // back into edit, so a permanently-gone message can't spin a loop.
         this.messageIds.delete(chatId)
-        await this.sendFresh(chatId, text, keyboard)
+        await this.sendFresh(chatId, text, keyboard, signal)
         return
       }
       this.log.warn('context hud edit failed (ignored)', {
