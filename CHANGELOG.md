@@ -11,9 +11,10 @@ First public release.
 
 - Parallel side threads (`KROT_CODEX_PARALLEL=1`): a message that arrives while a task
   runs is answered in a side thread. `KROT_CODEX_MAX_PARALLEL` sets the total, 1 to 8
-  threads with the main one, so up to 7 side threads; default 2. A side thread is a
-  fork of the main thread at its last finished turn and reuses its prompt cache; when
-  Codex refuses a fork, the bridge starts a fresh thread. (`3d3c50a`, `027d394`,
+  threads with the main one, so up to 7 side threads; default 2. Side threads fork
+  from the main thread at its last finished turn so they can reuse its prompt cache
+  (hit rate not measured yet); when Codex refuses a fork, the bridge starts a fresh
+  thread. (`3d3c50a`, `027d394`,
   `34aa9a5`, `2cc9e05`)
 - Agent webhook (`KROT_AGENT_WEBHOOK_LISTEN`, `KROT_AGENT_WEBHOOK_TOKEN`,
   `KROT_AGENT_WEBHOOK_ALLOW_IPS`): other agents send messages over HTTP; a token, an IP
@@ -38,5 +39,9 @@ First public release.
   wait for the card move. (`de24369`, `064ba09`, `7acff76`)
 - The bot deletes its own "pinned a message" service lines after HUD re-pins.
   (`88d5a1c`)
+
+### Inherited from upstream, documented
+
 - Codex subagents (`multi_agent_v2`): approval requests from child threads go to the
-  owner as Telegram cards (inherited from upstream, kept in this release).
+  owner as Telegram cards. Comes from the upstream fork point; kept and documented in
+  this release.
