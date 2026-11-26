@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { probeProxy, runDoctor } from '../scripts/doctor.js'
+import { checkCodex, probeProxy, runDoctor } from '../scripts/doctor.js'
 import { getStatePaths, loadConfig, RuntimeEnvSchema } from '../src/config.js'
 
 const token = '100001:fake-token-with-enough-characters'
@@ -99,4 +99,19 @@ test('[R01] doctor reports the active approval mode, including never', async () 
   const { checks } = await checkInstallation({ env: { KROT_CODEX_APPROVAL_MODE: 'risky' } })
   expect(checks.filter(check => check.status === 'error').map(check => check.message).join('\n'))
     .toContain('KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1')
+})
+
+test('[R01] doctor fails a proxy setup whose approval mode is never, as startup does, without probing the proxy', async () => {
+  const probed: string[] = []
+  const probe = async (workspace: string): Promise<{ status: 'ok'; message: string }> => {
+    probed.push(workspace)
+    return { status: 'ok', message: 'proxy ok' }
+  }
+  const proxyEnv = { KROT_CODEX_PROXY: process.execPath, KROT_CODEX_APPROVALS: '1' }
+  const never = await checkCodex({ ...proxyEnv, KROT_CODEX_APPROVAL_MODE: 'never' }, import.meta.dir, probe)
+  expect(never.status).toBe('error')
+  expect(never.message).toContain('never')
+  expect(probed).toEqual([])
+  expect((await checkCodex(proxyEnv, import.meta.dir, probe)).status).toBe('ok')
+  expect(probed).toEqual([import.meta.dir])
 })

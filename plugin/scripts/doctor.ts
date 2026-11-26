@@ -42,14 +42,26 @@ export async function probeProxy(workspace: string, env: NodeJS.ProcessEnv, comm
   } finally { clearTimeout(timer); rpc.close() }
 }
 
-async function checkCodex(env: NodeJS.ProcessEnv, workspace?: string): Promise<Check> {
+export async function checkCodex(env: NodeJS.ProcessEnv, workspace?: string,
+  probe: typeof probeProxy = probeProxy): Promise<Check> {
   if (env.KROT_CODEX_PROXY) {
     if (env.KROT_CODEX_APPROVALS !== '1' || !isAbsolute(env.KROT_CODEX_PROXY) ||
         !Bun.which(env.KROT_CODEX_PROXY)) {
       return { status: 'error', message: 'KROT_CODEX_PROXY требует абсолютный путь к исполняемому файлу и KROT_CODEX_APPROVALS=1.' }
     }
+    // Startup refuses the proxy without approval cards: resolve the mode the bridge will run with.
+    let cards = false
+    try {
+      cards = resolveApprovalSetup({
+        KROT_CODEX_APPROVALS: env.KROT_CODEX_APPROVALS,
+        KROT_CODEX_APPROVAL_MODE: env.KROT_CODEX_APPROVAL_MODE,
+      }).cards
+    } catch { /* risky without KROT_CODEX_APPROVALS=1: startup fails, so no cards either. */ }
+    if (!cards) {
+      return { status: 'error', message: 'KROT_CODEX_PROXY работает только с карточками подтверждения: режим never с прокси мост не запустит. Укажите KROT_CODEX_APPROVAL_MODE=standard или risky.' }
+    }
     if (!workspace) return { status: 'error', message: 'Нужна доступная рабочая папка для проверки прокси.' }
-    return probeProxy(workspace, env, ['/usr/bin/sudo', '-n', '--', env.KROT_CODEX_PROXY])
+    return probe(workspace, env, ['/usr/bin/sudo', '-n', '--', env.KROT_CODEX_PROXY])
   }
   const codex = Bun.which('codex')
   if (!codex) return { status: 'error', message: 'Codex CLI не найден в PATH. Установите его и проверьте codex --version.' }
