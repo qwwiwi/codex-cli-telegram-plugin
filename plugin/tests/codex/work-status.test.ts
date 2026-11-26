@@ -108,9 +108,10 @@ test('shortens the commentary separately from the latest three command summaries
   }, 6000)
   const [timer, commentary = '', commands = ''] = html.slice(5, -6).split('\n\n')
   expect(timer).toBe('working -- 5s')
-  expect(commentary).toStartWith('Checking progress. Long commentary')
-  expect(commentary).toEndWith('…')
-  expect([...commentary].length).toBeLessThanOrEqual(128)
+  const rows = commentary.split('\n')
+  expect(rows[0]).toBe('Checking progress.')
+  expect(rows.slice(1).join(' ')).toBe(('Long commentary '.repeat(12)).trim())
+  for (const row of rows) expect([...row].length).toBeLessThanOrEqual(45)
   const lines = commands.split('\n')
   expect(lines).toHaveLength(3)
   expect(lines.slice(0, 2)).toEqual(['▸ git status', '▸ editing a&amp;b.md'])
@@ -311,4 +312,64 @@ test('[R02] throttles reasoning edits and still shows the latest text after the 
   expect(states).toHaveLength(before + 1)
   expect(lastSnapshot(states)!.thought).toBe('one two three')
   await status.close()
+})
+
+const thoughtRows = (html: string): string[] => (html.slice(5, -6).split('\n\n')[1] ?? '').split('\n')
+const unescape = (html: string): string => html.replace(/<\/?pre>/g, '')
+  .replace(/&(amp|lt|gt|quot|#39);/g, (_, e: string) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" })[e] ?? '')
+
+test('[R02] the working bubble shows the thought tail up to max_lines and max_chars as separate wrapped lines', async () => {
+  const { status, states } = fixture()
+  status.begin(7)
+  const long = 'Reading the status renderer and the work status to see where the thought is cut, '
+    + 'then checking the private-token limits for lines and characters before the end'
+  status.receive({ method: 'item/completed', params: { threadId: 'root', turnId: 'turn-1', item: {
+    type: 'reasoning', id: 'reasoning-1', summary: ['**Plan**\n\nfirst line dropped\nsecond line kept\nthird line kept\n' + long],
+    content: [],
+  } } }, 'root')
+  await Bun.sleep(0)
+  const rows = thoughtRows(renderActivityBlock(lastSnapshot(states)!, 1000))
+  expect(rows.slice(0, 2)).toEqual(['second line kept', 'third line kept'])
+  expect(rows.length).toBeGreaterThan(3)
+  for (const row of rows) expect([...row].length).toBeLessThanOrEqual(45)
+  const shown = rows.slice(2).join(' ')
+  // More than the old one-line 128-character cap, the whole tail, still redacted.
+  expect(shown.length).toBeGreaterThan(128)
+  expect(shown).toEndWith('before the end')
+  expect(shown).not.toContain('private-token')
+  expect(rows.join(' ')).not.toContain('first line dropped')
+  await status.close()
+})
+
+test('[R02] the thought in the working bubble follows a larger max_lines and max_chars from config', async () => {
+  const { status, states } = fixture(() => 1000, { thoughts: { enabled: true, read_throttle_ms: 0, max_lines: 5, max_chars: 600 } })
+  status.begin(7)
+  const lines = Array.from({ length: 6 }, (_, i) => `step ${i + 1} ` + 'checks the bridge state '.repeat(3).trim())
+  status.receive({ method: 'item/completed', params: { threadId: 'root', turnId: 'turn-1', item: {
+    type: 'reasoning', id: 'reasoning-1', summary: [lines.join('\n')], content: [],
+  } } }, 'root')
+  await Bun.sleep(0)
+  const shown = thoughtRows(renderActivityBlock(lastSnapshot(states)!, 1000)).join(' ')
+  expect(shown).not.toContain('step 1 ')
+  expect(shown).toStartWith('step 2 ')
+  expect(shown).toEndWith(lines[5]!.slice(-20))
+  expect(shown.length).toBeGreaterThan(280)
+  await status.close()
+})
+
+test('[R02] an oversized thought keeps its latest tail and the bubble stays within a Telegram edit', () => {
+  const thought = Array.from({ length: 30 }, (_, i) => `line ${i} ` + '<&> wide '.repeat(40) + `tail ${i}`).join('\n')
+  const html = renderActivityBlock({
+    startedAtMs: 0,
+    phase: 'tool',
+    calls: Array.from({ length: 3 }, () => ({ toolName: 'Bash', detail: '&'.repeat(200) })),
+    thought,
+  }, 1000)
+  const rows = thoughtRows(html)
+  expect(rows.at(-1)).toEndWith('tail 29')
+  expect(rows.join(' ')).not.toContain('line 0 ')
+  for (const row of rows) expect([...unescape(row)].length).toBeLessThanOrEqual(45)
+  // At most the schema maxima (8 lines, 2000 characters) of thought text.
+  expect(unescape(rows.join('')).replace(/ /g, '').length).toBeLessThanOrEqual(2000)
+  expect([...unescape(html)].length).toBeLessThanOrEqual(4096)
 })

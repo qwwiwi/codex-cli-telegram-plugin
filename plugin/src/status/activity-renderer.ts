@@ -248,7 +248,11 @@ export interface ActivitySnapshot {
 
 const ACTIVITY_WINDOW = 3
 const ACTIVITY_LINE_LIMIT = 45
-const ACTIVITY_THOUGHT_LIMIT = 128
+// The thought arrives already cut to the configured thoughts.max_lines / max_chars tail. The
+// renderer only backstops the schema maxima (8 lines, 2000 characters), so a bubble with the
+// timer and three tool lines stays far below Telegram's 4096-character edit limit.
+const THOUGHT_MAX_LINES = 8
+const THOUGHT_MAX_CHARS = 2000
 const ACTIVITY_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" } as const
 
 function compactActivityLine(text: string, limit: number): string {
@@ -257,14 +261,57 @@ function compactActivityLine(text: string, limit: number): string {
   return characters.slice(0, limit - 1).join('').trimEnd() + '…'
 }
 
+// Word-wraps one line into rows of at most `width` characters; a longer word is cut.
+function wrapLine(line: string, width: number): string[] {
+  const rows: string[] = []
+  let row: string[] = []
+  for (const word of line.split(' ')) {
+    let characters = Array.from(word)
+    if (row.length && row.length + 1 + characters.length > width) {
+      rows.push(row.join(''))
+      row = []
+    }
+    if (row.length) row.push(' ')
+    while (row.length + characters.length > width) {
+      const room = width - row.length
+      rows.push([...row, ...characters.slice(0, room)].join(''))
+      row = []
+      characters = characters.slice(room)
+    }
+    row.push(...characters)
+  }
+  if (row.length) rows.push(row.join(''))
+  return rows
+}
+
+// The latest thought tail as separate rows: each line redacted, its whitespace collapsed,
+// then wrapped to the tool-line width.
+function thoughtRows(thought: string): string[] {
+  let lines = thought.split(/\r?\n/u).map(line => maskSecrets(line).replace(/\s+/gu, ' ').trim())
+    .filter(Boolean).slice(-THOUGHT_MAX_LINES)
+  let total = lines.reduce((sum, line) => sum + Array.from(line).length, 0)
+  while (total > THOUGHT_MAX_CHARS && lines.length) {
+    const first = Array.from(lines[0] ?? '')
+    const excess = total - THOUGHT_MAX_CHARS
+    if (first.length <= excess) {
+      lines = lines.slice(1)
+      total -= first.length
+    } else {
+      lines = ['…' + first.slice(excess + 1).join('').trimStart(), ...lines.slice(1)]
+      total = THOUGHT_MAX_CHARS
+    }
+  }
+  return lines.flatMap(line => wrapLine(line, ACTIVITY_LINE_LIMIT))
+}
+
 export function renderActivityBlock(
   snapshot: ActivitySnapshot,
   nowMs: number,
 ): string {
   const elapsedSec = Math.max(0, Math.floor((nowMs - snapshot.startedAtMs) / 1000))
   const lines = [`working -- ${elapsedSec}s`]
-  const thought = snapshot.thought && compactActivityLine(snapshot.thought, ACTIVITY_THOUGHT_LIMIT)
-  if (thought) lines.push('', thought)
+  const thought = snapshot.thought ? thoughtRows(snapshot.thought) : []
+  if (thought.length) lines.push('', ...thought)
 
   const summaries = snapshot.calls.slice(-ACTIVITY_WINDOW).flatMap(call => {
     const detail = call.humanized ? call.humanized.replace(/<\/?(?:code|b|i)>/giu, '')
@@ -274,7 +321,7 @@ export function renderActivityBlock(
     return summary ? [`▸ ${summary}`] : []
   })
   if (summaries.length) lines.push('', ...summaries)
-  else if (!thought && snapshot.phase === 'reasoning') lines.push('', 'reasoning...')
+  else if (!thought.length && snapshot.phase === 'reasoning') lines.push('', 'reasoning...')
   return `<pre>${lines.map(escapeHtml).join('\n')}</pre>`
 }
 
