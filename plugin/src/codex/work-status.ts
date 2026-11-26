@@ -256,7 +256,9 @@ export class CodexWorkStatus {
   // Code-stripped, redacted tail of a narration or reasoning summary, bounded by max_lines / max_chars.
   private shapeThought(text: string, plain = false): string {
     const { max_lines, max_chars } = this.config.thoughts ?? { max_lines: 3, max_chars: 280 }
-    const stripped = text.replace(/```[\s\S]*?```/g, ' ')
+    // Redact the whole text before splitting: a credential folded onto the line after its
+    // header (`Bearer\n  <token>`) only matches while the header is still attached.
+    const stripped = redactSecrets(text, this.secrets).replace(/```[\s\S]*?```/g, ' ')
     // Reasoning summaries head each part with a **bold** title; the bubble is plain text.
     return (plain ? stripped.replace(/\*\*/g, '') : stripped).split(/\r?\n/)
       .map(line => this.clean(line)).filter(Boolean)

@@ -373,3 +373,28 @@ test('[R02] an oversized thought keeps its latest tail and the bubble stays with
   expect(unescape(rows.join('')).replace(/ /g, '').length).toBeLessThanOrEqual(2000)
   expect([...unescape(html)].length).toBeLessThanOrEqual(4096)
 })
+
+test('[R02] a Bearer credential folded onto its own line never reaches Telegram once the header scrolls out of the tail', async () => {
+  const chatId = '123'
+  const sent: string[] = []
+  const config = AppConfigSchema.parse({ status: { thoughts: { enabled: true, read_throttle_ms: 0 } } })
+  const manager = new StatusManager({
+    config,
+    log: createLogger('work-status-test'),
+    now: () => 1000,
+    telegramApi: {
+      async sendMessage(_chatId, text) { sent.push(text); return { message_id: 10 } },
+      async editMessageText(_chatId, _messageId, text) { sent.push(text) },
+      async deleteMessage() {},
+    },
+  })
+  const status = new CodexWorkStatus(manager, chatId, config.status, [], () => 1000)
+  status.begin(7)
+  status.receive(delta('Calling the API with Authorization: Bearer\n    '), 'root')
+  status.receive(delta('fold3d.Cred-Value.x9QzLmNoPq\nprogress one\nprogress two '), 'root')
+  await Bun.sleep(20)
+  expect(sent.join('\n')).toContain('progress two')
+  expect(sent.join('\n')).not.toContain('fold3d')
+  expect(sent.join('\n')).not.toContain('x9QzLmNoPq')
+  await status.close()
+})
