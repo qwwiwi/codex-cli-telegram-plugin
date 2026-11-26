@@ -50,7 +50,7 @@ import {
   isTelegramHtmlParseError,
   markdownToTelegramHtml,
 } from '../format/html.js'
-import { splitMessage } from '../format/chunk.js'
+import { plainTextWithLinks, splitMessage, splitPlainMessage } from '../format/chunk.js'
 import { buildRichMessagePayload, contentFitsRichLimits } from '../format/rich.js'
 import type { RichLatch } from '../safety/rich-latch.js'
 import { WidgetPreSendError } from '../safety/pre-send-error.js'
@@ -135,6 +135,19 @@ export interface SendMessageOpts {
   // gets the late result. Consumed by the rate-limited layer; the raw layer
   // copies only Telegram fields, so it never reaches the wire.
   signal?: AbortSignal
+  // The owner's reply (final or interim answer text), not an auxiliary send
+  // (side card, queue notice, HUD card). Replies run on their own per-chat
+  // queue and may use the slots of the minute budget auxiliary sends must
+  // leave free (perChatReplyReserve), so they never wait behind those. Consumed
+  // by the rate-limited layer; the raw layer copies only Telegram fields.
+  ownerReply?: boolean
+  // The send keeps its place in the chat's send queue until it leaves the
+  // process, but does not hold the queue while Telegram answers: the next send
+  // waits only for its own rate-limit capacity. For the context HUD card,
+  // whose order against replies is kept by HudAnchor (replies wait for the
+  // card), so one slow card send never holds the side cards behind it.
+  // Consumed by the rate-limited layer, like `signal`.
+  releaseQueueInFlight?: boolean
 }
 
 export interface EditOpts {
@@ -146,6 +159,11 @@ export interface EditOpts {
   // (commands/oob, channel/tools edit_message) pass no reply_markup and
   // Telegram leaves the existing keyboard untouched.
   reply_markup?: InlineKeyboardLike
+  // Cancels the edit while it still waits for the chat's edit queue or rate
+  // limit (the context HUD drops a refresh that a card move superseded); it
+  // then rejects with SendCancelledError and never reaches Telegram. Consumed
+  // by the rate-limited layer; the raw layer copies only Telegram fields.
+  signal?: AbortSignal
 }
 
 export interface SendDocumentOpts {
@@ -175,6 +193,8 @@ export interface SendFileResult {
 // Options for the rich-message send. Threading only for M1; M3/M4 extend.
 export interface SendRichMessageOpts {
   reply_to_message_id?: number
+  // See SendMessageOpts.ownerReply.
+  ownerReply?: boolean
 }
 
 // Result of a rich send. Either Telegram accepted it (we got a message_id)
@@ -922,7 +942,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           const guestFormat = args.format === 'rich' ? 'html' : args.format
           const body = guestFormat === 'html' ? markdownToTelegramHtml(args.text) : args.text
 
-          const chunks = splitMessage(body)
+          const chunks = guestFormat === 'html' ? splitMessage(body) : splitPlainMessage(body)
           const single = chunks[0]
           if (single === undefined) {
             return toolError(name, 'guest reply rendered to an empty message — nothing to send')
@@ -931,7 +951,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // Plain-text fallback body: the PRE-render text — a parse failure
           // means our markup was bad, and raw <b> tag soup in a public
           // foreign chat reads worse than unrendered markdown.
-          const plainBody = splitMessage(args.text)[0] ?? single
+          const plainBody = splitPlainMessage(args.text)[0] ?? single
           const guestParseMode: AnswerGuestQueryOpts['parse_mode'] | undefined =
             guestFormat === 'html' ? 'HTML' : guestFormat === 'markdownv2' ? 'MarkdownV2' : undefined
 
@@ -1426,7 +1446,8 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
                 const plainOpts: SendMessageOpts = {}
                 if (i === 0 && replyToId !== undefined) plainOpts.reply_to_message_id = replyToId
                 if (threadId !== undefined) plainOpts.message_thread_id = threadId
-                const out = await telegramApi.sendMessage(args.chat_id, chunk, plainOpts)
+                // The text Telegram would have shown: never longer than the chunk's Telegram length.
+                const out = await telegramApi.sendMessage(args.chat_id, plainTextWithLinks(chunk), plainOpts)
                 sentIds.push(out.message_id)
               } else {
                 throw err
@@ -1440,7 +1461,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // chunk.ts' tag-balancing is HTML-specific; for text/markdownv2 we
           // still rely on the same paragraph/line/hard-cut preference order
           // (the tag-balance path is a no-op when no <pre>/<code> tags).
-          const chunks = splitMessage(args.text)
+          const chunks = splitPlainMessage(args.text)
           for (let i = 0; i < chunks.length; i++) {
             const chunkOpts: SendMessageOpts = {}
             if (i === 0 && replyToId !== undefined) chunkOpts.reply_to_message_id = replyToId

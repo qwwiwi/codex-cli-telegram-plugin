@@ -37,6 +37,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 
+import { splitMessage, splitPlainMessage } from '../format/chunk.js'
 import { parse429 } from './rate-limited-telegram-api.js'
 import type { SendMessageOpts } from '../channel/tools.js'
 import type { Logger } from '../log.js'
@@ -53,6 +54,11 @@ export interface OutboxItem {
   /** Send attempts so far (429 reschedules and non-flood failures both bump). */
   attempts: number
   question?: OpenQuestionDetection
+  /**
+   * 2: enqueued by a bridge that masks secrets in the source text before rendering and splitting. An item without
+   * it was saved before: its parts were redacted one by one (see migrateLegacy).
+   */
+  v?: 2
 }
 
 // The re-send primitive — the SAME rate-limited `sendMessage` the reply tool
@@ -78,6 +84,35 @@ export interface OutboxOptions {
   maxAttempts?: number
   /** Override the on-disk filename (tests / diagnostics). Default outbox.json. */
   fileName?: string
+  /**
+   * The outbound redaction (the safe wrapper's, see redactOutboundText) applied to a legacy reply whose parts are
+   * joined on load: a secret cut across two parts is found only in the joined text. Default: no redaction.
+   */
+  redact?: (text: string, parseMode: SendMessageOpts['parse_mode']) => string
+}
+
+// Send options of two parts of one reply: everything but the quote, which only the first part carries.
+function sameSendOptions(a: SendMessageOpts, b: SendMessageOpts): boolean {
+  const { reply_to_message_id: _a, ...left } = a
+  const { reply_to_message_id: _b, ...right } = b
+  // Both come from the same enqueue call site, so their keys are in the same order.
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+const CLOSERS_RE = /(?:<\/[a-zA-Z][\w-]*>)+$/
+const OPENERS_RE = /^(?:<[a-zA-Z][\w-]*(?:\s(?:[^<>"']|"[^"]*"|'[^']*')*)?>)+/
+const TAG_NAME_RE = /<\/?([a-zA-Z][\w-]*)/g
+
+// Joins two consecutive HTML parts of one reply. The chunker closed the tags open at a cut and reopened them on the
+// next part; that seam is removed, so a secret cut inside a <code> span reads as one run of text again.
+function joinParts(left: string, right: string, html: boolean): string {
+  if (!html) return left + right
+  const closers = CLOSERS_RE.exec(left)?.[0] ?? ''
+  const openers = OPENERS_RE.exec(right)?.[0] ?? ''
+  const closed = [...closers.matchAll(TAG_NAME_RE)].map(match => match[1]!.toLowerCase())
+  const reopened = [...openers.matchAll(TAG_NAME_RE)].map(match => match[1]!.toLowerCase())
+  if (closed.length === 0 || closed.join(' ') !== [...reopened].reverse().join(' ')) return left + right
+  return left.slice(0, left.length - closers.length) + right.slice(openers.length)
 }
 
 const DEFAULT_MAX_ITEMS = 200
@@ -93,6 +128,7 @@ export class Outbox {
   private readonly maxItems: number
   private readonly maxAttempts: number
   private readonly filePath: string
+  private readonly redact: NonNullable<OutboxOptions['redact']>
   private items: OutboxItem[] = []
 
   constructor(opts: OutboxOptions) {
@@ -104,6 +140,7 @@ export class Outbox {
     this.maxItems = opts.maxItems ?? DEFAULT_MAX_ITEMS
     this.maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
     this.filePath = join(this.stateDir, opts.fileName ?? DEFAULT_FILE_NAME)
+    this.redact = opts.redact ?? ((text: string): string => text)
     this.load()
   }
 
@@ -119,6 +156,7 @@ export class Outbox {
       opts,
       notBefore: this.now() + wait * 1000,
       attempts: 0,
+      v: 2,
       ...(question ? { question } : {}),
     })
     // Bounded: never grow without limit. Drop the OLDEST (front) so the most
@@ -228,6 +266,65 @@ export class Outbox {
     return this.items.map((it) => ({ ...it }))
   }
 
+  // ── upgrade ────────────────────────────────────────────────────────
+
+  // Items saved before v2 were the parts of a deferred reply, rendered and split before redaction and then redacted
+  // part by part: a secret cut across two parts, or escaped as `&amp;`, was in no single part. Each run of legacy
+  // parts of one reply is joined, redacted as a whole and, only when that masked something, split again. A run
+  // starts at an item carrying a quote or an open question (only a reply's first part does) and never spans a v2
+  // item or different send options. Every item comes out v2, so a restart never rewrites the queue again.
+  private migrateLegacy(items: readonly OutboxItem[]): OutboxItem[] {
+    const runs = new Map<string, OutboxItem[]>()
+    const groups: OutboxItem[][] = []
+    for (const item of items) {
+      if (item.v === 2) {
+        runs.delete(item.chatId)
+        groups.push([item])
+        continue
+      }
+      const run = runs.get(item.chatId)
+      const head = run?.[0]
+      if (run !== undefined && head !== undefined && item.opts.reply_to_message_id === undefined &&
+        item.question === undefined && sameSendOptions(head.opts, item.opts)) {
+        run.push(item)
+        continue
+      }
+      const next = [item]
+      runs.set(item.chatId, next)
+      groups.push(next)
+    }
+    const out: OutboxItem[] = []
+    let rewritten = 0
+    for (const group of groups) {
+      const head = group[0]!
+      if (head.v === 2) {
+        out.push(head)
+        continue
+      }
+      const parseMode = head.opts.parse_mode
+      const joined = group.map(item => item.text).reduce((left, right) => joinParts(left, right, parseMode === 'HTML'))
+      const redacted = this.redact(joined, parseMode)
+      if (redacted === joined) {
+        for (const item of group) out.push({ ...item, v: 2 })
+        continue
+      }
+      rewritten += 1
+      const parts = parseMode === 'HTML' ? splitMessage(redacted) : splitPlainMessage(redacted)
+      const { reply_to_message_id: _quote, ...restOpts } = head.opts
+      const notBefore = Math.max(...group.map(item => item.notBefore))
+      const attempts = Math.max(...group.map(item => item.attempts))
+      parts.forEach((text, index) => {
+        out.push({
+          id: index === 0 ? head.id : randomUUID(), chatId: head.chatId, text,
+          opts: index === 0 ? head.opts : restOpts, notBefore, attempts,
+          ...(index === 0 && head.question ? { question: head.question } : {}), v: 2,
+        })
+      })
+    }
+    if (rewritten > 0) this.log.warn('outbox upgraded legacy replies, redacted across their parts', { replies: rewritten })
+    return out
+  }
+
   // ── persistence ────────────────────────────────────────────────────
 
   private load(): void {
@@ -259,12 +356,17 @@ export class Outbox {
             opts: (e.opts ?? {}) as SendMessageOpts,
             notBefore: e.notBefore,
             attempts: typeof e.attempts === 'number' ? e.attempts : 0,
+            ...(e.v === 2 ? { v: 2 as const } : {}),
             ...(e.question && typeof e.question.code === 'string' && typeof e.question.snippet === 'string'
               ? { question: e.question } : {}),
           })
         }
       }
       this.items = items
+      if (items.some(item => item.v !== 2)) {
+        this.items = this.migrateLegacy(items)
+        this.persist()
+      }
     } catch (err) {
       // Corrupt JSON → start empty rather than crash the process. Log loudly.
       this.log.warn('outbox file corrupt, starting empty', {

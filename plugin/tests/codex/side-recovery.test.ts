@@ -4,11 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Message } from 'grammy/types'
 
-import { frameAgentMessage } from '../../src/codex/agent-webhook.js'
+import { frameAgentMessage, startAgentWebhook, type AgentDelivery } from '../../src/codex/agent-webhook.js'
 import { CodexInbox } from '../../src/codex/inbox.js'
 import { agentProvenance, ownerProvenance } from '../../src/codex/provenance.js'
 import { recoverInterruptedWork, type RecoveryDeps, type RecoveryNotice } from '../../src/codex/side-recovery.js'
 import type { Logger } from '../../src/log.js'
+import { workerBody, workerSender } from '../fixtures/agent-webhook/worker-payload.js'
 
 const OWNER = 42
 const dirs: string[] = []
@@ -145,4 +146,29 @@ test('an unconfirmed agent follow-up whose dead letter cannot be written is kept
   expect(letters).toEqual([{ agent: 'swarm', messageId: -5, stage: 'unconfirmed',
     text: frameAgentMessage('Verify the summary.', 'swarm') }])
   expect(new CodexInbox(dir, OWNER).sideJobs).toEqual([])
+})
+
+test('a lost worker delivery is reported under its real sender, not the recipient agentId', async () => {
+  const delivered: AgentDelivery[] = []
+  const server = startAgentWebhook({ hostname: '127.0.0.1', port: 0, token: 'side-recovery-test-token' },
+    delivery => { delivered.push(delivery); return 'accepted' }, silent)
+  try {
+    const response = await fetch('http://127.0.0.1:' + server.port + '/webhook', {
+      method: 'POST',
+      headers: { authorization: 'Bearer side-recovery-test-token', 'content-type': 'application/json' },
+      body: JSON.stringify(workerBody()),
+    })
+    expect(response.status).toBe(200)
+  } finally {
+    server.stop(true)
+  }
+  const delivery = delivered[0]!
+  const { inbox } = crashedInbox(inbox => {
+    // server.ts keys the provenance on delivery.agentId.
+    inbox.beginFollowUp(message(-5, delivery.input), agentProvenance(delivery.agentId))
+  })
+  const { deps, notices, letters } = failingDeps()
+  await recoverInterruptedWork(inbox, deps)
+  expect(notices[0]!.text.startsWith('Сообщение от агента ' + workerSender + ' (')).toBe(true)
+  expect(letters[0]!.agent).toBe(workerSender)
 })

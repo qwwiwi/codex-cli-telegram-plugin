@@ -331,6 +331,15 @@ export class ContextHud {
   // first to cache/persist the id, then edits it in place. Stored tail is the
   // SETTLED (never-rejecting) promise so a thrown op can't poison the chain.
   private readonly chatLocks = new Map<string, Promise<void>>()
+  // Card moves (bump) called but not started yet, per chat. A refresh queued
+  // before a move is superseded by it (the move renders current content), so
+  // it is skipped instead of holding the move: its edit can wait a long time
+  // for the chat's edit queue and rate limit while the status bubble is busy,
+  // and every reply waits for the move (HudAnchor).
+  private readonly movesPending = new Map<string, number>()
+  // The refresh running now per chat; a move cancels its edit if that edit
+  // has not left the process yet.
+  private readonly refreshing = new Map<string, AbortController>()
 
   constructor(opts: ContextHudOptions) {
     this.api = opts.api
@@ -457,7 +466,12 @@ export class ContextHud {
   // (HudAnchor's hang guard expired; see SendMessageOpts.signal).
   bump(chatId: string, signal?: AbortSignal): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    this.movesPending.set(chatId, (this.movesPending.get(chatId) ?? 0) + 1)
+    this.refreshing.get(chatId)?.abort()
     return this.runSerialized(chatId, async () => {
+      const pending = (this.movesPending.get(chatId) ?? 1) - 1
+      if (pending > 0) this.movesPending.set(chatId, pending)
+      else this.movesPending.delete(chatId)
       try {
         await this.retryLeftovers(chatId)
         const { text, keyboard } = await this.renderCurrent(chatId)
@@ -557,6 +571,10 @@ export class ContextHud {
   updateNow(chatId: string): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     return this.runSerialized(chatId, async () => {
+      // Superseded by a card move queued behind it (see movesPending).
+      if (this.movesPending.has(chatId)) return
+      const cancel = new AbortController()
+      this.refreshing.set(chatId, cancel)
       try {
         if (this.bumpFailed.has(chatId) && this.messageIds.get(chatId) === undefined &&
             this.loadPersisted(chatId) === undefined) return
@@ -564,12 +582,14 @@ export class ContextHud {
         const ensured = await this.ensureMessage(chatId, text, keyboard)
         // No message and send failed → swallow. Freshly created → already current.
         if (ensured === undefined || ensured.created) return
-        await this.edit(chatId, ensured.id, text, keyboard)
+        await this.edit(chatId, ensured.id, text, keyboard, undefined, cancel.signal)
       } catch (err) {
         this.log.warn('context hud updateNow failed (ignored)', {
           chat_id: chatId,
           error: err instanceof Error ? err.message : String(err),
         })
+      } finally {
+        if (this.refreshing.get(chatId) === cancel) this.refreshing.delete(chatId)
       }
     })
   }
@@ -684,6 +704,9 @@ export class ContextHud {
       const sent = await this.api.sendMessage(chatId, text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
+        // A slow card send never holds the chat's other sends (side cards);
+        // replies keep their place below the card through HudAnchor.
+        releaseQueueInFlight: true,
         ...(signal === undefined ? {} : { signal }),
       })
       messageId = sent.message_id
@@ -725,12 +748,15 @@ export class ContextHud {
   // the pin, it only avoids re-editing identical content.
   //
   // `signal` (from bump) cancels the replacement send, like bump's own send.
+  // `editSignal` (from updateNow) cancels the edit itself while it still waits
+  // in the rate limiter: a card move superseded the refresh.
   private async edit(
     chatId: string,
     messageId: number,
     text: string,
     keyboard: InlineKeyboardLike,
     signal?: AbortSignal,
+    editSignal?: AbortSignal,
   ): Promise<void> {
     const fingerprint = this.renderFingerprint(text, keyboard)
     if (this.lastRendered.get(chatId) === fingerprint) return
@@ -738,12 +764,15 @@ export class ContextHud {
       await this.api.editMessageText(chatId, messageId, text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
+        ...(editSignal === undefined ? {} : { signal: editSignal }),
       })
       // Record only on a genuine success — a thrown edit (benign / gone /
       // other) must NOT poison the cache, or a later identical render would be
       // wrongly skipped after a failed send.
       this.lastRendered.set(chatId, fingerprint)
     } catch (err) {
+      // Superseded by a card move before it left the process: nothing to do.
+      if (editSignal?.aborted === true) return
       const cls = classifyEditError(err)
       if (cls.kind === 'benign') return
       if (cls.kind === 'message_gone') {

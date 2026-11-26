@@ -136,7 +136,7 @@ export function sideInstructions(main: RunningSummary, provenance: Provenance): 
     ', идёт ' + minutes(main.elapsedMs) + '.'
   if (provenance.origin === 'agent') {
     // A message from another agent is never presented as the owner's.
-    return [running, task, agentTurnInstructions(provenance.agent),
+    return [running, task, agentTurnInstructions(provenance),
       'Рабочая папка общая: не меняй файлы, которые затрагивает основная задача, не останавливай её и не перезапускай мост.',
     ].join('\n')
   }

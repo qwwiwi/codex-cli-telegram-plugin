@@ -4,12 +4,11 @@ import { dirname, isAbsolute, join, relative } from 'node:path'
 import { Bot } from 'grammy'
 import type { Message } from 'grammy/types'
 import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
-import { carriesExpandableBlockquote, createTelegramApi, type TelegramApi } from '../channel/tools.js'
+import { createTelegramApi, type TelegramApi } from '../channel/tools.js'
 import { getStatePaths, loadConfig, resolveAskGuardMode, resolveHudEnabled, resolveOutboxEnabled, RuntimeEnvSchema } from '../config.js'
-import { splitMessage } from '../format/chunk.js'
+import { plainTextWithLinks, splitMessage } from '../format/chunk.js'
 import { splitLongBlock } from '../format/paragraphs.js'
 import { isTelegramHtmlParseError, markdownToTelegramHtml } from '../format/html.js'
-import { contentFitsRichLimits } from '../format/rich.js'
 import { createLogger } from '../log.js'
 import { MemoryWriter } from '../memory/writer.js'
 import { Outbox, type OutboxOptions } from '../safety/outbox.js'
@@ -18,7 +17,7 @@ import { createOpenQuestionTick } from '../safety/open-question-sweep.js'
 import { createRateLimitedTelegramApi, parse429 } from '../safety/rate-limited-telegram-api.js'
 import { classifySendError, createReliableTelegramApi } from '../safety/reliable-telegram-api.js'
 import { redactSecrets } from '../safety/redact.js'
-import { createSafeTelegramApi } from '../safety/safe-telegram-api.js'
+import { createSafeTelegramApi, redactOutboundText } from '../safety/safe-telegram-api.js'
 import { createRichLatch } from '../safety/rich-latch.js'
 import { ensureStateDirs, writeDeadLetter } from '../state/store.js'
 import { OpenQuestionStore } from '../state/open-question-store.js'
@@ -55,11 +54,11 @@ import { startExternalTasks } from './external.js'
 import { agentWebhookSettings, routeAgentMessage, startAgentWebhook, type AgentDelivery,
   type DeliverOutcome } from './agent-webhook.js'
 import { codexEnvironment, exactSecrets } from './environment.js'
-import { agentBody, agentProvenance, agentTurnInstructions, ownerProvenance, turnIntent,
+import { agentBody, agentLabel, agentProvenance, agentReplyText, agentTurnInstructions, ownerProvenance, turnIntent,
   type Provenance } from './provenance.js'
 import { recoverInterruptedWork } from './side-recovery.js'
 import { deliverGoalFiles, savedGoalAnswer, savedTurnAnswer, shouldRecoverGoal } from './goal-delivery.js'
-import { deliverReplyPart, plannedTextParts, type PartStatus } from './reply-delivery.js'
+import { deliverReplyPart, plannedTextParts, sendsAsRich, type PartStatus } from './reply-delivery.js'
 import {
   BridgeRestart, bridgeRestartDirectInstructions, bridgeRestartInstructions, bridgeRestartReply,
   bridgeRestartVerificationInstructions, ownerRequestedBridgeRestart, restartOwnerText,
@@ -82,6 +81,7 @@ import {
   busyNotice, parallelSettings, queuedNotice, routeWhileBusy, SideRegistry, sideInstructions, taskTitle,
 } from './parallel.js'
 import { SideStatusCard, sideActivityLine, sideFirstStage, sideThinking } from './side-status.js'
+import { QueueNotices } from './queue-notice.js'
 import { hasMedia, prepareInbound, type MediaInput } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { CodexSession } from './session.js'
@@ -164,7 +164,9 @@ async function main(): Promise<void> {
   let onDeferredDelivery: OutboxOptions['onDelivered']
   const outbox = resolveOutboxEnabled(config)
     ? new Outbox({ stateDir: paths.root, sendFn: (id, text, opts) => safeTelegram.sendMessage(id, text, opts),
-      onDelivered: (item, messageId) => onDeferredDelivery?.(item, messageId), log })
+      onDelivered: (item, messageId) => onDeferredDelivery?.(item, messageId), log,
+      // A legacy reply saved part by part is redacted as a whole on load (a secret may be cut across its parts).
+      redact: (text, parseMode) => redactOutboundText(text, parseMode, secrets) })
     : undefined
   let flushing: Promise<void> | undefined
   let outboxTimer: ReturnType<typeof setInterval> | undefined
@@ -596,12 +598,17 @@ async function main(): Promise<void> {
       await hudAnchor.settled()
       await telegram.sendMessage(ownerChat, text, {})
     }
-    // A status line about one owner message (queued): a silent reply to it, so it is no extra ping.
-    const sendStatusReply = async (text: string, replyTo: number): Promise<void> => {
-      await hudAnchor.settled()
-      await withoutDeletedQuote(id => telegram.sendMessage(ownerChat, text,
-        { ...(id === undefined ? {} : { reply_to_message_id: id }), disable_notification: true }), replyTo > 0 ? replyTo : undefined)
-    }
+    // The «В очереди» line about one queued owner message: a silent reply to it, so it is no extra ping. Sent only if
+    // the message still waits once the HUD card landed; on pickup a still-queued send is cancelled through the rate
+    // limiter's signal, a sent one deleted.
+    const queueNotices = new QueueNotices({
+      settled: () => hudAnchor.settled(),
+      isQueued: id => inbox.isQueued(id),
+      send: (text, replyTo, signal) => withoutDeletedQuote(id => telegram.sendMessage(ownerChat, text,
+        { ...(id === undefined ? {} : { reply_to_message_id: id }), disable_notification: true, signal }), replyTo),
+      remove: id => telegram.deleteMessage(ownerChat, id),
+      onError: error => warnError(error, 'Could not remove a queue notice'),
+    })
     let learningRetryAfter = 0
     function runLearning(force = false): void {
       if (!learning || stopping || !force && Date.now() < learningRetryAfter) return
@@ -630,11 +637,13 @@ async function main(): Promise<void> {
 
     async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number,
       onSent?: (id: number) => void): Promise<void> {
-      const normalized = normalizeChatReply(text)
+      // Secrets are masked in the source: HTML rendering escapes `&`, `<`, `>` and quotes past exact matching.
+      const normalized = normalizeChatReply(redactSecrets(text, secrets))
       text = splitLongBlock(normalized)
       if (!text) return
       await hudAnchor.settled()
-      const quote = replyTo === undefined ? {} : { reply_to_message_id: replyTo }
+      // ownerReply: the reply's own send queue and the reserved slots of the minute budget (rate-limited layer).
+      const quote = { ownerReply: true, ...(replyTo === undefined ? {} : { reply_to_message_id: replyTo }) }
       const question = questionConfig.enabled ? detectOpenQuestion(redactSecrets(text, secrets)) : undefined
       async function recordQuestion(messageId: number): Promise<void> {
         if (question) {
@@ -645,14 +654,12 @@ async function main(): Promise<void> {
         else if (questionStore.get(ownerChat)?.code !== 'AQ_CARD') questionStore.clear(ownerChat)
       }
       if (messageId !== undefined) {
-        const richEligible = config.richMessages.enabled && !containsFiles &&
-          !config.richMessages.perChatOptOut.includes(ownerChat) && contentFitsRichLimits(text) &&
-          !carriesExpandableBlockquote(text)
+        const richEligible = sendsAsRich(text, ownerChat, config.richMessages, containsFiles)
         const richState = inbox.replyPart(messageId, 'rich')
         if (richEligible || richState) {
           const result = await deliverReplyPart(richState, state => inbox.setReplyPart(messageId, 'rich', state),
             () => withoutDeletedQuote(id => telegram.sendRichMessage(ownerChat, text,
-              id === undefined ? {} : { reply_to_message_id: id }), replyTo),
+              { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }), replyTo),
             value => !('message_id' in value))
           if (result.value && 'message_id' in result.value) {
             agentChat.remember(result.value.message_id, true, true, true)
@@ -661,16 +668,16 @@ async function main(): Promise<void> {
           if (result.state !== 'fallback') return
         } else inbox.setReplyPart(messageId, 'rich', 'fallback')
         // The saved chunk plan keeps `text:N` receipts pointing at the chunks they were counted for.
-        for (const [index, part] of plannedTextParts(inbox, messageId, normalized).entries()) {
+        for (const [index, part] of plannedTextParts(inbox, messageId, normalized, source => redactSecrets(source, secrets)).entries()) {
           const key = 'text:' + index
           const result = await deliverReplyPart(inbox.replyPart(messageId, key),
             state => inbox.setReplyPart(messageId, key, state),
             () => withoutDeletedQuote(async id => {
-              const options = id === undefined ? {} : { reply_to_message_id: id }
+              const options = { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }
               try { return await telegram.sendMessage(ownerChat, part, { ...options, parse_mode: 'HTML' }) }
               catch (error) {
                 if (!isTelegramHtmlParseError(error)) throw error
-                return telegram.sendMessage(ownerChat, part, options)
+                return telegram.sendMessage(ownerChat, plainTextWithLinks(part), options)
               }
             }, index === 0 ? replyTo : undefined))
           if (result.value) {
@@ -683,8 +690,7 @@ async function main(): Promise<void> {
       let rich
       let retryAfter: number | undefined
       try {
-        if (config.richMessages.enabled && !containsFiles && !config.richMessages.perChatOptOut.includes(ownerChat) &&
-            contentFitsRichLimits(text) && !carriesExpandableBlockquote(text)) {
+        if (sendsAsRich(text, ownerChat, config.richMessages, containsFiles)) {
           rich = await telegram.sendRichMessage(ownerChat, text, quote)
         }
       } catch (error) {
@@ -699,7 +705,7 @@ async function main(): Promise<void> {
         return
       }
       for (const [index, part] of splitMessage(markdownToTelegramHtml(text)).entries()) {
-        const options = { parse_mode: 'HTML' as const, ...(index === 0 ? quote : {}) }
+        const options = { parse_mode: 'HTML' as const, ownerReply: true, ...(index === 0 ? quote : {}) }
         if (retryAfter !== undefined && outbox) {
           outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter, index === 0 ? question : undefined)
           continue
@@ -716,7 +722,8 @@ async function main(): Promise<void> {
             outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter, index === 0 ? question : undefined)
           } else {
             if (!isTelegramHtmlParseError(error)) throw error
-            const sent = await telegram.sendMessage(ownerChat, part, index === 0 ? quote : {})
+            const sent = await telegram.sendMessage(ownerChat, plainTextWithLinks(part),
+              index === 0 ? quote : { ownerReply: true })
             agentChat.remember(sent.message_id, true, true)
             onSent?.(sent.message_id)
             if (index === 0) await recordQuestion(sent.message_id)
@@ -739,13 +746,17 @@ async function main(): Promise<void> {
         log, secrets,
       }),
       reactionPalette,
+      redact: text => redactSecrets(text, secrets),
+      // Interim replies wait for the HUD card like every answer, so they never land above it.
+      beforeReply: (): Promise<void> => hudAnchor.settled(),
       replyPolicy: text => leases.replyPolicy(redactSecrets(text, secrets), resolveAskGuardMode(config, log)),
       root: paths.root,
       sendFile: (path, target) => sendAttachment(telegram, ownerChat, workspace, path, target),
-      sendReply: (text, target) => withoutDeletedQuote(async id => {
-        const quote = id === undefined ? {} : { reply_to_message_id: id }
-        if (config.richMessages.enabled && !config.richMessages.perChatOptOut.includes(ownerChat) &&
-            contentFitsRichLimits(text) && !carriesExpandableBlockquote(text)) {
+      sendReply: (source, target) => withoutDeletedQuote(async id => {
+        // Redacted before rendering: HTML escaping hides a secret holding `&`, `<`, `>` or quotes from exact matching.
+        const text = redactSecrets(source, secrets)
+        const quote = { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }
+        if (sendsAsRich(text, ownerChat, config.richMessages)) {
           const result = await telegram.sendRichMessage(ownerChat, text, quote)
           if ('message_id' in result) return { messageId: result.message_id, rich: true as const }
         }
@@ -844,7 +855,8 @@ async function main(): Promise<void> {
         return
       }
       try {
-        await send(await executeChatAction(actionApi, ownerChat, bot.botInfo.id, action, target, args))
+        await send(await executeChatAction(actionApi, ownerChat, bot.botInfo.id, action, target, args,
+          text => redactSecrets(text, secrets)))
       } catch (error) {
         warnError(error, 'Telegram declined an owner chat action', { area: 'telegram' })
         await send('Telegram отклонил действие с этим сообщением.')
@@ -1425,7 +1437,7 @@ async function main(): Promise<void> {
       // Built when it is sent: if this message was taken meanwhile, it waits for nothing and gets no notice.
       const notice = () => stopping || (message && inbox.active?.messages[0]?.message_id === message.message_id)
         ? undefined : (message && message.message_id > 0
-        ? sendStatusReply(queuedNotice(mainSummary().title), message.message_id)
+        ? queueNotices.notify(message.message_id, queuedNotice(mainSummary().title))
         : send(queuedNotice(mainSummary().title))).catch(() => undefined)
       if (!message || message.message_id <= 0) { void notice(); return }
       void watcher.maybeAutoReply({ chatId: ownerChat, messageId: message.message_id }).then(result => {
@@ -1615,7 +1627,10 @@ async function main(): Promise<void> {
         if (hudReady) hudAnchor.ownerMessage()
         startNext()
         if (inbox.active?.messages[0]?.message_id !== message.message_id) {
-          await sendStatusReply(busyNotice(mainSummary(), sides.titles, parallel.maxParallel), message.message_id)
+          // Not awaited: the notice waits for the HUD card and the send queue, and Telegram updates are handled one
+          // after another, so awaiting it here would hold the routing (and card) of the owner's next message.
+          void queueNotices.notify(message.message_id, busyNotice(mainSummary(), sides.titles, parallel.maxParallel))
+            .catch((error: unknown) => warnError(error, 'Could not send a queue notice', { messageId: message.message_id }))
         }
       } catch (error) {
         warnError(error, 'Could not queue an owner message', { messageId: message.message_id })
@@ -1881,10 +1896,13 @@ async function main(): Promise<void> {
     // A message from another agent: one restricted turn (workspace-write, no approvals) and a plain reply
     // to the owner. No owner-intent classifiers, pending owner task, goal continuation, lease, learning,
     // memory, bridge restart, question cards, chat actions or attachments.
-    async function runAgentTurn(first: Message, text: string, agent: string, epoch: number): Promise<void> {
+    async function runAgentTurn(first: Message, text: string, sender: { agent: string; verified?: boolean },
+      epoch: number): Promise<void> {
       const id = first.message_id
+      // A sender name only the message text claims stays marked wherever it is shown.
+      const agent = agentLabel(sender)
       inbox.start(id)
-      const result = await codex.run([agentTurnInstructions(agent), text].join('\n\n'), [], turnId => {
+      const result = await codex.run([agentTurnInstructions(sender), text].join('\n\n'), [], turnId => {
         try { inbox.assignTurn(id, turnId) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
       }, { untrusted: true })
       if (stopping) return
@@ -1895,7 +1913,7 @@ async function main(): Promise<void> {
         return
       }
       const reply = hideQuestionMarker(hideContinuationMarker(hideLeaseCompletions(result.text)))
-      inbox.complete(id, { text: redactSecrets('Ответ на сообщение агента ' + agent + ':\n\n' + reply, secrets), files: [] })
+      inbox.complete(id, { text: redactSecrets(agentReplyText(sender, reply), secrets), files: [] })
       await finishOrdinaryReply(epoch)
       log.info('Codex answered an agent message', { agent })
     }
@@ -1964,6 +1982,8 @@ async function main(): Promise<void> {
         if (selfRestartEnabled) void bridgeRestart.check()
         return
       }
+      // The message waits for nothing now: its «В очереди» notice goes away.
+      for (const taken of messages) void queueNotices.pickedUp(taken.message_id)
       const epoch = stopEpoch
       work.begin(first.message_id > 0 ? first.message_id : undefined)
       mainStartedAt = Date.now()
@@ -1997,7 +2017,7 @@ async function main(): Promise<void> {
           }
           const sender = inbox.provenance(first.message_id)
           if (sender.origin === 'agent') {
-            await runAgentTurn(first, input.text, sender.agent, epoch)
+            await runAgentTurn(first, input.text, sender, epoch)
             return
           }
           const editTarget = first.text && first.reply_to_message && !first.forward_origin &&
@@ -2117,7 +2137,8 @@ async function main(): Promise<void> {
           await recordMemory(codex.currentThread, input.text, reply.text, Date.now() - began)
           if (reply.text && editTarget) {
             try {
-              await send(await executeChatAction(actionApi, ownerChat, bot.botInfo.id, 'edit', editTarget, reply.text))
+              await send(await executeChatAction(actionApi, ownerChat, bot.botInfo.id, 'edit', editTarget, reply.text,
+                text => redactSecrets(text, secrets)))
             } catch { await send('Telegram отклонил изменение сообщения.') }
             inbox.finish(first.message_id)
             return
@@ -2305,7 +2326,7 @@ async function main(): Promise<void> {
         chat: { id: Number(ownerChat), type: 'private', first_name: 'Telegram' },
         from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
       }
-      const provenance = agentProvenance(delivery.agentId)
+      const provenance = agentProvenance(delivery.agentId, delivery.senderVerified)
       const notify = () => { void send(redactSecrets(delivery.notice, secrets)).catch((error: unknown) => warnError(error, 'Could not notify the owner about an agent message')) }
       const busy = !!task || goalActive || codex.isRunning
       const route = routeAgentMessage(delivery.input, { busy, parallel, sides })

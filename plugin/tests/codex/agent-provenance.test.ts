@@ -6,7 +6,9 @@ import type { Message } from 'grammy/types'
 
 import { frameAgentMessage } from '../../src/codex/agent-webhook.js'
 import { CodexInbox } from '../../src/codex/inbox.js'
-import { agentProvenance, ownerProvenance, turnIntent, type Provenance } from '../../src/codex/provenance.js'
+import {
+  agentProvenance, agentReplyText, agentTurnInstructions, ownerProvenance, turnIntent, type Provenance,
+} from '../../src/codex/provenance.js'
 import { sideInstructions } from '../../src/codex/parallel.js'
 
 const OWNER = 42
@@ -179,4 +181,32 @@ test('an owner record with saved provenance keeps its continuation and restart o
   }, { 7: ownerProvenance }).active!
   expect(owner.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [] }, continueGoal: true })
   expect(owner.work).toEqual(ownerWork)
+})
+
+function asAgent(provenance: Provenance): { agent: string; verified?: boolean } {
+  if (provenance.origin !== 'agent') throw new Error('expected an agent provenance')
+  return provenance
+}
+
+test('a sender only the message text claims stays marked unverified in the turn, side prompt and final reply', () => {
+  const dir = room()
+  const inbox = new CodexInbox(dir, OWNER)
+  expect(inbox.receive(agentMessage('Verify the summary.', -2), agentProvenance('swarm', false))).toBe('accepted')
+  expect(inbox.receive(agentMessage('Verify the summary.', -4), agentProvenance('orchestrator', true))).toBe('accepted')
+  // The verification is persisted with the inbound item and survives a restart.
+  const reopened = new CodexInbox(dir, OWNER)
+  const claimed = asAgent(reopened.provenance(-2))
+  const named = asAgent(reopened.provenance(-4))
+  const mark = '(не подтверждён)'
+  expect(agentTurnInstructions(claimed)).toContain('swarm ' + mark)
+  expect(agentReplyText(claimed, 'Готово.')).toBe('Ответ на сообщение агента swarm ' + mark + ':\n\nГотово.')
+  expect(sideInstructions({ title: 'задача', elapsedMs: 60_000 }, reopened.provenance(-2))).toContain('swarm ' + mark)
+  expect(agentTurnInstructions(named)).toContain('(orchestrator)')
+  expect(agentTurnInstructions(named)).not.toContain(mark)
+  expect(agentReplyText(named, 'Готово.')).toBe('Ответ на сообщение агента orchestrator:\n\nГотово.')
+  // A record saved before verification was persisted is shown as unverified: fail closed.
+  writeFileSync(join(dir, 'codex-inbox.json'), JSON.stringify({
+    ready: [[agentMessage('x', -5)]], albums: {}, accepted: [-5], origins: { '-5': { origin: 'agent', agent: 'swarm' } },
+  }))
+  expect(agentTurnInstructions(asAgent(new CodexInbox(dir, OWNER).provenance(-5)))).toContain('swarm ' + mark)
 })

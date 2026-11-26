@@ -3,8 +3,8 @@
 // Telegram's `parse_mode=HTML` accepts a fixed allowlist of tags. Anything
 // outside that set produces a 400 Bad Request and drops the message. Rather
 // than discover this at runtime, we pre-validate every outgoing HTML body.
-// If the body is invalid, we DOWNGRADE: strip all tags, escape the body
-// with the canonical `escapeHtml`, return a plain-text reply that ships
+// If the body is invalid, we DOWNGRADE: return the text Telegram would show
+// (supported tags dropped, entities decoded) as a plain-text reply that ships
 // without parse_mode. Better a missing <b> than a missing answer.
 //
 // This module is deliberately conservative — the cost of a false downgrade
@@ -14,7 +14,7 @@
 // NEVER throws. Pathological inputs (`<<<>>>`, unterminated `<a href="…`)
 // always return a `ValidatedHtml`. Empty input is valid.
 
-import { escapeHtml } from '../format/html.js'
+import { plainTextWithLinks, TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // Allowlist. Source of truth: https://core.telegram.org/bots/api#html-style.
@@ -269,21 +269,16 @@ function extractHref(attrsRaw: string): string | null {
 }
 
 function downgrade(input: string, reason: string): ValidatedHtml {
-  // Escape the ORIGINAL input wholesale rather than stripping tags first.
-  // Rationale:
-  //   1. The user/agent intent is preserved — the receiver sees the literal
-  //      `<script>alert(1)</script>` text and can spot the mis-attempted
-  //      formatting instead of getting a silently-edited body.
-  //   2. Escape-only is a single, predictable transform: every `<`, `>`,
-  //      `&`, `"` becomes its entity form. No tag-stripping edge cases
-  //      (nested tags, malformed brackets) can leak through.
-  //   3. For unsafe-href downgrade specifically, the link text and href
-  //      both land as escaped text — operator sees the suspicious URL
-  //      rather than losing all context.
-  // The downgrade is meant to ship plain text via Telegram WITHOUT
-  // parse_mode, so escaping ensures no entity is re-interpreted later.
+  // The plain text Telegram would have shown: supported tags dropped, the
+  // entities it decodes decoded, anything else (`<script>`, a stray `<`) kept
+  // literally. Link destinations stay after their text («text (url)») while
+  // the result fits Telegram's limit, so a part the chunker fitted to the
+  // limit still fits once downgraded. It ships WITHOUT parse_mode, so nothing
+  // is re-interpreted. (Escaping the input instead turned a bold span of 900
+  // `&amp;` into a 7,206-character part that Telegram refused, and showed the
+  // owner `&amp;` for every `&`.)
   return {
-    text: escapeHtml(input),
+    text: plainTextWithLinks(input, TELEGRAM_MAX_MESSAGE),
     downgraded: true,
     reason,
   }

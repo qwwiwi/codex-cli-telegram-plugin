@@ -239,3 +239,21 @@ test('[R88] quoted credential values, every cookie and a Digest header are maske
     'model claude-sonnet-4-5-20250929 not found'
   expect(maskDiagnostic(kept)).toBe(kept)
 })
+
+test('[R88] numeric and upper-case credential values are masked; only known diagnostic names keep a number or code', () => {
+  const masked = maskDiagnostic('x-api-key: 1234567890; X-Api-Key: ABCDEFGHIJ; api_key=987654; password: HUNTER; ' +
+    'body {"api_key": 24681357, "token":13579, "max_tokens": 4096}')
+  for (const leak of ['1234567890', 'ABCDEFGHIJ', '987654', 'HUNTER', '24681357', '13579']) expect(masked).not.toContain(leak)
+  expect(masked).toContain('"api_key": [REDACTED]')
+  expect(masked).toContain('"max_tokens": 4096')
+  const kept = 'max_tokens: 5000; max_output_tokens=8192; session: ENOENT; {"max_tokens":4096,"total_tokens":12}'
+  expect(maskDiagnostic(kept)).toBe(kept)
+})
+
+test('[R88] a quoted JSON value under a diagnostic name is masked; only the unquoted form keeps a code or count', () => {
+  const masked = maskDiagnostic('upstream said {"session": "ZQXWVUTSRQ", \'session\':\'PLMOKNIJ\', "max_tokens": "77553311"}')
+  for (const leak of ['ZQXWVUTSRQ', 'PLMOKNIJ', '77553311']) expect(masked).not.toContain(leak)
+  expect(masked).toContain('{"session": "[REDACTED]"')
+  const kept = 'session: ENOENT; session=EACCES; {"max_tokens": 4096}'
+  expect(maskDiagnostic(kept)).toBe(kept)
+})

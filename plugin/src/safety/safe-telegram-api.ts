@@ -33,6 +33,7 @@ import type {
   SendWidgetParams,
   TelegramApi,
 } from '../channel/tools.js'
+import { escapeHtml, escapeHtmlAttr } from '../format/html.js'
 import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
 import { richErrorClass } from '../format/rich.js'
@@ -115,18 +116,37 @@ function redactReplyMarkup(
  *                      (the layered chain then uses the HTML path) so a
  *                      mis-wired build degrades safely instead of crashing.
  */
+/** Each secret as written and in the escaped forms it takes in rendered Telegram HTML. */
+function htmlSecretForms(secrets: ReadonlyArray<string>): string[] {
+  return [...new Set(secrets.flatMap(secret => [secret, escapeHtml(secret), escapeHtmlAttr(secret),
+    // The Markdown renderer escapes only the three characters Telegram requires.
+    secret.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')]))]
+}
+
+/**
+ * The redaction the safe wrapper applies to one outbound text: every pattern rule plus the exact secrets, in their
+ * escaped HTML forms too when the text is HTML.
+ */
+export function redactOutboundText(text: string, parseMode: 'MarkdownV2' | 'HTML' | undefined,
+  secrets: ReadonlyArray<string>): string {
+  return redactSecrets(text, parseMode === 'HTML' ? htmlSecretForms(secrets) : secrets)
+}
+
 export function createSafeTelegramApi(
   raw: TelegramApi,
   log: Logger,
   extraSecrets?: ReadonlyArray<string>,
   richLatch?: RichLatch,
 ): TelegramApi {
+  const htmlSecrets = extraSecrets === undefined ? undefined : htmlSecretForms(extraSecrets)
   const sanitize = (
     text: string,
     parseMode: 'MarkdownV2' | 'HTML' | undefined,
   ): { text: string; parseMode: 'MarkdownV2' | 'HTML' | undefined } => {
-    // Redact first — secrets must be stripped regardless of parse mode.
-    const redacted = redactSecrets(text, extraSecrets)
+    // Redact first — secrets must be stripped regardless of parse mode. HTML text
+    // carries a secret in its escaped form (`&` as `&amp;`), so those forms are
+    // masked too; callers still redact the source before rendering.
+    const redacted = redactSecrets(text, parseMode === 'HTML' ? htmlSecrets : extraSecrets)
     if (parseMode !== 'HTML') {
       return { text: redacted, parseMode }
     }
@@ -137,7 +157,8 @@ export function createSafeTelegramApi(
       // ctx — even after redaction it may carry sensitive context the
       // caller didn't whitelist.
       log.warn('telegram html downgrade', { reason: validated.reason ?? 'unknown' })
-      return { text: validated.text, parseMode: undefined }
+      // Decoding entities could reassemble a secret written as numeric entities.
+      return { text: redactSecrets(validated.text, extraSecrets), parseMode: undefined }
     }
     return { text: validated.text, parseMode }
   }

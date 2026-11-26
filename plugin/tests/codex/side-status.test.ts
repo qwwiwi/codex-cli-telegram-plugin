@@ -105,3 +105,64 @@ test('[R94] the card still appears without the quote when the owner deleted the 
   await card.close()
   expect(calls).toEqual([{ op: 'send', text: sideThinking, opts: { disable_notification: true } }, { op: 'delete', id: 5 }])
 })
+
+// A card whose first edit hangs until `release()`; every edit start is recorded with its text.
+function heldTelegram() {
+  const calls: Call[] = []
+  let release: () => void = () => undefined
+  const held = new Promise<void>(resolve => { release = resolve })
+  let edits = 0
+  return {
+    calls,
+    release: () => release(),
+    api: {
+      async sendMessage(_chat: string, text: string, opts: Record<string, unknown>) {
+        calls.push({ op: 'send' as const, text, opts })
+        return { message_id: 300 }
+      },
+      async editMessageText(_chat: string, id: number, text: string) {
+        calls.push({ op: 'edit' as const, id, text })
+        if (++edits === 1) await held
+      },
+      async deleteMessage(_chat: string, id: number) { calls.push({ op: 'delete' as const, id }) },
+    },
+  }
+}
+
+test('[R94] a slow edit holds one newest pending line, and closing drops it instead of a burst of stale edits', async () => {
+  const { api, calls, release } = heldTelegram()
+  const card = new SideStatusCard(api, '1', 81, { editIntervalMs: 10 })
+  card.show(sideThinking)
+  await wait(0)
+  card.show(sideThinking + '\nшаг 0')
+  await wait(25)
+  // The first edit hangs; five newer lines arrive, each later than the throttle.
+  for (let step = 1; step <= 5; step++) {
+    card.show(sideThinking + '\nшаг ' + step)
+    await wait(25)
+  }
+  expect(calls.filter(call => call.op === 'edit')).toHaveLength(1)
+  const closing = card.close()
+  release()
+  await closing
+  expect(calls.map(call => call.op)).toEqual(['send', 'edit', 'delete'])
+})
+
+test('[R94] after a slow edit lands, only the newest pending line is edited in', async () => {
+  const { api, calls, release } = heldTelegram()
+  const card = new SideStatusCard(api, '1', 82, { editIntervalMs: 10 })
+  card.show(sideThinking)
+  await wait(0)
+  card.show(sideThinking + '\nшаг 0')
+  await wait(25)
+  for (let step = 1; step <= 5; step++) {
+    card.show(sideThinking + '\nшаг ' + step)
+    await wait(25)
+  }
+  release()
+  await wait(40)
+  const edits = calls.filter(call => call.op === 'edit')
+  expect(edits.map(edit => edit.text)).toEqual([sideThinking + '\nшаг 0', sideThinking + '\nшаг 5'])
+  await card.close()
+  expect(calls.at(-1)).toEqual({ op: 'delete', id: 300 })
+})

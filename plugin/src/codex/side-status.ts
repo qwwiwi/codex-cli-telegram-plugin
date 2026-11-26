@@ -53,7 +53,7 @@ export class SideStatusCard {
   private shown = ''
   private messageId: number | undefined
   private sending: Promise<void> | undefined
-  private editing: Promise<void> = Promise.resolve()
+  private editing: Promise<void> | undefined
   private timer: ReturnType<typeof setTimeout> | undefined
   private lastEdit = 0
   private closed = false
@@ -114,18 +114,27 @@ export class SideStatusCard {
     const delay = Math.max(0, this.lastEdit + this.editIntervalMs - Date.now())
     this.timer = setTimeout(() => {
       this.timer = undefined
-      if (this.closed || this.messageId === undefined || this.text === this.shown) return
-      const text = this.text
-      const id = this.messageId
-      this.lastEdit = Date.now()
-      this.editing = this.editing.then(async () => {
-        try {
-          await this.api.editMessageText(this.chat, id, text, {})
-          this.shown = text
-        } catch (error) {
-          this.options.onError?.(error, 'Could not update a parallel turn status card')
-        }
-      })
+      this.startEdit()
     }, delay)
+  }
+
+  // One edit in flight at most; `this.text` is the one pending value. A line that arrives during a slow edit waits
+  // for it, and only the newest one is edited in afterwards; once the card is closed nothing pending is sent.
+  private startEdit(): void {
+    if (this.editing || this.closed || this.messageId === undefined || this.text === this.shown) return
+    const text = this.text
+    const id = this.messageId
+    this.lastEdit = Date.now()
+    this.editing = (async () => {
+      try {
+        await this.api.editMessageText(this.chat, id, text, {})
+        this.shown = text
+      } catch (error) {
+        this.options.onError?.(error, 'Could not update a parallel turn status card')
+      } finally {
+        this.editing = undefined
+        if (!this.closed && this.text !== text) this.scheduleEdit()
+      }
+    })()
   }
 }

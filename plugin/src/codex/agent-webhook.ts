@@ -15,7 +15,7 @@ import { z } from 'zod'
 import type { Logger } from '../log.js'
 import { bearerEquals } from '../webhook/http.js'
 import { routeWhileBusy, type ParallelSettings, type SideRegistry } from './parallel.js'
-import { agentFramePrefix } from './provenance.js'
+import { agentFramePrefix, unverifiedSenderMark } from './provenance.js'
 
 export const AGENT_WEBHOOK_BODY_LIMIT = 64 * 1024
 const rememberedDeliveries = 500
@@ -38,7 +38,10 @@ export interface AgentDelivery {
   input: string
   /** Short owner-facing Telegram notice. */
   notice: string
+  /** Display-safe name of the sender (see agentSender), not the body agentId. */
   agentId: string
+  /** The sender came from fromAgent or X-From-Agent, not only from the message text. */
+  senderVerified: boolean
   deliveryId?: string
 }
 
@@ -50,7 +53,9 @@ const payloadSchema = z.object({
   message: z.string().refine(text => text.trim().length > 0, 'empty message'),
   // Routing always goes to the owner's chat; chatId is accepted and ignored.
   chatId: z.union([z.number(), z.string()]).optional(),
+  // The gbrain worker sends the RECIPIENT here (or nothing); never the sender.
   agentId: z.string().max(256).optional(),
+  fromAgent: z.string().max(256).optional(),
 })
 
 const deliveryIdPattern = /^[\w.:@/+=-]{1,200}$/u
@@ -78,20 +83,86 @@ function normalizeIp(address: string): string {
   return trimmed.startsWith('::ffff:') && trimmed.includes('.') ? trimmed.slice(7) : trimmed
 }
 
+function safeAgentName(name: string | null | undefined): string {
+  return (name ?? '').replace(/[^\p{L}\p{N}_.@-]+/gu, '_').replace(/^_+|_+$/gu, '').slice(0, 64)
+}
+
 /** A display-safe agent name: one line, no brackets, bounded length. */
-export function agentName(agentId: string | undefined): string {
-  const safe = (agentId ?? '').replace(/[^\p{L}\p{N}_.@-]+/gu, '_').replace(/^_+|_+$/gu, '').slice(0, 64)
-  return safe || 'unknown'
+export function agentName(name: string | null | undefined): string {
+  return safeAgentName(name) || 'unknown'
 }
 
-/** Frames an agent message as untrusted data for Codex. */
-export function frameAgentMessage(message: string, agentId?: string): string {
-  return agentFramePrefix + agentName(agentId) +
-    '; the owner did not write this]\n\n' + message
+// The gbrain worker's header line; trusted only at the very start of the message.
+const workerHeaderPattern = /^\[Inter-agent от ([^\s\]]+) → [^\s\]]+\]/u
+
+export interface SenderSource {
+  /** Body field fromAgent, set by the worker from the authenticated outbox row. */
+  fromAgent?: string | undefined
+  /** X-From-Agent request header. */
+  fromHeader?: string | null | undefined
+  message: string
 }
 
-function ownerNotice(message: string, agentId: string | undefined): string {
-  return 'Сообщение от агента ' + agentName(agentId) + ': ' + Array.from(message.trim()).slice(0, noticeChars).join('')
+export interface AgentSender {
+  /** Display-safe name, 'unknown' when nothing names the sender. */
+  name: string
+  /** True only for a name from fromAgent or X-From-Agent, which the authenticated worker sets. */
+  verified: boolean
+}
+
+/**
+ * The display-safe sender of a delivery: fromAgent, else X-From-Agent (both
+ * verified), else the worker header line at position 0 (a claim in the text
+ * any authenticated caller can write: unverified), else 'unknown'. The body
+ * agentId names the recipient and is never used.
+ */
+export function agentSender(source: SenderSource): AgentSender {
+  for (const candidate of [source.fromAgent, source.fromHeader]) {
+    const name = safeAgentName(candidate)
+    if (name) return { name, verified: true }
+  }
+  const claimed = safeAgentName(workerHeaderPattern.exec(source.message)?.[1])
+  return { name: claimed || 'unknown', verified: false }
+}
+
+// How the sender is shown to the owner and to Codex: a name only the message text claims carries a mark.
+function senderLabel(name: string | undefined, verified: boolean): string {
+  const safe = agentName(name)
+  return verified || safe === 'unknown' ? safe : safe + unverifiedSenderMark
+}
+
+// The worker appends its delivery steps after a --- separator; the last such
+// block is the worker's, earlier look-alikes stay the sender's words. The
+// header may carry a variant note, e.g. "ПОРЯДОК ДЕЙСТВИЙ (ack-only fast path, …):".
+const protocolStartPattern = /^---[ \t]*\r?\n(?:[ \t]*\r?\n)*(?=ПОРЯДОК ДЕЙСТВИЙ(?: \([^)\n]*\))?:[ \t]*\r?$)/gmu
+const protocolLabel = '[протокол доставки gbrain (служебный, не просьба отправителя)]\n'
+
+/** Labels the worker's delivery protocol block so Codex does not read it as the sender's request. */
+function labelDeliveryProtocol(message: string): string {
+  let start: number | undefined
+  for (const match of message.matchAll(protocolStartPattern)) start = match.index + match[0].length
+  return start === undefined ? message : message.slice(0, start) + protocolLabel + message.slice(start)
+}
+
+export interface FrameOptions {
+  /** The sender name came from fromAgent or X-From-Agent; otherwise it is shown as unverified. Default true. */
+  verified?: boolean
+  /** The body carries fromAgent, so the trailing protocol block is the worker's. Default false. */
+  workerProtocol?: boolean
+}
+
+/**
+ * Frames an agent message as untrusted data for Codex; sender is the resolved sender name. The gbrain protocol
+ * label is applied only for a delivery of the authenticated worker: any other caller can write that block itself.
+ */
+export function frameAgentMessage(message: string, sender?: string, options: FrameOptions = {}): string {
+  return agentFramePrefix + senderLabel(sender, options.verified ?? true) +
+    '; the owner did not write this]\n\n' + (options.workerProtocol === true ? labelDeliveryProtocol(message) : message)
+}
+
+function ownerNotice(message: string, sender: AgentSender): string {
+  return 'Сообщение от агента ' + senderLabel(sender.name, sender.verified) + ': ' +
+    Array.from(message.trim()).slice(0, noticeChars).join('')
 }
 
 /**
@@ -188,11 +259,15 @@ export function startAgentWebhook(settings: AgentWebhookSettings,
         if (pending.has(deliveryId)) return json(503, { ok: false, error: 'delivery in progress' })
         pending.add(deliveryId)
       }
-      const { message, agentId } = parsed.data
-      const name = agentName(agentId)
+      const { message, fromAgent } = parsed.data
+      const sender = agentSender({ fromAgent, fromHeader: request.headers.get('x-from-agent'), message })
+      const name = sender.name
+      // fromAgent is set by the worker from the authenticated outbox row: only then is the protocol block its own.
+      const workerProtocol = safeAgentName(fromAgent) !== ''
       try {
         const outcome = await deliver({
-          input: frameAgentMessage(message, agentId), notice: ownerNotice(message, agentId), agentId: name,
+          input: frameAgentMessage(message, name, { verified: sender.verified, workerProtocol }),
+          notice: ownerNotice(message, sender), agentId: name, senderVerified: sender.verified,
           ...(deliveryId !== undefined ? { deliveryId } : {}),
         })
         if (outcome === 'full' || outcome === 'stopping') {

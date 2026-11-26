@@ -501,3 +501,36 @@ test('[R85] a widget Telegram refuses is logged at warn with its error code and 
   // The rendered widget never reaches the log.
   expect(logged).not.toContain('<')
 })
+
+test('[R13] a diagram the widget refuses reaches the owner as a numbered flow, never node kinds or index pairs', async () => {
+  // The live payload: a flowchart with return edges (3→2, 4→2, 2→1), which the flowchart pack rejects as cyclic.
+  const labels = ['Ты пишешь боту', 'Плагин на сервере', 'Codex ведёт задачу', 'Модель OpenAI', 'Файлы и команды', 'Ответ в Telegram']
+  const data = {
+    title: 'Как Тиранда отвечает в Telegram',
+    nodes: labels.map(label => ({ label, kind: 'step' })),
+    edges: [[0, 1], [1, 2], [2, 3], [3, 2], [2, 4], [4, 2], [2, 1], [1, 5]].map(([source, target]) => ({ source, target })),
+  }
+  const { actions, calls } = bridge()
+  const result = await actions.component('flow', 'send_component', { component: 'flowchart', data }, () => true)
+  expect(parsed(result)).toMatchObject({ ok: true, delivery: 'text' })
+  expect(calls.map(call => call[0])).toEqual(['text'])
+  expect(calls[0]![2]).toBe([
+    'Как Тиранда отвечает в Telegram',
+    '1. Ты пишешь боту → Плагин на сервере',
+    '2. Плагин на сервере → Codex ведёт задачу, Ответ в Telegram',
+    '3. Codex ведёт задачу → Модель OpenAI, Файлы и команды, Плагин на сервере',
+    '4. Модель OpenAI → Codex ведёт задачу',
+    '5. Файлы и команды → Codex ведёт задачу',
+    '6. Ответ в Telegram',
+  ].join('\n'))
+  // A plain chain in node order reads as numbered steps; edge labels of an architecture graph stay with their arrow.
+  const chain = { title: 'Путь', nodes: labels.slice(0, 3).map(label => ({ label, kind: 'step' })),
+    edges: [{ source: 0, target: 1 }, { source: 1, target: 2 }] }
+  expect(componentFallbackText('flowchart', chain, undefined, text => text))
+    .toBe('Путь\n1. Ты пишешь боту\n2. Плагин на сервере\n3. Codex ведёт задачу')
+  expect(componentFallbackText('architecture', pack('architecture', 'example.json') as Record<string, unknown>, undefined,
+    text => text)).not.toMatch(/^\d+ \d+$|→ \d/mu)
+  // The model is told why a flowchart with return edges is refused and what to use instead.
+  expect(componentInstructions).toContain('flowchart')
+  expect(componentInstructions).toContain('без возвратов')
+})

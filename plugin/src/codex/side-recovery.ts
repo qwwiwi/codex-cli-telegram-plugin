@@ -12,7 +12,7 @@ import type { Message } from 'grammy/types'
 import type { Logger } from '../log.js'
 import type { CodexInbox } from './inbox.js'
 import { taskTitle } from './parallel.js'
-import { agentBody } from './provenance.js'
+import { agentBody, agentLabel } from './provenance.js'
 
 export interface RecoveryNotice {
   text: string
@@ -58,7 +58,7 @@ async function settle(inbox: CodexInbox, message: Message, stage: 'unconfirmed' 
       kept = false
       deps.log.warn('Could not keep a lost agent message; its record stays for the next recovery')
     }
-    const what = 'Сообщение от агента ' + provenance.agent + ' («' + taskTitle(agentBody(message.text)) + '»)'
+    const what = 'Сообщение от агента ' + agentLabel(provenance) + ' («' + taskTitle(agentBody(message.text)) + '»)'
     const where = kept ? ' Текст сохранён в журнале недоставленных.'
       : ' Сохранить текст в журнал недоставленных не удалось, запись оставлена до следующего перезапуска.'
     text = (stage === 'unconfirmed'

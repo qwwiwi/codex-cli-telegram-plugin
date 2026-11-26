@@ -3,6 +3,41 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
+## v0.3.1.1
+
+Fix release on top of v0.3.1. Release notes: [docs/releases/v0.3.1.1.md](docs/releases/v0.3.1.1.md).
+
+### Fixed
+
+- Paragraphs are preserved in long replies. Plain prose goes as Telegram HTML with the
+  empty line between paragraphs kept; a Rich Message is used only for Markdown that only
+  Telegram renders (a table, math, a task list, `<details>`, a footnote). Long HTML
+  replies are split on tag and entity boundaries within Telegram's parsed length, and
+  owner-requested edits are rendered as HTML too.
+- Inter-agent messages show their real sender, marked verified or unverified. The sender
+  comes from `fromAgent` or the `X-From-Agent` header (verified), else from a leading
+  `[Inter-agent от <sender> → <recipient>]` line (shown as «не подтверждён»,
+  unverified), else `unknown`; `agentId` is no longer used for display. The
+  verification survives restarts and is carried into the Codex turn, the side prompt,
+  the recovery notice and the final reply.
+- Parallel replies without false "parallel stream" errors: replies no longer stall behind
+  status edits and the HUD card. Owner replies get their own send queue and reserved
+  slots of the per-chat minute budget, status edits leave room for sends, the HUD card
+  move skips stale refreshes, and a queue notice is sent only to a message that still
+  waits and is cancelled on pickup.
+- Secrets are redacted in the source text before HTML rendering on the reply and edit
+  paths, and in queued and replayed messages: saved reply parts from an older outbox are
+  joined, redacted and re-split on load, so a secret cut across two parts is masked
+  before replay.
+- Link-preserving fallback: when Telegram refuses a part's HTML, the plain-text fallback
+  keeps link destinations after their text («text (url)») while the part fits Telegram's
+  limit, instead of escaping the whole HTML.
+- A refused diagram is sent as a numbered flow instead of raw node kinds and index pairs.
+
+### Known limitations
+
+- See [issue #7](https://github.com/qwwiwi/codex-cli-telegram-plugin/issues/7).
+
 ## v0.1.0 – 2026-11-26
 
 First public release.
