@@ -82,6 +82,7 @@ Manual setup on Ubuntu or Debian: [plugin/docs/quickstart.md](plugin/docs/quicks
 - One owner, one private chat; everything else is ignored.
 - Text, voice (transcribed), photos, documents, albums, forwards and replies with quoted context.
 - A live status message while Codex works, moved below new messages so it stays visible.
+- What the agent is thinking: the status message streams the latest line of Codex's reasoning summary instead of a static `reasoning...` (on for a new install; `TELEGRAM_STATUS_THOUGHTS=0` turns it off).
 - `/mirror on` shows a compact live feed of commands Codex runs.
 - Approval cards for commands, file changes and MCP tool calls; question cards when Codex asks you to choose.
 - `/goal` for long tasks with a completion criterion; unfinished tasks continue in the next turn.
@@ -128,6 +129,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 - **Never root.** The bridge exits when started as root, and the installer refuses to run as root. Run it under a dedicated unprivileged OS user that has no access to your other data.
 - **Secrets stay out of Codex.** Codex gets only an allowlist of environment variables (`PATH`, `HOME`, locale, `CODEX_HOME`, `GH_CONFIG_DIR` and a few system ones). The bot token and the Groq key are not passed and are redacted from logs and messages.
 - **State outside the workspace.** The state directory must be outside the Codex workspace, so Codex cannot edit the bridge's own files.
+- **Thoughts are redacted.** The reasoning lines in the status message pass the same redaction as tool lines: configured secrets, tokens, keys and similar values are masked, and a word still being streamed is held back until it is complete, so half a secret never shows. They live only in that transient message, which is deleted when the turn ends.
 
 Approval modes:
 
@@ -153,7 +155,7 @@ Side conversations do not touch the main conversation, the HUD or the status mes
 
 ## Configuration
 
-Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`. `doctor` prints the active approval mode. Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
+Settings live in `plugin/.env` (environment) and an optional `config.json` in the state directory; the environment wins. The installer writes the required ones: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_EXPECTED_BOT_ID`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_STATE_DIR`, `TELEGRAM_WORKSPACE_ROOT`, `KROT_CODEX_AGENT_NAME`, `KROT_CODEX_APPROVALS`, `KROT_CODEX_APPROVAL_MODE`, `TELEGRAM_STATUS_THOUGHTS`. `doctor` prints the active approval mode and whether thoughts are shown. Commonly added: `TELEGRAM_HUD_ENABLED=1`, `GROQ_API_KEY`, `KROT_CODEX_MODEL`, `KROT_CODEX_SANDBOX`, `KROT_CODEX_PARALLEL=1`. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-and-environment). Restart the service after a change.
 
 ## Update and uninstall
 

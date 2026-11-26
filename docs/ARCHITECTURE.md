@@ -198,13 +198,16 @@ Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, 
 7. **Events.** App-server sends notifications:
    - `turn/started`, `item/started`, `item/completed` (commentary, milestones, the final answer),
    - `item/commandExecution/outputDelta` (for the mirror),
+   - `item/reasoning/summaryPartAdded`, `item/reasoning/summaryTextDelta` (thoughts in the status bubble, step 8),
    - `turn/plan/updated` (HUD plan),
    - `thread/tokenUsage/updated` (HUD context),
    - `thread/goal/updated`,
    - `turn/completed` (end of the turn: completed, interrupted or failed).
 
    App-server requests that need an answer become cards (see [Approval and question cards](#approval-and-question-cards)).
-8. **Status and mirror.** Each event goes to `CodexWorkStatus` (`codex/work-status.ts`), which edits the status bubble: `working -- Ns` and up to three lines of current activity. When the bot sends a new message, the bubble is reposted below it. The mirror (`codex/mirror.ts`) edits one silent message with the stage and the last lines of command output, at most once per second.
+8. **Status and mirror.** Each event goes to `CodexWorkStatus` (`codex/work-status.ts`), which edits the status bubble: `working -- Ns` and up to three lines of current activity. When the bot sends a new message, the bubble is reposted below it.
+
+   **Thoughts.** With `status.thoughts.enabled` (`TELEGRAM_STATUS_THOUGHTS=1`, written by `install.sh` for a new install) the owner `turn/start` carries `summary: "auto"`, and the bubble shows the agent's thinking in place of `reasoning...`: `item/reasoning/summaryTextDelta` deltas of the current summary part (`summaryIndex`; `item/reasoning/summaryPartAdded` starts a new one), or the last entry of `summary` on a completed `reasoning` item, and commentary `agentMessage` items. The text loses its `**bold**` part titles, is redacted line by line (`redactSecrets` with the configured secrets), cut to `max_lines` / `max_chars`, and while streaming the last, unfinished word is held back, so half a secret the redactor cannot match yet never shows. Edits come at most once per `read_throttle_ms` and end on the latest text; each one still goes through the shared Telegram rate limiter and 429 cooldown. Only the owner thread's reasoning is shown, and it is cleared when the turn completes. Under `KROT_CODEX_PROXY` the bridge does not send `summary` (the root relay admits a fixed `turn/start` key set); the server's own Codex config decides there. The mirror (`codex/mirror.ts`) edits one silent message with the stage and the last lines of command output, at most once per second.
 9. **Reply.** On `turn/completed` the final text goes through `deliverReply` and `sendFinalText`. The bridge tries a Rich Message first (`sendRichMessage`, Markdown rendered by Telegram, up to 32768 bytes) when the reply has no files, fits the limit and has no expandable quote. Otherwise, or after the rich latch has switched off, it converts Markdown to Telegram HTML, splits it into parts and sends them with `parse_mode: 'HTML'`, falling back to plain text on a parse error. Each part's delivery is saved in `codex-inbox.json`. Files follow as attachments.
 10. **HUD.** After the turn the HUD card is refreshed in place (`updateNow`); it does not move. The card was already moved under the owner's message when that message was accepted (step 3), and the reply waited for it to land. Then `startNext` takes the next queued message.
 
@@ -442,6 +445,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `TELEGRAM_RICH_MESSAGES` | `0`/`false`/`no`/`off` turns Rich Messages off; anything else on (default on) |
 | `TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT` | CSV of chat IDs that always get the HTML path |
 | `TELEGRAM_HUD_ENABLED` | turns the HUD on (default off); a falsy value forces it off |
+| `TELEGRAM_STATUS_THOUGHTS` | streams the agent's redacted reasoning summary in the status bubble (`status.thoughts.enabled`, default off; `install.sh` writes `1` for a new install); a falsy value forces it off |
 | `TELEGRAM_OUTBOX_ENABLED` | turns on the persistent outbox for replies blocked by a long flood-wait (default off) |
 | `TELEGRAM_CONTEXT_WINDOW_TOKENS` | context window size override; parsed into `config.json` value `context_window_tokens`, which no code outside `config.ts` reads |
 | `TELEGRAM_OWNER_CHAT_IDS` | CSV of owner chat IDs for owner-only features; falls back to the allowed user IDs |

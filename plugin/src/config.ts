@@ -169,7 +169,9 @@ export const AppConfigSchema = z.object({
     // default: it inverts the deliberate "drop freeform Claude text" privacy
     // policy, so it is opt-in per channel. All text is redacted (paths,
     // tokens, IPs) before render, same as tool lines. Optional block — absent
-    // → feature off, legacy configs need no migration.
+    // → feature off, legacy configs need no migration. The Codex bridge
+    // (codex/work-status.ts) streams the reasoning summary from app-server
+    // instead; there read_throttle_ms is the minimum gap between its edits.
     thoughts: z.object({
       enabled: z.boolean().default(false),
       // Tail length of the narration shown in the bubble (chars / lines).
