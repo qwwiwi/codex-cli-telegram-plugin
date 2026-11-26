@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import type { SendWidgetParams } from '../../src/channel/tools.js'
 import { AgentChatActions } from '../../src/codex/chat-actions.js'
-import { AgentComponents, COMPONENT_NAMES, componentTools } from '../../src/codex/components.js'
+import { AgentComponents, COMPONENT_NAMES, componentInstructions, componentTools, finalAfterComponents } from '../../src/codex/components.js'
 import { createLogger } from '../../src/log.js'
 import { WidgetPreSendError } from '../../src/safety/pre-send-error.js'
 import { redactSecrets } from '../../src/safety/redact.js'
@@ -334,4 +334,101 @@ test('[R12][R13] a send_component replayed after 1,000 schema calls in the same 
   const replay = await actions.component('send', 'send_component', { component: 'kpi', data }, () => true)
   expect(parsed(replay)).toMatchObject({ ok: true, message_ids: [77], delivery: 'widget' })
   expect(calls.map(call => call[0])).toEqual(['widget'])
+})
+
+// The shape of a Telegram error description: an UPPER_SNAKE code after the HTTP status. The code below is an example of
+// that shape, not a claim about a real Bot API code.
+const TELEGRAM_CODE = 'INPUT_WIDGET_REPLY_NOT_ALLOWED'
+const refusal = (code: string) =>
+  Object.assign(new Error(`Call to 'sendWidget' failed! (400: Bad Request: ${code})`), { error_code: 400 })
+
+test('[R12][R13] a Telegram error code survives redaction in the widget refusal hint, real secrets stay masked', async () => {
+  expect(redactSecrets(`Bad Request: ${TELEGRAM_CODE}`)).toBe(`Bad Request: ${TELEGRAM_CODE}`)
+  expect(redactSecrets('MESSAGE_TOO_LONG_FOR_THIS_CHAT_TYPE')).toBe('MESSAGE_TOO_LONG_FOR_THIS_CHAT_TYPE')
+  // Mixed case, digits or no underscore: still masked by the long-token rule.
+  for (const secret of ['AbCdEfGhIjKlMnOpQrStUvWxYz0123', 'ABCDEFGHIJKLMNOPQRSTUVWXYZAB', 'ABCD_EFGH_1234567890_WXYZ_QRST',
+    'abcd_efgh_ijkl_mnop_qrst_uvwx']) {
+    expect(redactSecrets(`key ${secret} end`)).not.toContain(secret)
+  }
+  expect(redactSecrets('123456789:AAHfakefakefakefakefakefakefakefake12')).toBe('[REDACTED]')
+
+  const refused = bridge({ async sendWidget() { throw refusal(TELEGRAM_CODE) } })
+  const result = await refused.actions.component('code', 'send_component', { component: 'kpi', data: pack('kpi', 'example.json') }, () => true)
+  expect(parsed(result)).toMatchObject({ ok: true, delivery: 'text' })
+  expect(String(parsed(result).hint)).toContain(TELEGRAM_CODE)
+})
+
+test('[R12][R13] a widget refused as not allowed with a reply target is sent once more without the reply', async () => {
+  const attempts: Array<number | undefined> = []
+  const notAllowed = bridge({
+    async sendWidget(_chat, params) {
+      attempts.push(params.reply_to_message_id)
+      if (params.reply_to_message_id !== undefined) throw refusal(TELEGRAM_CODE)
+      return { message_id: 90 }
+    },
+  })
+  notAllowed.actions.remember(1321, false)
+  const sent = await notAllowed.actions.component('reply', 'send_component',
+    { component: 'progress', data: { title: 'Демо', label: 'Выполнено задач', value: 75 }, target: 1321 }, () => true)
+  expect(parsed(sent)).toMatchObject({ ok: true, message_ids: [90], delivery: 'widget' })
+  expect(attempts).toEqual([1321, undefined])
+  expect(notAllowed.calls).toEqual([])
+
+  // Any other refusal, or a refusal without a reply target, gets no second widget attempt.
+  const other: Array<number | undefined> = []
+  const rejected = bridge({
+    async sendWidget(_chat, params) { other.push(params.reply_to_message_id); throw refusal('WIDGET_HTML_INVALID') },
+  })
+  rejected.actions.remember(1321, false)
+  await rejected.actions.component('other', 'send_component',
+    { component: 'progress', data: { title: 'Демо', label: 'Выполнено задач', value: 75 }, target: 1321 }, () => true)
+  const bare = bridge({ async sendWidget(_chat, params) { other.push(params.reply_to_message_id); throw refusal(TELEGRAM_CODE) } })
+  await bare.actions.component('bare', 'send_component',
+    { component: 'progress', data: { title: 'Демо', label: 'Выполнено задач', value: 75 } }, () => true)
+  expect(other).toEqual([1321, undefined])
+  expect(rejected.calls.map(call => call[0])).toEqual(['text'])
+  expect(bare.calls.map(call => call[0])).toEqual(['text'])
+})
+
+test('[R12][R13] after a text fallback the owner gets exactly one message: a short failure report or an empty final is dropped', async () => {
+  for (const final of ['Telegram не отобразил демо-виджет, данные пришли обычным текстом.', '', '  \n']) {
+    const chat = fakeTelegramChat()
+    chat.owner('voice')
+    const components = new AgentComponents({
+      ...chat.raw, async sendWidget() { throw refusal(TELEGRAM_CODE) },
+    }, OWNER)
+    const actions = new AgentChatActions({
+      sendMessage: unexpected, editMessageText: unexpected, setMessageReaction: unexpected,
+      pinChatMessage: unexpected, unpinChatMessage: unexpected,
+    }, OWNER, { components })
+    actions.remember(101, false)
+    const key = JSON.stringify(['thread', 'turn-1', 'call-1'])
+    const result = await actions.component(key, 'send_component',
+      { component: 'progress', data: { title: 'Агент · Демо', label: 'Выполнено задач', value: 75 }, target: 101 }, () => true)
+    expect(parsed(result)).toMatchObject({ delivery: 'text' })
+    // The tool result tells the model to end the turn without a final message.
+    expect(String(parsed(result).hint)).toContain('пустым финальным ответом')
+    expect(actions.componentDelivery(['turn-1'])).toBe('text')
+    // The bridge decides on the final answer: what it sends lands in the chat.
+    if (finalAfterComponents(final, actions.componentDelivery(['turn-1'])) === 'send') await chat.raw.sendMessage(OWNER, final, {})
+    expect(chat.texts()).toHaveLength(2)
+    expect(chat.texts()[0]).toBe('voice')
+    expect(chat.texts()[1]).toContain('Выполнено задач')
+  }
+  expect(componentInstructions).toContain('пустым финальным ответом')
+})
+
+test('[R12][R13] the final answer after a component: an empty one is dropped, real answers still go out', () => {
+  // A delivered widget and an empty final: nothing more, no "no answer" notice.
+  expect(finalAfterComponents('', 'widget')).toBe('drop')
+  expect(finalAfterComponents('Виджет показывает прогресс курса.', 'widget')).toBe('send')
+  // After a text fallback a question, a long answer or several paragraphs are content, not a failure report.
+  expect(finalAfterComponents('Показать данные ещё и таблицей?', 'text')).toBe('send')
+  expect(finalAfterComponents('Итог: ' + 'данные '.repeat(60), 'text')).toBe('send')
+  expect(finalAfterComponents('Первая строка.\nВторая строка.\nТретья строка.', 'text')).toBe('send')
+  // No component in the turn: the bridge keeps its usual handling of an empty answer.
+  expect(finalAfterComponents('', undefined)).toBe('send')
+  // Only the given turns count; a component of another turn or a non-component key does not.
+  const { actions } = bridge()
+  expect(actions.componentDelivery(['turn-1'])).toBeUndefined()
 })

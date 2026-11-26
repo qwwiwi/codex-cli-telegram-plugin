@@ -64,7 +64,7 @@ import { BridgeRestartHandoff, isRestartVerificationMessage } from './restart-ha
 import { readHandoffContext } from './handoff-context.js'
 import { AgentChatActions, agentChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   downloadQuotedAttachment, safeActionTarget, type ChatAction } from './chat-actions.js'
-import { AgentComponents, isComponentTool } from './components.js'
+import { AgentComponents, finalAfterComponents, isComponentTool } from './components.js'
 import { InboundWatcher } from '../telegram/watcher.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
 import { LearningMemory } from './learning.js'
@@ -1911,8 +1911,11 @@ async function main(): Promise<void> {
             ...(first.voice && taskText && taskText.length <= 4000 ? { voiceTaskText: redactSecrets(taskText, secrets) } : {}),
           })
           let latestTurnId: string | undefined
+          // Every Codex turn of this task: their components decide what happens to the final answer.
+          const turnIds: string[] = []
           const saveTurn = (turnId: string) => {
             latestTurnId = turnId
+            turnIds.push(turnId)
             try { inbox.assignTurn(first.message_id, turnId) } catch { log.warn('Could not persist the Codex turn ID') }
           }
           const handoff = memory && config.memory.workspace_path && !codex.status.hasThread
@@ -1962,6 +1965,14 @@ async function main(): Promise<void> {
           }
           await agentChat.flush()
           if (stopping) return
+          const componentDelivery = agentChat.componentDelivery(turnIds)
+          if (result.status === 'completed' && !editTarget && !result.text.trim() &&
+              finalAfterComponents(result.text, componentDelivery) === 'drop') {
+            // The component was the answer: no second message, not even a "no answer" notice.
+            log.info('Codex turn ended with a component and an empty final answer')
+            inbox.finish(first.message_id)
+            return
+          }
           if (result.status !== 'completed' || !result.text.trim()) {
             progressResult = result.status === 'interrupted' ? 'Задача остановлена' : 'Ответ не получен'
             await send(result.status === 'interrupted' ? 'Задача остановлена.' : 'Codex не вернул готовый ответ.')
@@ -1977,7 +1988,12 @@ async function main(): Promise<void> {
             ? await leaseCompletion.complete(result.text) : hideLeaseCompletions(interim ?? result.text)
           const restart = bridgeRestartReply(completed, mayRestartBridge, interim !== undefined, verificationEligible)
           const targetId = first.reply_to_message?.message_id
-          const extracted = extractAttachments(hideQuestionMarker(hideContinuationMarker(restart.text)))
+          const shown = extractAttachments(hideQuestionMarker(hideContinuationMarker(restart.text)))
+          // After a component fell back to text, a short note about it would be a second message with nothing new.
+          const dropNote = !editTarget && interim === undefined && !restart.requested && shown.files.length === 0 &&
+            finalAfterComponents(shown.text, componentDelivery) === 'drop'
+          if (dropNote) log.info('Dropped the short final answer after a component text fallback')
+          const extracted = dropNote ? { ...shown, text: '' } : shown
           const reply = { ...extracted, text: editTarget ? extracted.text :
             leases.finalReply(extracted.text, resolveAskGuardMode(config, log)),
           ...(targetId === undefined ? {} : { replyTo: targetId }) }

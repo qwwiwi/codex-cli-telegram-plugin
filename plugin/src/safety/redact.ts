@@ -171,6 +171,13 @@ const URL_RE = /https?:\/\/[^\s<>"'),;\]]+/g
 // the exemption past the real link.
 const URL_TRAILING_PUNCT_RE = /[.:!?]+$/
 
+// UPPER_SNAKE identifier exemption: error codes from Telegram and other APIs
+// (`MESSAGE_TOO_LONG`, `*_NOT_ALLOWED`) and constant names. Uppercase letters
+// joined by underscores carry no entropy worth masking, and masking the code
+// hid the one fact needed to diagnose a refused send. A run with a digit or a
+// lowercase letter, or without an underscore, is still masked.
+const UPPER_SNAKE_RE = /^[A-Z]+(?:_[A-Z]+)+$/
+
 // Replace GENERIC_LONG_TOKEN_RE matches everywhere EXCEPT inside http(s)
 // URLs. Ranges are recomputed per call from the current text (earlier
 // rules may have shifted offsets). Idempotent: skipped matches are left
@@ -189,7 +196,7 @@ function maskLongTokensOutsideUrls(text: string): string {
       const inUrl = urlRanges.some(
         ([start, end]) => offset >= start && offset < end,
       )
-      return inUrl ? match : `${head}***${tail}`
+      return inUrl || UPPER_SNAKE_RE.test(match) ? match : `${head}***${tail}`
     },
   )
 }
