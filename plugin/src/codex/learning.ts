@@ -142,13 +142,6 @@ export class LearningMemory {
       JSON.stringify(context) : ''
   }
 
-  confirmForget(target: string): (() => string) | undefined {
-    const item = this.state.approved.find(entry => id(entry) === target)
-    if (!item) return undefined
-    return () => this.active() && this.state.approved.includes(item)
-      ? this.command('forget ' + target) : 'этот факт изменился, откройте заново.'
-  }
-
   command(args: string): string {
     const [action = '', target, extra] = args.trim().split(/\s+/)
     if (action === 'list' || action === 'pending') {

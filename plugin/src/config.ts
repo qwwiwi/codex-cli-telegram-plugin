@@ -502,6 +502,8 @@ export type AppConfig = z.infer<typeof AppConfigSchema>
 
 export const RuntimeEnvSchema = z.object({
   XDG_STATE_HOME: z.string().optional(),
+  KROT_BRAIN_SAVE_NOTICE: z.enum(['on', 'off']).default('off'),
+  KROT_BRAIN_REVIEW_BUTTONS: z.enum(['on', 'off']).default('off'),
   KROT_CODEX_AGENT_ID: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).optional(),
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_STATE_DIR: z.string().optional(),

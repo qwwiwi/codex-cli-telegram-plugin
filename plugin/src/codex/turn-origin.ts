@@ -63,6 +63,8 @@ export interface ClassifyOptions {
   continuation?: boolean
   /** Side only: the reply target is the bot's answer from the verified owner side thread the reply reuses. */
   trustedReply?: boolean
+  /** Main only: the receiving bot, whose own replies preserve direct origin. */
+  replyBotId?: number
 }
 
 type Fields = Omit<OriginFields, 'role' | 'isolate'>
@@ -113,6 +115,7 @@ export function classifyTurn(messages: readonly Message[], ownerId: number, send
     ...(options.side ? { side: true } : {}),
     ...(options.continuation ? { continuation: true } : {}),
     ...(options.trustedReply ? { trustedReply: true } : {}),
+    ...(options.replyBotId === undefined ? {} : { replyBotId: options.replyBotId }),
     ...(index === 0 && options.confirmedVoice !== undefined ? { confirmedVoice: options.confirmedVoice } : {}),
   }))
   const chosen = leastTrusted(items)

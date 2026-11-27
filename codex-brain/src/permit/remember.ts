@@ -76,10 +76,12 @@ export async function remember(ctx: GateContext, request: RememberRequest): Prom
     return fromWrite(await writer.put({ ...parsed.data, source: permit.journal_ref }, request.expectedRevision), permit.turn_id)
   }
 
+  const targetRevision = (await ctx.facts.get(input.id))?.revision
   const now = ctx.clock.now()
   const proposal: Proposal = {
     id: proposalId(now),
     fact: { id: input.id, kind: input.kind, description: input.description, body: input.body },
+    ...(targetRevision === undefined ? {} : { target_revision: targetRevision }),
     from: 'remember',
     reason: decision.reason,
     created: now.toISOString(),

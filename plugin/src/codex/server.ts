@@ -91,7 +91,7 @@ import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } 
 import { LearningMemory } from './learning.js'
 import { createBrainBridge } from './brain-bridge.js'
 import { BRAIN_CALLBACK, BRAIN_UNAVAILABLE, MEMORY_REFUSED, MEMORY_WRITE_REFUSED, mayRunMemoryCommand } from './brain-commands.js'
-import { classifyBrainOrigin, foreignProvenance, hasForeignReply, hasMemoryCue, isOwnerPrivateChat } from './brain-origin.js'
+import { foreignProvenance, hasForeignReply, hasMemoryCue, isOwnerPrivateChat } from './brain-origin.js'
 import { createOwnerEffects, createUnansweredQuestionHandler, type OwnerEffects } from './owner-effects.js'
 import {
   bridgeOrigin, classifyTurn, mainOrigin, ownerOrigin, ownerWords, parseTurnOrigin, storedOrigin, type TurnOrigin,
@@ -264,6 +264,7 @@ async function main(): Promise<void> {
   const brainScope = bridgeScope(String(env.TELEGRAM_EXPECTED_BOT_ID), String(ownerId))
   const brain = createBrainBridge({
     brainHome, scope: brainScope,
+    reviewButtons: env.KROT_BRAIN_REVIEW_BUTTONS === 'on',
     // issuedKeys is the same array: every redactSecrets(…, secrets) call also scrubs live turn keys.
     legacyRoot: join(paths.root, 'learning'), secrets, issuedKeys: secrets, warn: text => log.warn(text),
     summarizer: (prompt, schema, signal) => summarizeBrain(prompt, schema, signal),
@@ -1166,6 +1167,7 @@ async function main(): Promise<void> {
       const notice = ticket ? await brain.turnDelivered(ticket, outcome) : undefined
       if (!notify || !brain.enabled || stopping) return
       const warning = notice?.unavailable || execution?.unavailable || (!execution && !ticket)
+      if (!warning && env.KROT_BRAIN_SAVE_NOTICE !== 'on') return
       const reply = warning ? { text: BRAIN_UNAVAILABLE, buttons: [] } : brain.notice(notice?.saved ?? [])
       await sendMemory(reply).catch((error: unknown) => warnError(error, 'Could not send the Brain receipt'))
     }
@@ -1599,7 +1601,7 @@ async function main(): Promise<void> {
     })
     onDeferredDelivery = (item, id) => {
       if (item.chatId !== ownerChat) return
-      // The outbox sent the last part of a reply: its exchange is delivered now (with the «Сохранено» notice).
+      // The outbox sent the last part of a reply, so the exchange is delivered and can report its receipt.
       if (item.brainKey) {
         const key = item.brainKey
         void brain.recover(key).then(ticket => ticket ? recordBrainDelivery(ticket, { status: 'delivered' }, undefined, true) : undefined)
@@ -2146,14 +2148,12 @@ async function main(): Promise<void> {
       }
     }
 
-    const legacyForget = new Map<string, () => string>()
     async function handleMemory(args: string): Promise<void> {
       const enabled = brain.enabled
       const brainCommand = enabled || /^(?:on|off|status)$/u.test(args) || (!args && !learning)
       if (brainCommand) {
         const result = await brain.memoryCommand({ args, ownerPrivateChat: true })
         if (enabled !== brain.enabled) {
-          legacyForget.clear()
           commands = buildCommands()
           void registerOwnerScopedCommands(bot.api, commands.menu, [ownerId], log)
           if (brain.enabled) void refreshBrainHooks().catch(() => log.warn('Brain hook status could not be checked'))
@@ -2165,16 +2165,6 @@ async function main(): Promise<void> {
       if (args === 'review') {
         await send('Проверю недавний диалог в фоне.')
         runLearning(true)
-        return
-      }
-      const forget = /^forget\s+(\S+)$/u.exec(args)
-      if (forget) {
-        const confirm = learning?.confirmForget(forget[1]!)
-        if (!confirm) return send('Запись не найдена.')
-        const data = 'krot:memory:' + randomUUID()
-        if (legacyForget.size >= 20) legacyForget.delete(legacyForget.keys().next().value!)
-        legacyForget.set(data, confirm)
-        await sendMemory({ text: 'Забыть «' + forget[1] + '»?', buttons: [[{ label: 'Подтвердить удаление', data }]] })
         return
       }
       if (learning) await send(learning.command(args))
@@ -2311,12 +2301,6 @@ async function main(): Promise<void> {
       }
       await ctx.answerCallbackQuery().catch(() => undefined)
       const callback = ctx.callbackQuery.data
-      const legacy = legacyForget.get(callback)
-      legacyForget.delete(callback)
-      if (!brain.enabled && legacy) {
-        await send(legacy())
-        return
-      }
       await sendMemory(await brain.memoryCommand({ args: '', ownerPrivateChat: true, callback }))
     })
     if (access) {
@@ -3125,8 +3109,8 @@ async function main(): Promise<void> {
           const input = await prepareMessages(messages)
           cancelMedia = undefined
           if (stopping) return
-          if (cancelled) {
-            if (notifyOwner) await send('Обработка вложения отменена.')
+          if (cancelled || epoch !== stopEpoch) {
+            if (cancelled && notifyOwner) await send('Обработка вложения отменена.')
             inbox.finish(first.message_id)
             return
           }
@@ -3143,25 +3127,11 @@ async function main(): Promise<void> {
             await runAgentTurn(first, input.text, sender, epoch)
             return
           }
-          let confirmedVoice: string | undefined
-          if (brain.enabled && input.ownerTranscript && input.ownerTranscript.length <= 2000 && classifyBrainOrigin(first, ownerId, {
-            confirmedVoice: input.ownerTranscript,
-          }).origin === 'owner-direct') {
-            const yes = 'Подтвердить'
-            const confirmation = await questions.ask([{
-              id: 'brain-voice', question: 'Подтвердите расшифровку голосового сообщения:\n' + input.ownerTranscript,
-              options: [{ label: yes }, { label: 'Продолжить без памяти' }], isOther: false,
-            }])
-            if (stopping || epoch !== stopEpoch) {
-              if (!stopping) inbox.finish(first.message_id)
-              return
-            }
-            if (confirmation['brain-voice']?.answers[0] === yes) confirmedVoice = input.ownerTranscript
-          }
+          const confirmedVoice = brain.enabled ? input.ownerTranscript : undefined
           // Classified once, over every album item: only foreign text (forward, pasted quote), another agent
           // or a foreign chat runs isolated, and only an owner origin reaches the owner effects below.
           const turnOrigin = classifyTurn(messages, ownerId, sender, {
-            brain: brain.enabled, key: brainKey(first), confirmedVoice, continuation: verification,
+            brain: brain.enabled, key: brainKey(first), confirmedVoice, continuation: verification, replyBotId: bot.botInfo.id,
           })
           const isolate = turnOrigin.isolate
           const ownerTurnOrigin = ownerOrigin(turnOrigin)

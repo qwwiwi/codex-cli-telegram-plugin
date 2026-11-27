@@ -45,6 +45,62 @@ test('protects the installer service from direct stop or restart commands', () =
   expect(verdict('systemctl --user stop unrelated.service').tier).toBe('allow')
 })
 
+const systemctlVerdict = (command: string) => assessPolicy('version: 1\ndefault_tier: allow', {
+  hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command },
+})
+
+test.each([
+  "systemctl --user stop 'krotov-*'",
+  "systemctl --user restart '*telegram*'",
+  "systemctl --user kill 'krotov-telegram@*'",
+  "systemctl --user disable '*.service'",
+  'systemctl --user mask krotov-telegr?m.service',
+  "systemctl --user reload 'krotov-[a-z]elegram.service'",
+  "systemctl --user try-restart 'worker-*'",
+  "systemctl --user isolate '*.target'",
+  "systemctl --user set-property 'krotov-*' CPUWeight=100",
+  "systemctl --root '/tmp/a&b' disable '*.service'",
+  "systemctl --user --all stop '*.service'",
+  "systemctl --user --state running stop 'krotov-*'",
+  'systemctl --user --all stop',
+  'systemctl --user -a stop',
+  'systemctl --user stop -a',
+  'systemctl --user -qa stop',
+  'systemctl --user stop -aq',
+  'systemctl -aMuser@host stop',
+  'systemctl stop -aMuser@host',
+  "systemctl -Muser@host stop '*.service'",
+  "systemctl --machine=user@host stop '*.service'",
+  "systemctl -M user@host stop '*.service'",
+  "systemctl --machine user@host stop '*.service'",
+  'systemctl --user --state=running stop',
+  'systemctl --user stop --state running',
+])('hard-denies systemctl selection %s', (command) => {
+  expect(systemctlVerdict(command)).toMatchObject({
+    tier: 'deny', matchedRule: 'builtin:deny:own-channel',
+  })
+})
+
+test.each([
+  'systemctl --user stop unrelated.service',
+  'systemctl --user --all stop unrelated.service',
+  'systemctl --user -qa stop unrelated.service',
+  'systemctl --user stop -aq unrelated.service',
+  'systemctl -Muser@host stop unrelated.service',
+  'systemctl stop -qMa@host',
+  'systemctl -M krotov-telegram.service@host stop unrelated.service',
+  'systemctl stop unrelated.service --machine=krotov-telegram.service@host',
+  'systemctl status krotov-telegram.service; systemctl stop unrelated.service',
+  'systemctl stop unrelated.service; systemctl status krotov-telegram.service',
+  "systemctl --user --all status '*.service'",
+  'systemctl --user --state running list-units',
+  "systemctl --user stop unrelated.service; printf '%s' '*.service'",
+  "systemctl --user stop unrelated.service\nprintf '%s' '*.service'",
+  "systemctl --user stop unrelated.service --property 'Watchdog*'",
+])('allows systemctl command %s', (command) => {
+  expect(systemctlVerdict(command).tier).toBe('allow')
+})
+
 test('protects both the configured bridge unit and the default unit', () => {
   const previous = process.env.KROT_CODEX_SERVICE_NAME
   try {
@@ -61,10 +117,11 @@ test('protects both the configured bridge unit and the default unit', () => {
     expect(verdict('systemctl --user stop fixtureXworker.service').tier).toBe('allow')
     expect(verdict('systemctl --user stop other.fixture.worker.service').tier).toBe('allow')
     expect(verdict('systemctl --user status fixture.worker.service').tier).toBe('allow')
+    expect(verdict('systemctl --user stop unrelated.service --machine fixture.worker.service').tier).toBe('allow')
     expect(verdict('systemctl --user stop gateway.service').tier).toBe('deny')
     process.env.KROT_CODEX_SERVICE_NAME = 'fixture.*.service'
     expect(verdict('systemctl --user stop fixture.worker.service').tier).toBe('allow')
-    expect(verdict('systemctl --user stop krotov-telegram.service').tier).toBe('deny')
+    expect(verdict('systemctl stop krotov-telegram.service').tier).toBe('deny')
   } finally {
     if (previous === undefined) delete process.env.KROT_CODEX_SERVICE_NAME
     else process.env.KROT_CODEX_SERVICE_NAME = previous
