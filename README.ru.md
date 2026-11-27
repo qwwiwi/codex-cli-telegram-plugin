@@ -218,7 +218,7 @@ systemctl --user restart krotov-telegram.service
 
 ## Обновление и удаление
 
-Обновление: скрипт подтягивает новую версию из ветки upstream, сначала прогоняет тесты и `doctor` на отдельной копии.
+Обновление: скрипт подтягивает новую версию из отслеживаемой ветки, сначала прогоняет тесты и `doctor` на отдельной копии.
 
 ```bash
 ./update.sh            # потом перезапустите, когда бот свободен
@@ -264,7 +264,7 @@ grep -h '"level":"error"' ~/.local/state/krotov-plugin/errors-*.jsonl | tail -n 
 - [plugin/docs/install.md](plugin/docs/install.md): развёртывание и команды Telegram (на английском)
 - [plugin/docs/root-backend.md](plugin/docs/root-backend.md): отдельный Codex App Server через локальное реле
 - [Codex Brain и перенос старых записей](plugin/docs/learning.md)
-- [CHANGES.md](CHANGES.md): изменения в этом форке (на английском)
+- [CHANGES.md](CHANGES.md): история изменений (на английском)
 
 Тесты разработчика: `bun test` в папке `plugin/`.
 

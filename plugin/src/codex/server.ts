@@ -2138,8 +2138,11 @@ async function main(): Promise<void> {
 
     function mainSummary() {
       const first = inbox.active?.messages[0]
-      const title = first ? taskTitle(agentBody(first.text) ?? first.caption) : goalActive ? 'цель агента' : 'текущая задача'
-      const step = plans.find(item => item.status === 'in_progress')?.content ?? plans.at(-1)?.content
+      // Only the owner's own main turn is described: an isolated turn (a forward, another agent) carries foreign text.
+      const described = !first || ownerOrigin(inbox.activeOrigin) !== undefined
+      const title = !first ? goalActive ? 'цель агента' : 'текущая задача'
+        : described ? taskTitle(agentBody(first.text) ?? first.caption) : 'основная задача'
+      const step = described ? plans.find(item => item.status === 'in_progress')?.content ?? plans.at(-1)?.content : undefined
       return {
         title: redactSecrets(title, secrets),
         ...(step ? { step } : {}),
@@ -2165,8 +2168,7 @@ async function main(): Promise<void> {
       const id = message.message_id
       const epoch = stopEpoch
       const agent = provenance.origin === 'agent'
-      // Classified once: an agent's turn is a guest's, the owner's parallel turn a side one.
-      const sideOrigin = classifyTurn([message], ownerId, provenance, { brain: brain.enabled, key: brainKey(message), side: true })
+      const brainEnabled = brain.enabled
       sides.begin(id, redactSecrets(taskTitle(agentBody(message.text) ?? message.caption), secrets), reuse)
       const settleSide = () => {
         try { inbox.finishSide(id) } catch (error) { warnError(error, 'Could not clear a finished parallel turn') }
@@ -2178,6 +2180,13 @@ async function main(): Promise<void> {
       card?.show(sideFirstStage(message))
       let cardThread: string | undefined
       void (async () => {
+        // A reply to the bot's answer from the verified owner side thread it reuses brings nothing new into that
+        // fork; any other reply target that is not the owner's own words isolates the turn (see brain-origin.ts).
+        const target = message.reply_to_message
+        const trustedReply = brainEnabled && !agent && reuse !== undefined && target?.from?.is_bot === true &&
+          sides.threadOf(target.message_id) === reuse && await brain.isSafeSide(reuse, 'side').catch(() => false)
+        const sideOrigin = classifyTurn([message], ownerId, provenance,
+          { brain: brainEnabled, key: brainKey(message), side: true, ...(trustedReply ? { trustedReply } : {}) })
         let started = false
         let brainTurn: BrainExecution | undefined
         // `thread` set: Codex accepted the turn, keep it as a side job; unset: drop the follow-up.
@@ -2205,14 +2214,14 @@ async function main(): Promise<void> {
             await send(input.text)
             return
           }
-          const isolated = brain.enabled
+          const isolated = sideOrigin.isolate
           const summary = isolated ? { title: 'основная задача', elapsedMs: 0 } : mainSummary()
           const prompt = agent
             ? [sideInstructions(summary, provenance), input.text].filter(Boolean).join('\n\n')
             : sideOwnerTurn(formatReminderOn,
-              [sideInstructions(summary, provenance), ...(isolated ? [] : [agentChatInstructions]), chatContext([message]), input.text])
+              [sideInstructions(summary, provenance), ...(brainEnabled ? [] : [agentChatInstructions]), chatContext([message]), input.text])
           card?.show(sideThinking)
-          const safeReuse = !isolated || !reuse || await brain.isSafeSide(reuse) ? reuse : undefined
+          const safeReuse = !brainEnabled || !reuse || await brain.isSafeSide(reuse, isolated ? 'guest' : 'side') ? reuse : undefined
           brainTurn = brain.execution(sideOrigin.role, brainInput(message, sideOrigin, input.text))
           const result = await brainTurn.run(() => codex.runSide(prompt, agent ? [] : input.images, safeReuse, thread => {
             sides.attach(id, thread)

@@ -175,7 +175,7 @@ Settings live in `plugin/.env` (environment) and an optional `config.json` in th
 
 ## Update and uninstall
 
-Update (fast-forward from the upstream branch, tests and `doctor` run on a staged copy first):
+Update (fast-forward from the tracked branch, tests and `doctor` run on a staged copy first):
 
 ```bash
 ./update.sh            # then restart when the bot is idle
@@ -221,7 +221,7 @@ grep -h '"level":"error"' ~/.local/state/krotov-plugin/errors-*.jsonl | tail -n 
 - [plugin/docs/install.md](plugin/docs/install.md): deployment guide and Telegram commands
 - [plugin/docs/root-backend.md](plugin/docs/root-backend.md): separate Codex App Server through a local relay
 - [Codex Brain and legacy memory migration](plugin/docs/learning.md)
-- [CHANGES.md](CHANGES.md): changes in this fork
+- [CHANGES.md](CHANGES.md): implementation history
 
 Developer tests: `bun test` in `plugin/`.
 

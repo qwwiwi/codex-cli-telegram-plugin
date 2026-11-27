@@ -61,6 +61,8 @@ export interface ClassifyOptions {
   side?: boolean
   confirmedVoice?: string | undefined
   continuation?: boolean
+  /** Side only: the reply target is the bot's answer from the verified owner side thread the reply reuses. */
+  trustedReply?: boolean
 }
 
 type Fields = Omit<OriginFields, 'role' | 'isolate'>
@@ -110,14 +112,14 @@ export function classifyTurn(messages: readonly Message[], ownerId: number, send
     ...(agent ? { agent: true } : {}),
     ...(options.side ? { side: true } : {}),
     ...(options.continuation ? { continuation: true } : {}),
+    ...(options.trustedReply ? { trustedReply: true } : {}),
     ...(index === 0 && options.confirmedVoice !== undefined ? { confirmedVoice: options.confirmedVoice } : {}),
   }))
   const chosen = leastTrusted(items)
   const isolate = options.brain && chosen.isolate
   const fields: Fields = { key: options.key, messageId: first.message_id, origin: chosen.origin, inputKind: chosen.inputKind }
-  if (agent) return foreign(fields, 'guest', isolate)
+  if (agent || isolate) return foreign(fields, 'guest', isolate)
   if (options.side) return foreign(fields, 'side', isolate)
-  if (isolate) return foreign(fields, 'guest', true)
   return owner(fields)
 }
 

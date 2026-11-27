@@ -734,9 +734,9 @@ export function createBrainBridge(options: BrainOptions) {
         return { sessionId: exchange.thread, key, ref: exchange.ref, origin: exchange.origin }
       } catch { reportFailure('Brain could not recover the exchange'); return null }
     },
-    isSafeSide: async (sessionId: string) => {
+    isSafeSide: async (sessionId: string, role: 'side' | 'guest') => {
       const entry = await sessions.resolve(sessionId).catch(() => null)
-      return entry?.scope === scope && (entry.role === 'guest' || entry.role === 'side')
+      return entry?.scope === scope && entry.role === role
     },
     notice: commands.notice,
     observe(event: CodexEvent) {
