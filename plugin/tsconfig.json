@@ -17,8 +17,9 @@
     "isolatedModules": true,
     "allowSyntheticDefaultImports": true,
     "verbatimModuleSyntax": false,
-    "types": ["bun-types"]
+    "types": ["bun-types"],
+    "paths": { "zod": ["./node_modules/zod"] }
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"],
+  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts", "../codex-hooks/src/**/*.ts", "../codex-brain/src/**/*.ts"],
   "exclude": ["node_modules", "refs", "state"]
 }

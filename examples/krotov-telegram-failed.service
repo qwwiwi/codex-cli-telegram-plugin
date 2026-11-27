@@ -1,0 +1,6 @@
+[Unit]
+Description=Tell the Krotov bridge owner that the service stopped restarting
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/Krotov-plugin/plugin/scripts/notify-failed.sh %h/Krotov-plugin/plugin/.env

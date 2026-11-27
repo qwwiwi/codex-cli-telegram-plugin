@@ -238,6 +238,36 @@ const RULES: ReadonlyArray<RedactionRule> = [
   //    in redactSecrets() (NOT listed here; see maskLongTokensOutsideUrls).
 ]
 
+// Token-shaped secrets only (no IPs, hosts, paths or the generic long-token
+// backstop): the Codex hooks pack uses this to flag a secret in tool output
+// without tripping on commit hashes and addresses.
+const SECRET_SHAPES: ReadonlyArray<readonly [string, RegExp]> = [
+  ['telegram', TELEGRAM_TOKEN_RE],
+  ['groq', GROQ_KEY_RE],
+  ['openai', OPENAI_RE],
+  ['github', GITHUB_PAT_RE],
+  ['resend', RESEND_RE],
+  ['slack', SLACK_BOT_RE],
+  ...FIREBASE_REs.map(rule => ['firebase', rule.pattern] as const),
+  ['bearer', BEARER_RE],
+  ['url-token', QUERY_TOKEN_RE],
+  ['url-password', URL_USERINFO_RE],
+  ['jwt', JWT_RE],
+  ['webhook', DISCORD_WEBHOOK_RE],
+  ['webhook', SLACK_WEBHOOK_RE],
+]
+
+/** The kinds of token-shaped secrets found in `text`, without duplicates. */
+export function findSecretKinds(text: string): string[] {
+  const kinds = new Set<string>()
+  for (const [kind, pattern] of SECRET_SHAPES) {
+    pattern.lastIndex = 0
+    if (pattern.test(text)) kinds.add(kind)
+    pattern.lastIndex = 0
+  }
+  return [...kinds]
+}
+
 /**
  * Apply every redaction rule to `text` in declaration order, then mask
  * caller-supplied exact-substring secrets (`extras`). Returns the redacted

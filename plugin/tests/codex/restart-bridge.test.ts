@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CodexInbox } from '../../src/codex/inbox.js'
 import { ownerProvenance } from '../../src/codex/provenance.js'
+import { mainOrigin } from '../../src/codex/turn-origin.js'
 import {
   BridgeRestart, bridgeRestartReply, ownerRequestedBridgeRestart, ownerRequestedRestartVerification,
 } from '../../src/codex/restart-bridge.js'
@@ -123,7 +124,7 @@ test('the inbox recovers the restart request and cancels it without losing deliv
     let inbox = new CodexInbox(root, owner.id)
     inbox.receive({ message_id: 7, date: 1, chat, from: owner, text: 'Restart the bridge' }, ownerProvenance)
     inbox.take()
-    inbox.start(7, { mayRestartBridge: true, verificationEligible: true, voiceTaskText: 'Restart the bridge' })
+    inbox.start(7, mainOrigin('main'), { mayRestartBridge: true, verificationEligible: true, voiceTaskText: 'Restart the bridge' })
     inbox.assignTurn(7, 'turn-7')
 
     inbox = new CodexInbox(root, owner.id)

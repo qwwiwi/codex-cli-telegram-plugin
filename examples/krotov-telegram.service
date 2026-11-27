@@ -1,14 +1,27 @@
 [Unit]
 Description=Krotov Plugin Telegram bridge for Codex
-StartLimitIntervalSec=0
+# 6 starts in 300 s end a crash loop; krotov-telegram-failed.service then tells the owner once.
+StartLimitIntervalSec=300
+StartLimitBurst=6
+OnFailure=krotov-telegram-failed.service
 
 [Service]
 Type=simple
 WorkingDirectory=%h/Krotov-plugin/plugin
 Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# Rolls back a chat /update whose trial boot never became healthy; "-" never blocks the start.
+# The copy in the state directory (install.sh writes it), never the one inside the checkout.
+ExecStartPre=-/bin/bash %h/.local/state/krotov-plugin/boot-guard.sh
+# The guard's rollback reinstalls dependencies inside the start; the default 90 s can cut it off.
+TimeoutStartSec=300
 ExecStart=%h/.bun/bin/bun run start
 Restart=on-failure
 RestartSec=10s
+# Exit 75 = planned restart (always restarted), 78 = fatal configuration (never restarted).
+RestartForceExitStatus=75
+SuccessExitStatus=75
+RestartPreventExitStatus=78
+TimeoutStopSec=90
 UMask=0077
 
 [Install]

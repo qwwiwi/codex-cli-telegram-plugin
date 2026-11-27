@@ -53,7 +53,7 @@ const payloadSchema = z.object({
   message: z.string().refine(text => text.trim().length > 0, 'empty message'),
   // Routing always goes to the owner's chat; chatId is accepted and ignored.
   chatId: z.union([z.number(), z.string()]).optional(),
-  // The gbrain worker sends the RECIPIENT here (or nothing); never the sender.
+  // The delivery worker sends the RECIPIENT here (or nothing); never the sender.
   agentId: z.string().max(256).optional(),
   fromAgent: z.string().max(256).optional(),
 })
@@ -92,7 +92,7 @@ export function agentName(name: string | null | undefined): string {
   return safeAgentName(name) || 'unknown'
 }
 
-// The gbrain worker's header line; trusted only at the very start of the message.
+// The delivery worker's header line; trusted only at the very start of the message.
 const workerHeaderPattern = /^\[Inter-agent от ([^\s\]]+) → [^\s\]]+\]/u
 
 export interface SenderSource {
@@ -135,7 +135,7 @@ function senderLabel(name: string | undefined, verified: boolean): string {
 // block is the worker's, earlier look-alikes stay the sender's words. The
 // header may carry a variant note, e.g. "ПОРЯДОК ДЕЙСТВИЙ (ack-only fast path, …):".
 const protocolStartPattern = /^---[ \t]*\r?\n(?:[ \t]*\r?\n)*(?=ПОРЯДОК ДЕЙСТВИЙ(?: \([^)\n]*\))?:[ \t]*\r?$)/gmu
-const protocolLabel = '[протокол доставки gbrain (служебный, не просьба отправителя)]\n'
+const protocolLabel = '[протокол доставки (служебный, не просьба отправителя)]\n'
 
 /** Labels the worker's delivery protocol block so Codex does not read it as the sender's request. */
 function labelDeliveryProtocol(message: string): string {
@@ -152,7 +152,7 @@ export interface FrameOptions {
 }
 
 /**
- * Frames an agent message as untrusted data for Codex; sender is the resolved sender name. The gbrain protocol
+ * Frames an agent message as untrusted data for Codex; sender is the resolved sender name. The worker protocol
  * label is applied only for a delivery of the authenticated worker: any other caller can write that block itself.
  */
 export function frameAgentMessage(message: string, sender?: string, options: FrameOptions = {}): string {

@@ -10,7 +10,7 @@
 [![Platform: Linux, macOS](https://img.shields.io/badge/platform-Linux%2C%20macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#что-нужно)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#лицензия-и-авторы)
 
-**Релизы:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · сейчас v0.1.0 (pre-release), [заметки к релизу](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
+**Релизы:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · текущая версия v0.4.0 · [заметки к релизу](docs/releases/v0.4.0.md) · [заметки к v0.1.0](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
 
 ## Свой агент Codex в личке Telegram.
 
@@ -85,9 +85,9 @@ git clone https://github.com/qwwiwi/codex-cli-telegram-plugin && cd codex-cli-te
 | `--approval-mode never\|standard\|risky` | карточки подтверждения: `never` (по умолчанию для новой установки, автономно, без карточек), `standard` или `risky` (см. [Безопасность](#безопасность)) |
 | `--non-interactive --token-file ПУТЬ` | без вопросов, токен из приватного файла |
 | `--owner-id ID` / `--pair-code КОД` | владелец по числовому ID или по заранее отправленному коду `krotov-<uuid>` |
+| `--hooks` / `--no-hooks` | установить (по умолчанию) или пропустить хуки Codex |
+| `--no-memories` | пропустить настройку встроенной памяти Codex при новой установке |
 | `--dry-run` | показать план и выйти |
-
-При новой установке мост включает [встроенную память Codex](plugin/docs/install.md#native-codex-memories), если она явно не настроена. Флаг `--no-memories` оставляет настройку самому Codex.
 
 Ручная установка на Ubuntu или Debian: [plugin/docs/quickstart.md](plugin/docs/quickstart.md). Установка силами ИИ-агента: [INSTALL-WITH-AGENT.md](INSTALL-WITH-AGENT.md). На macOS установщика и службы нет: заполните `plugin/.env` вручную и запустите `bun run start` в папке `plugin/`.
 
@@ -114,7 +114,7 @@ git clone https://github.com/qwwiwi/codex-cli-telegram-plugin && cd codex-cli-te
 - По желанию — параллельные ответы: новый вопрос во время долгой задачи получает свой отдельный диалог.
 - Ответы-виджеты: цифры, графики, шаги, планы и сравнения Codex может показать виджетом Telegram из [html-components](https://github.com/qwwiwi/html-components); если виджет не показать, те же данные приходят текстом.
 - Сохранённые диалоги: `/cc resume`, выгрузка в файл, выбор модели.
-- По желанию — память уроков и навыков (`/memory`), см. [plugin/docs/learning.md](plugin/docs/learning.md).
+- Codex Brain включён по умолчанию. Факты, задачи, предложения и контекст сжатия доступны через `/memory` в личном чате владельца. [Руководство по памяти](plugin/docs/learning.md)
 
 ## Голосовые сообщения
 
@@ -144,7 +144,7 @@ Codex пишет ответ в Markdown — это простая разметк
 | `/lease <задача>[; ttl=48h]`, `/lease revoke <ID>`, `/lease consume <ID>` | выдать, посмотреть или отозвать мандат автономии |
 | `/cc` | `compact`, `context`, `status`, `model [имя]`, `resume [номер или ID]`, `export`, `cost`, `clear` |
 | `/goal <результат>` | поставить длинную цель; `/goal`, `/goal status`, `/goal pause`, `/goal resume`, `/goal cancel` |
-| `/memory` | предложения памяти и навыки; только при `KROT_CODEX_LEARNING=1` |
+| `/memory` | факты, задачи, предложения и контекст сжатия Brain. Команда `off` выключает Brain |
 | `/pin`, `/unpin` | закрепить или открепить сообщение, на которое вы ответили |
 | `/react <эмодзи>` | поставить реакцию на сообщение, на которое вы ответили |
 | `/edit <текст>` | заменить текст сообщения бота, на которое вы ответили |
@@ -166,12 +166,24 @@ Codex пишет ответ в Markdown — это простая разметк
 
 | Настройка | Как ведёт себя Codex | Когда подходит |
 |---|---|---|
-| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=never` (ставит установщик) или `KROT_CODEX_APPROVALS` не задан | песочница `workspace-write`, политика `never`: карточек нет совсем, агент не ждёт вашего ответа, действия за пределами песочницы не выполняются | по умолчанию: автономный агент внутри рабочей папки |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=never` (ставит установщик) или `KROT_CODEX_APPROVALS` не задан | песочница `workspace-write`, пока системные хуки не прошли проверку, политика `never`: карточек нет совсем, агент не ждёт вашего ответа, действия за пределами песочницы не выполняются | по умолчанию: автономный агент внутри рабочей папки |
 | `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=standard` (`--approval-mode standard`) | песочница `workspace-write`, политика `on-request`: перед действием за пределами песочницы Codex спрашивает; вы видите карточку с точной командой или изменением файла | когда хотите подтверждать действия за пределами рабочей папки |
 | `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | как `standard`, но простые запросы на чтение мост одобряет сам, а до вас доходят рискованные и неясные | когда карточек слишком много |
-| `KROT_CODEX_SANDBOX=danger-full-access`, `KROT_CODEX_APPROVALS` не задан | без песочницы и без карточек: Codex ходит в сеть и пишет везде, куда может пользователь системы | только для отдельного непривилегированного пользователя на сервере, который не жалко переустановить |
+| `KROT_CODEX_SANDBOX=danger-full-access`, системные хуки проверены, режим `never` | Codex ходит в сеть и пишет везде, куда может пользователь системы | только для отдельного непривилегированного пользователя |
 
 `danger-full-access` нельзя совмещать с `KROT_CODEX_PROXY`.
+
+### Полный доступ и системные хуки
+
+В Linux полный доступ даёт агенту право писать везде, где это разрешено его отдельному системному пользователю. Запустите `./install.sh --hooks` от этого пользователя. Попросите администратора проверить и выполнить выведенную строку `sudo install …`. Повторите `./install.sh --hooks`, затем откройте `/doctor` в Telegram или запустите `bun run doctor` из `plugin/`. В режиме `never` мост включает полный доступ после проверки системных хуков. Если проверка не пройдёт, действует песочница рабочей папки.
+
+Хуки защищают файлы `AGENTS.md` и `AGENTS.override.md` в каталоге Codex. Настройка системных хуков и неизменяемого флага Linux описана в [руководстве](codex-hooks/README.md).
+
+### Память Brain
+
+Brain включён по умолчанию. Он хранит факты и открытые задачи из вашего личного чата, чтобы новый или сжатый диалог мог продолжить работу. Пересылки и чужие сообщения отделены от памяти владельца. Отправьте `/memory`, чтобы просмотреть записи, или `/memory off`, чтобы выключить Brain.
+
+При новой установке с выключенным на момент запуска Brain локальный Codex включает встроенную память, если вы не задали эту настройку. Подробнее о [Brain](plugin/docs/learning.md) и [встроенной памяти](plugin/docs/install.md#native-codex-memories).
 
 ## Параллельные ответы
 
@@ -206,7 +218,7 @@ systemctl --user restart krotov-telegram.service
 
 ## Обновление и удаление
 
-Обновление: скрипт подтягивает новую версию из удалённой ветки, которую отслеживает ваша копия репозитория, сначала прогоняет тесты и `doctor` на отдельной копии.
+Обновление: скрипт подтягивает новую версию из ветки upstream, сначала прогоняет тесты и `doctor` на отдельной копии.
 
 ```bash
 ./update.sh            # потом перезапустите, когда бот свободен
@@ -251,7 +263,7 @@ grep -h '"level":"error"' ~/.local/state/krotov-plugin/errors-*.jsonl | tail -n 
 - [plugin/docs/quickstart.md](plugin/docs/quickstart.md): ручная установка на VPS
 - [plugin/docs/install.md](plugin/docs/install.md): развёртывание и команды Telegram (на английском)
 - [plugin/docs/root-backend.md](plugin/docs/root-backend.md): отдельный Codex App Server через локальное реле
-- [plugin/docs/learning.md](plugin/docs/learning.md): память уроков
+- [Codex Brain и перенос старых записей](plugin/docs/learning.md)
 - [CHANGES.md](CHANGES.md): изменения в этом форке (на английском)
 
 Тесты разработчика: `bun test` в папке `plugin/`.

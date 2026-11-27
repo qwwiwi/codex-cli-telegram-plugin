@@ -7,6 +7,7 @@ import type { Message } from 'grammy/types'
 import { frameAgentMessage, startAgentWebhook, type AgentDelivery } from '../../src/codex/agent-webhook.js'
 import { CodexInbox } from '../../src/codex/inbox.js'
 import { agentProvenance, ownerProvenance } from '../../src/codex/provenance.js'
+import { bridgeOrigin } from '../../src/codex/turn-origin.js'
 import { recoverInterruptedWork, type RecoveryDeps, type RecoveryNotice } from '../../src/codex/side-recovery.js'
 import type { Logger } from '../../src/log.js'
 import { workerBody, workerSender } from '../fixtures/agent-webhook/worker-payload.js'
@@ -70,7 +71,7 @@ test('F3: crash before turn/start answered – plain notice, record cleared and 
 test('F3: crash after turn/start – the side job survives the restart and is settled without blocking', async () => {
   const { dir, inbox } = crashedInbox(inbox => {
     inbox.beginFollowUp(message(-8, frameAgentMessage('Собери отчёт', 'swarm')), agentProvenance('swarm'))
-    inbox.startSide(-8, 'side-thread')
+    inbox.startSide(-8, 'side-thread', bridgeOrigin('side-thread'))
     inbox.receive(message(9, 'следующая задача'), ownerProvenance)
   })
   expect(inbox.sideJobs.map(job => ({ id: job.id, thread: job.thread }))).toEqual([{ id: -8, thread: 'side-thread' }])
@@ -88,9 +89,9 @@ test('F3: crash after turn/start – the side job survives the restart and is se
 test('F3: an owner side job is quoted, and a finished side job leaves no record', async () => {
   const { inbox } = crashedInbox(inbox => {
     inbox.beginFollowUp(message(11, 'Отдельный вопрос'), ownerProvenance)
-    inbox.startSide(11, 'side-a')
+    inbox.startSide(11, 'side-a', bridgeOrigin('side-a'))
     inbox.beginFollowUp(message(12, 'Готово'), ownerProvenance)
-    inbox.startSide(12, 'side-b')
+    inbox.startSide(12, 'side-b', bridgeOrigin('side-b'))
     inbox.finishSide(12)
   })
   const notices: RecoveryNotice[] = []
@@ -113,7 +114,7 @@ function deniedDeadLetter() {
 test('a side job whose dead letter cannot be written keeps its record and does not block the queue', async () => {
   const { dir, inbox } = crashedInbox(inbox => {
     inbox.beginFollowUp(message(-8, frameAgentMessage('Собери отчёт', 'swarm')), agentProvenance('swarm'))
-    inbox.startSide(-8, 'side-thread')
+    inbox.startSide(-8, 'side-thread', bridgeOrigin('side-thread'))
     inbox.receive(message(9, 'следующая задача'), ownerProvenance)
   })
   const { deps, notices } = deniedDeadLetter()
@@ -171,4 +172,26 @@ test('a lost worker delivery is reported under its real sender, not the recipien
   await recoverInterruptedWork(inbox, deps)
   expect(notices[0]!.text.startsWith('Сообщение от агента ' + workerSender + ' (')).toBe(true)
   expect(letters[0]!.agent).toBe(workerSender)
+})
+
+test('an isolated turn survives a restart with its side thread and is recovered only from that thread', async () => {
+  const { recoveredTurn } = await import('../../src/codex/inbox.js')
+  const { inbox } = crashedInbox(inbox => {
+    inbox.receive({ ...message(11, 'переслано'), forward_origin: { type: 'hidden_user', date: 1, sender_user_name: 'X' } }, ownerProvenance)
+    inbox.take()
+    inbox.start(11, bridgeOrigin(null))
+    inbox.assignTurn(11, 'side-turn', 'side-thread')
+  })
+  expect(inbox.active?.outcome).toEqual({ stage: 'running', turnId: 'side-turn', thread: 'side-thread' })
+  const asked: string[] = []
+  const history = {
+    main: async () => { asked.push('main'); return [{ id: 'side-turn', status: 'completed', items: [] }] },
+    side: async (thread: string) => { asked.push(thread); return [{ id: 'side-turn', status: 'completed', items: [{ text: 'Side answer' }] }] },
+  }
+  expect(await recoveredTurn('side-turn', 'side-thread', history)).toMatchObject({ items: [{ text: 'Side answer' }] })
+  expect(asked).toEqual(['side-thread'])
+  expect(await recoveredTurn('side-turn', 'side-thread', { ...history, side: async () => { throw new Error('gone') } })).toBeUndefined()
+  expect(asked).toEqual(['side-thread'])
+  expect(await recoveredTurn('main-turn', undefined, history)).toBeUndefined()
+  expect(asked).toEqual(['side-thread', 'main'])
 })

@@ -1,0 +1,5 @@
+{
+  "extends": "../plugin/tsconfig.json",
+  "compilerOptions": { "paths": { "zod": ["../plugin/node_modules/zod"] } },
+  "include": ["src/**/*.ts"]
+}

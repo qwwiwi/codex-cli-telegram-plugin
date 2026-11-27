@@ -410,6 +410,10 @@ export class AgentChatActions {
             if (!this.options.editRich) return false
             await this.options.editRich(id, text)
           } else await this.editAsHtml(id, text)
+          // The message no longer shows the text it was sent with: a widget fallback must not reuse it.
+          for (let index = this.confirmedReplies.length - 1; index >= 0; index--) {
+            if (this.confirmedReplies[index]!.id === id) this.confirmedReplies.splice(index, 1)
+          }
         } else if (action === 'pin') {
           await this.api.pinChatMessage(this.ownerChat, id, { disable_notification: true })
         } else if (action === 'unpin') {

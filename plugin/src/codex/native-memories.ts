@@ -1,13 +1,14 @@
-import { CodexRpc, object } from './rpc.js'
+import { CodexRpc, LOCAL_CODEX_COMMAND, object } from './rpc.js'
 
-const localAppServer = ['codex', 'app-server', '--listen', 'stdio://'] as const
 const probeTimeoutMs = 5000
 
 export async function codexAppServerCommand(
-  cwd: string, env: NodeJS.ProcessEnv, defaultEnabled: boolean,
-  command: readonly [string, ...string[]] = localAppServer,
+  cwd: string, env: NodeJS.ProcessEnv, defaults: { nativeEnabled: boolean; brainEnabled: boolean },
+  command: readonly [string, ...string[]] = LOCAL_CODEX_COMMAND,
 ): Promise<readonly [string, ...string[]]> {
-  if (!defaultEnabled) return command
+  // Brain manages the bridge's owner memory by default. Explicit Codex configuration
+  // still applies because the command is returned without a feature override.
+  if (!defaults.nativeEnabled || defaults.brainEnabled) return command
 
   // Only Codex knows which project layers are trusted and which managed layers apply.
   const probe = new CodexRpc(cwd, env, () => {}, () => {}, command)

@@ -84,7 +84,8 @@ fi
 if (( restart )); then
   restart_target || setup_fail 'Привязка пользовательской службы изменилась во время проверки.'
 fi
-git merge --ff-only "$target"
+# An ignored local file (plugin/.env) that the target starts tracking stops the merge instead of being overwritten.
+git merge --ff-only --no-overwrite-ignore "$target"
 
 restore_previous() {
   printf '%s\n' 'Возвращаю предыдущую версию.' >&2

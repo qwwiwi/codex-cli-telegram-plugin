@@ -21,6 +21,8 @@ const specs = [
   { command: 'edit', description: 'заменить текст выбранного ответа агента' },
   { command: 'get', description: 'передать агенту вложение из цитаты' },
   { command: 'doctor', description: 'самопроверка и сравнение с GitHub; fix — передать агенту' },
+  { command: 'restart', description: 'перезапустить мост (и выйти из безопасного режима)' },
+  { command: 'update', description: 'обновить мост; check | rollback | codex' },
 ] as const
 
 export function codexCommands(config: AppConfig, learningEnabled = false) {
@@ -71,10 +73,13 @@ export function codexCommandSet(
   menuEnv: string | undefined,
   log: Pick<Logger, 'info'>,
   extra: readonly CodexCommandSpec[] = [],
+  brainEnabled = false,
 ) {
-  const help: readonly CodexCommandSpec[] = [...codexCommands(config, learningEnabled), ...extra]
+  const help: readonly CodexCommandSpec[] = [...codexCommands(config, learningEnabled || brainEnabled), ...extra]
   const menu: CodexCommandSpec[] = []
-  for (const name of menuNames(menuEnv)) {
+  const names = menuNames(menuEnv)
+  const showBrain = brainEnabled && names === DEFAULT_MENU_COMMANDS && help.some(spec => spec.command === 'memory')
+  for (const name of showBrain ? [...names, 'memory'] : names) {
     const spec = help.find(item => item.command === name)
     if (!spec) {
       log.info('telegram menu: listed command is not registered, skipped', { command: name })

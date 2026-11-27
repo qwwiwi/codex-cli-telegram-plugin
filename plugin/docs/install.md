@@ -1,4 +1,4 @@
-# Krotov Plugin deployment guide
+# Codex Telegram bridge deployment guide
 
 For a first installation on Ubuntu or Debian, follow the [step-by-step guide](quickstart.md).
 Once configured, run `bun run doctor` from `plugin/` as the bridge user before starting polling.
@@ -19,11 +19,11 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
   `on-request` with its workspace sandbox. The owner sees the exact command or
   file diff. Set `permission_gate.timeout_ms` in the Telegram config to change
   the two-minute timeout.
-- Set `KROT_CODEX_SANDBOX=danger-full-access` for a fully autonomous agent.
-  Codex then runs without its sandbox: it has network access and can write
-  anywhere the service user can. With `KROT_CODEX_APPROVALS` unset or `0`
-  Codex uses `never` and shows no approval cards. Use it only when the bridge
-  runs as a dedicated unprivileged OS user. The default is `workspace-write`.
+- For full access on Linux, use a dedicated unprivileged OS user in approval mode
+  `never`. Run `./install.sh --hooks`, have an administrator run the printed
+  `sudo install …` line, then rerun the installer and check `/doctor`.
+  The bridge uses `workspace-write` until the system-wide managed hooks are
+  verified. See the [hooks guide](../../codex-hooks/README.md).
 - For an existing host-managed Codex App Server, follow the [local relay setup](root-backend.md).
   The relay uses a root-owned configuration file and the Telegram process runs as its own non-root user.
 - Set `KROT_CODEX_AGENT_ID` to match the destination identifier used by an external service.
@@ -84,19 +84,22 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 ## Native Codex memories
 
 A fresh `./install.sh` sets `KROT_CODEX_MEMORIES_DEFAULT=1` in `plugin/.env`.
-When the bridge starts its local Codex App Server, it enables native Codex
-memories if Codex reports no explicit `features.memories` setting in its
-resolved configuration. This leaves
-the user's Codex configuration file intact. The [optional bridge learning
-feature](learning.md) has its own settings.
+When Brain is off at startup, the bridge enables native memories for its local
+Codex App Server if the resolved configuration has no explicit
+`features.memories` setting and Codex reports that the feature is off.
+The bridge leaves Codex's configuration file intact and honors explicit values,
+including when Brain is on. Brain manages `/memory` and its own owner-memory
+boundary. Native memories use Codex's separate store and rules. If both are
+enabled, Brain reports the possible duplication in its status.
 
 To skip this default on a new installation, pass `./install.sh --no-memories`.
 For an existing installation, set `KROT_CODEX_MEMORIES_DEFAULT=0` in
-`plugin/.env` and restart the bridge while it is idle. This uses whatever
-Codex itself is configured to do. To explicitly disable native memories,
-set `memories = false` under `[features]` in the Codex configuration.
-Existing environment files keep their settings on reinstall or update.
-A host-managed App Server continues to use its own configuration.
+`plugin/.env` and restart the bridge while idle to use Codex's own setting.
+Set `memories = false` under `[features]` in your Codex configuration to
+explicitly disable native memories. Reinstall and update preserve the existing
+environment setting. Restart the bridge while idle after `/memory on` or
+`/memory off` if you want the native default reevaluated. A host-managed App
+Server uses its own configuration.
 
 ## Telegram controls
 
@@ -251,10 +254,10 @@ The only route is `POST /webhook` (`POST /` also works); everything else is
 The sender shown to the owner and to Codex is `fromAgent`, else the
 `X-From-Agent` header, else a leading `[Inter-agent от <sender> → <recipient>]`
 line at the very start of `message`, else `unknown`. `agentId` is accepted and
-ignored for display: the gbrain worker puts the recipient there. A worker
+ignored for display: some delivery workers put the recipient there. A worker
 `ПОРЯДОК ДЕЙСТВИЙ:` block after a `---` line, including the ack-only variant
 `ПОРЯДОК ДЕЙСТВИЙ (ack-only fast path, без dual-report):`, is labelled for Codex
-as gbrain delivery protocol, not as the sender's request.
+as delivery protocol.
 
 `chatId` is accepted and ignored: the message always goes to the owner's chat
 (the first `TELEGRAM_ALLOWED_CHAT_IDS` entry). `X-Delivery-Id` is the
@@ -310,8 +313,7 @@ bearer_token_env_var = "GBRAIN_BEARER"
 
 Codex starts with a filtered environment (`plugin/src/codex/environment.ts`):
 Telegram and other bridge credentials never reach it. The one credential the
-bridge passes through for MCP servers is `GBRAIN_BEARER`; despite the name it
-works for any HTTP MCP server that reads its token through
+bridge passes through for MCP servers is `GBRAIN_BEARER`. It works for any HTTP MCP server that reads its token through
 `bearer_token_env_var`. Put the value in `plugin/.env`; logs and replies redact
 it by exact value. A server that needs a different variable needs that name
 added to `codexEnvironment` in `environment.ts`.

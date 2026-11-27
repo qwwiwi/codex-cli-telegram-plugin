@@ -10,6 +10,7 @@ import {
   agentProvenance, agentReplyText, agentTurnInstructions, ownerProvenance, turnIntent, type Provenance,
 } from '../../src/codex/provenance.js'
 import { sideInstructions } from '../../src/codex/parallel.js'
+import { classifyTurn } from '../../src/codex/turn-origin.js'
 
 const OWNER = 42
 const dirs: string[] = []
@@ -38,7 +39,8 @@ function ownerMessage(text: string, id = 7): Message {
 }
 
 function intent(provenance: Provenance, message: Message) {
-  return turnIntent(provenance, {
+  const origin = classifyTurn([message], OWNER, provenance, { brain: true, key: 'test:' + message.message_id })
+  return turnIntent(origin, {
     message, editing: false, verification: false, selfRestart: true, directBackend: true, restartHandoff: true,
     thread: 'main', pending: { thread: 'main', objective: 'Сделай отчёт' },
   })

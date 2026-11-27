@@ -135,6 +135,10 @@ export interface SendMessageOpts {
   // gets the late result. Consumed by the rate-limited layer; the raw layer
   // copies only Telegram fields, so it never reaches the wire.
   signal?: AbortSignal
+  // The signal also cancels the HTTP request once it is on the wire (no late
+  // result): for a bounded notice right before the process exits, which must
+  // not keep the event loop alive. Consumed by the rate-limited layer.
+  abortInFlight?: boolean
   // The owner's reply (final or interim answer text), not an auxiliary send
   // (side card, queue notice, HUD card). Replies run on their own per-chat
   // queue and may use the slots of the minute budget auxiliary sends must
@@ -502,7 +506,11 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       if (opts.disable_notification !== undefined) {
         other.disable_notification = opts.disable_notification
       }
-      const sent = await bot.api.sendMessage(chatId, text, other)
+      // Only the rate-limited layer sets `signal` here (abortInFlight); it aborts the HTTP request.
+      // grammY types its signal with the abort-controller polyfill; the runtime one is the same object
+      // (cast as in telegram/poller.ts).
+      const signal = opts.signal as unknown as Parameters<typeof bot.api.sendMessage>[3]
+      const sent = await bot.api.sendMessage(chatId, text, other, signal)
       return { message_id: sent.message_id }
     },
     async sendRichMessage(chatId, rawMarkdown, opts) {

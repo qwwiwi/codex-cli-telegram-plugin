@@ -158,32 +158,21 @@ test('README badges use plain shields.io paths without escape sequences that mob
   }
 })
 
-// Each README with the heading of its contributors section and the heading where its bottom part
-// (documentation links, license and credits) starts.
-const readmes = [
-  { path: 'README.md', contributors: '## Contributors', bottom: '## Documentation' },
-  { path: 'README.ru.md', contributors: '## Участники', bottom: '## Документация' },
-]
-
-test('[R08] both READMEs credit jasonqwwen with a GitHub link in a contributors section near the end', () => {
-  for (const readme of readmes) {
-    const lines = read(readme.path).split('\n')
-    const start = lines.indexOf(readme.contributors)
-    expect(start, readme.path).toBeGreaterThan(lines.indexOf(readme.bottom))
-    const next = lines.findIndex((line, index) => index > start && line.startsWith('## '))
-    const section = lines.slice(start, next === -1 ? undefined : next).join('\n')
-    expect(section, readme.path).toContain('[jasonqwwen](https://github.com/jasonqwwen)')
-    // The credit to the original plugin author stays.
-    expect(lines.join('\n'), readme.path).toContain('([github.com/PashaKrot](https://github.com/PashaKrot))')
+test('[S9c] the starter AGENTS.md tells the agent where the Codex docs are and to read the changelog before updating', () => {
+  const doc = read('examples/AGENTS.example.md')
+  const start = doc.indexOf('## Codex: обновления и документация')
+  expect(start).toBeGreaterThan(-1)
+  const section = doc.slice(start, doc.indexOf('\n## ', start + 1) === -1 ? undefined : doc.indexOf('\n## ', start + 1))
+  for (const page of ['cli', 'models', 'changelog', 'config-reference']) {
+    expect(section).toContain('https://developers.openai.com/codex/' + page)
   }
+  expect(section).toContain('/update codex')
+  expect(section).toMatch(/changelog[^\n]*(before|перед)/i)
 })
 
-test('[R36] both READMEs mention the fork and upstream only in their bottom part', () => {
-  for (const readme of readmes) {
-    const lines = read(readme.path).split('\n')
-    const bottom = lines.indexOf(readme.bottom)
-    expect(bottom, readme.path).toBeGreaterThan(0)
-    const early = lines.slice(0, bottom).filter(line => /\b(fork|upstream)|форк/i.test(line))
-    expect(early, readme.path).toEqual([])
+test('[S9] the architecture map names the self-update modules and the boot guard', () => {
+  const doc = read('docs/ARCHITECTURE.md')
+  for (const name of ['restart-intent.ts', 'self-update.ts', 'codex-update.ts', 'update-commands.ts', 'watchdogs.ts', 'boot-guard.sh']) {
+    expect(doc).toContain(name)
   }
 })

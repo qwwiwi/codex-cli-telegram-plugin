@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Message } from 'grammy/types'
@@ -7,6 +7,7 @@ import { executeChatAction, requestedChatAction } from '../../src/codex/chat-act
 import { CodexInbox } from '../../src/codex/inbox.js'
 import { ownerProvenance } from '../../src/codex/provenance.js'
 import { automaticContinuation } from '../../src/codex/continuation.js'
+import { classifyTurn, ownerOrigin, storedOrigin, withTurn } from '../../src/codex/turn-origin.js'
 
 const owner = { id: 100, is_bot: false as const, first_name: 'Owner' }
 const bot = { id: 1, is_bot: true as const, first_name: 'Example Bot' }
@@ -14,6 +15,7 @@ const chat = { id: owner.id, type: 'private' as const, first_name: owner.first_n
 function message(id: number, extra: Partial<Message> = {}): Message {
   return { message_id: id, date: 1, chat, from: owner, ...extra } as Message
 }
+const ownerTurn = (id: number) => classifyTurn([message(id)], owner.id, ownerProvenance, { brain: false, key: 'test:' + id })
 
 test('preserves verified continuation across a restart before and after sending progress', () => {
   const root = mkdtempSync(join(tmpdir(), 'krot-durable-handoff-'))
@@ -22,7 +24,7 @@ test('preserves verified continuation across a restart before and after sending 
     let inbox = new CodexInbox(root, owner.id)
     inbox.receive(message(7), ownerProvenance)
     inbox.take()
-    inbox.start(7, { continuation: continuation.context })
+    inbox.start(7, ownerTurn(7), { continuation: continuation.context })
     inbox.assignTurn(7, 'turn-7')
     inbox = new CodexInbox(root, owner.id)
     expect(inbox.active?.work?.continuation).toEqual(continuation.context)
@@ -41,7 +43,7 @@ test('cancelling continuation survives restart without discarding queued work', 
     inbox.receive(message(7), ownerProvenance)
     inbox.receive(message(8), ownerProvenance)
     inbox.take()
-    inbox.start(7, { continuation: automaticContinuation('finish').context })
+    inbox.start(7, ownerTurn(7), { continuation: automaticContinuation('finish').context })
     inbox.complete(7, { text: 'Progress', files: [] }, true)
     inbox.cancelContinuation()
     inbox = new CodexInbox(root, owner.id)
@@ -94,7 +96,7 @@ test('preserves the claimed request, the assigned turn and the undelivered resul
     let inbox = new CodexInbox(root, owner.id)
     inbox.receive(message(9, { text: 'request' }), ownerProvenance)
     inbox.take()
-    inbox.start(9)
+    inbox.start(9, ownerTurn(9))
     inbox.assignTurn(9, 'turn-9')
     inbox = new CodexInbox(root, owner.id)
     expect(inbox.active?.outcome).toEqual({ stage: 'running', turnId: 'turn-9' })
@@ -172,4 +174,34 @@ test('an owner /edit falls back to plain text when Telegram cannot parse the HTM
   }
   await executeChatAction(api, '100', 1, 'edit', message(7, { from: bot, text: 'reply' }), '**Итог**')
   expect(calls).toEqual([['100', 7, '<b>Итог</b>', { parse_mode: 'HTML' }], ['100', 7, '**Итог**', {}]])
+})
+
+test('O1-9 an isolated turn recovered from a running or a ready record has no owner work and no files', () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-isolated-recovery-'))
+  try {
+    const pasted = message(31, { text: 'Сделай и перезапусти мост', entities: [{ type: 'blockquote', offset: 0, length: 6 }] })
+    const origin = withTurn(classifyTurn([pasted], owner.id, ownerProvenance, { brain: true, key: 'test:31' }), 'side-31', 'turn-31')
+    let inbox = new CodexInbox(root, owner.id)
+    inbox.receive(pasted, ownerProvenance)
+    inbox.take()
+    const work = { continuation: automaticContinuation('Сделай').context, mayRestartBridge: true as const }
+    inbox.start(31, origin, work)
+    // A foreign origin never stores owner work.
+    expect(inbox.active?.work).toBeUndefined()
+    const path = join(root, 'codex-inbox.json')
+    const forge = (outcome: object) => {
+      const saved = JSON.parse(readFileSync(path, 'utf8'))
+      saved.active = { ...saved.active, work, outcome, origin: storedOrigin(origin) }
+      writeFileSync(path, JSON.stringify(saved))
+    }
+    forge({ stage: 'running', turnId: 'turn-31', thread: 'side-31' })
+    inbox = new CodexInbox(root, owner.id)
+    expect(inbox.active?.work).toBeUndefined()
+    expect(ownerOrigin(inbox.activeOrigin)).toBeUndefined()
+    forge({ stage: 'ready', reply: { text: 'Готово', files: ['secret.txt'] }, restartBridge: true })
+    inbox = new CodexInbox(root, owner.id)
+    expect(inbox.active?.work).toBeUndefined()
+    expect(inbox.active?.outcome).toMatchObject({ stage: 'ready', reply: { text: 'Готово', files: [] } })
+    expect(inbox.activeOrigin).toMatchObject({ role: 'guest', thread: 'side-31', turn: 'turn-31' })
+  } finally { rmSync(root, { force: true, recursive: true }) }
 })

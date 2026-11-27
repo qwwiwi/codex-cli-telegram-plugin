@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'none'; img-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>Тест передачи ключа</title>
+  <!-- Telegram requires its script in <head> before any other script (design T12). -->
+  <script src="https://telegram.org/js/telegram-web-app.js?65"></script>
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Тест передачи ключа</h1>
+    <p class="warn">Это проверка. Не вставляйте сюда настоящий ключ — подойдёт любой текст.</p>
+
+    <section id="outside" class="card error" hidden>
+      <h2>Откройте страницу в Telegram</h2>
+      <p>Эта страница работает только внутри Telegram. Вернитесь в чат с ботом, отправьте <b>/keytest</b> и нажмите кнопку под полем ввода.</p>
+    </section>
+
+    <section id="app" hidden>
+      <div class="card">
+        <h2>Проверки</h2>
+        <ul class="checks">
+          <li><span class="label">Параметры ссылки</span> <span id="check-params" class="value">…</span></li>
+          <li><span class="label">Шифрование на телефоне</span> <span id="check-crypto" class="value">…</span></li>
+          <li><span class="label">Кнопка действует</span> <span id="check-exp" class="value">…</span></li>
+          <li><span class="label">Клиент</span> <span id="check-client" class="value">…</span></li>
+          <li><span class="label">Нарушения CSP</span> <span id="check-csp" class="value">0</span></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <label for="value">Тестовое значение</label>
+        <input id="value" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="text" placeholder="Любой текст, не настоящий ключ">
+        <button id="paste" type="button" class="secondary">Вставить из буфера</button>
+        <p id="paste-status" class="status" aria-live="polite">Символов: 0</p>
+      </div>
+
+      <button id="send" type="button" class="primary">Отправить тест</button>
+      <p class="note">Боту уйдёт фиксированная тестовая строка (3968 байт), а не то, что вы вставили.</p>
+      <p id="send-status" class="status" aria-live="polite"></p>
+    </section>
+  </main>
+</body>
+</html>

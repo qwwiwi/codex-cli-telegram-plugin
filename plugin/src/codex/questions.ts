@@ -8,18 +8,28 @@ import type { Logger } from '../log.js'
 import { redactSecrets } from '../safety/redact.js'
 import { object } from './rpc.js'
 import type { CardCleanup } from './card-cleanup.js'
+import { mainOrigin, storedOrigin, StoredTurnOriginSchema, type StoredTurnOrigin } from './turn-origin.js'
 
 export const QUESTION_CALLBACK = /^krot:q:([a-f0-9-]{36}):([0-9]|x|d)$/
 const questionMarker = /(?:^|\r?\n)(KROT_QUESTION_[a-f0-9-]{36}) (\{[^\r\n]*\})\s*$/u
 type Answer = Record<string, { answers: string[] }>
 type Choice = { label: string; description?: string }
-export type UnansweredQuestion = { messageId: number; askedAtMs: number; snippet: string; reason: 'timeout' | 'restart' }
+/** The origin of the turn that asked (an isolated turn is not the owner's); read through parseTurnOrigin. */
+export type QuestionOrigin = StoredTurnOrigin
+export type UnansweredQuestion = {
+  messageId: number; askedAtMs: number; snippet: string; reason: 'timeout' | 'restart'; origin?: QuestionOrigin
+}
+
+export function parseQuestionOrigin(value: unknown): QuestionOrigin | undefined {
+  const parsed = StoredTurnOriginSchema.safeParse(value)
+  return parsed.success ? parsed.data : undefined
+}
 type CardState = 'open' | 'closed' | UnansweredQuestion['reason']
 type StoredQuestion = Omit<UnansweredQuestion, 'reason'> & { body: string; state: CardState; reported: boolean }
 type QuestionOptions = {
   timeoutMs: number
   previewChars: number
-  persistence?: { root: string; log: Logger }
+  persistence?: { root: string; log: Logger; legacyMainThread?: () => string | null }
   onUnanswered?: (question: UnansweredQuestion) => void | Promise<void>
 }
 type Pending = { id: string; card?: StoredQuestion;
@@ -77,15 +87,27 @@ export class QuestionCards {
     try {
       const { chat, entries } = object(JSON.parse(readFileSync(join(persistence.root, journalFile), 'utf8')))
       if (chat !== this.chat || !Array.isArray(entries)) return
+      let legacyMainThread: string | null | undefined
       for (const value of entries.slice(-maxSavedCards)) {
-        const { messageId, askedAtMs, snippet, body, state, reported } = object(value)
+        const { messageId, askedAtMs, snippet, body, state, reported, origin: savedOrigin } = object(value)
         if (typeof messageId !== 'number' || !Number.isSafeInteger(messageId) || messageId <= 0 ||
             typeof askedAtMs !== 'number' || !Number.isSafeInteger(askedAtMs) || askedAtMs <= 0 ||
             typeof body !== 'string' || typeof snippet !== 'string' ||
             (state !== 'open' && state !== 'closed' && state !== 'timeout' && state !== 'restart')) continue
+        let origin = parseQuestionOrigin(savedOrigin)
+        if (!origin) {
+          const legacy = object(savedOrigin)
+          if (legacy.role === 'owner' && typeof legacy.thread === 'string' &&
+              legacy.thread.length > 0 && legacy.thread.length <= 200 && Object.keys(legacy).length === 2) {
+            origin = storedOrigin(mainOrigin(legacy.thread))
+          } else if (savedOrigin === undefined) {
+            if (legacyMainThread === undefined) legacyMainThread = persistence.legacyMainThread?.() ?? null
+            if (legacyMainThread && legacyMainThread.length <= 200) origin = storedOrigin(mainOrigin(legacyMainThread))
+          }
+        }
         this.retained.set(messageId, { messageId, askedAtMs, state, reported: reported === true,
           body: redactSecrets(body, this.secrets).slice(0, 3600),
-          snippet: redactSecrets(snippet, this.secrets).slice(0, 200) })
+          snippet: redactSecrets(snippet, this.secrets).slice(0, 200), ...(origin ? { origin } : {}) })
       }
     } catch (error) {
       if (object(error).code !== 'ENOENT') persistence.log.warn('Could not read pending Telegram questions')
@@ -94,7 +116,7 @@ export class QuestionCards {
 
   get isPending(): boolean { return this.current !== undefined }
 
-  async ask(raw: unknown, signal?: AbortSignal): Promise<Answer> {
+  async ask(raw: unknown, signal?: AbortSignal, origin?: QuestionOrigin): Promise<Answer> {
     const answers: Answer = Object.create(null)
     if (!Array.isArray(raw)) return answers
     for (const question of raw.slice(0, 4).map(object)) {
@@ -105,7 +127,7 @@ export class QuestionCards {
           ...(typeof option.description === 'string' ? { description: option.description } : {}),
         }] : []) : []
       const answer = await this.show(question.question, options, question.isOther === true || options.length === 0,
-        question.multiSelect === true, signal)
+        question.multiSelect === true, signal, origin)
       if (answer === undefined) break
       answers[question.id] = { answers: answer }
     }
@@ -163,8 +185,10 @@ export class QuestionCards {
     const persistence = this.options.persistence
     if (!persistence) return false
     try {
+      // Explicit null distinguishes newly saved unattributed cards from pre-origin cards.
+      const entries = [...this.retained.values()].map(card => ({ ...card, origin: card.origin ?? null }))
       atomicWriteInRoot(persistence, journalFile,
-        JSON.stringify({ chat: this.chat, entries: [...this.retained.values()] }) + '\n')
+        JSON.stringify({ chat: this.chat, entries }) + '\n')
       return true
     } catch {
       persistence.log.warn('Could not persist pending Telegram questions')
@@ -187,7 +211,7 @@ export class QuestionCards {
   }
 
   private async closeCard(card: StoredQuestion): Promise<void> {
-    const { messageId, askedAtMs, snippet, state } = card
+    const { messageId, askedAtMs, snippet, state, origin } = card
     if (state === 'open') return
     let closed = false
     try {
@@ -206,7 +230,7 @@ export class QuestionCards {
     }
     if (state !== 'closed' && !card.reported && this.options.onUnanswered) {
       try {
-        await this.options.onUnanswered({ messageId, askedAtMs, snippet, reason: state })
+        await this.options.onUnanswered({ messageId, askedAtMs, snippet, reason: state, ...(origin ? { origin } : {}) })
         card.reported = true
         this.persist()
       } catch {
@@ -217,7 +241,8 @@ export class QuestionCards {
     if (closed) this.forget(messageId)
   }
 
-  private show(question: string, choices: Choice[], other: boolean, multiSelect: boolean, signal?: AbortSignal): Promise<string[] | undefined> {
+  private show(question: string, choices: Choice[], other: boolean, multiSelect: boolean, signal?: AbortSignal,
+    origin?: QuestionOrigin): Promise<string[] | undefined> {
     if (this.suspended || this.current || signal?.aborted) return Promise.resolve(undefined)
     const id = randomUUID()
     const safe = (text: string) => redactSecrets(text, this.secrets)
@@ -291,7 +316,7 @@ export class QuestionCards {
       signal?.addEventListener('abort', cancel, { once: true })
       void this.api.sendMessage(this.chat, body, { reply_markup: keyboard() }).then(({ message_id }) => {
         const card: StoredQuestion = { messageId: message_id, body: savedBody, snippet,
-          askedAtMs: Date.now(), state, reported: false }
+          askedAtMs: Date.now(), state, reported: false, ...(origin ? { origin } : {}) }
         pending.card = card
         this.track(card)
         if (state !== 'open' && state !== 'restart') void this.closeCard(card)

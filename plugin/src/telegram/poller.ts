@@ -32,6 +32,7 @@ import type { AppConfig, StatePaths } from '../config.js'
 import type { Logger } from '../log.js'
 import { TelegramUpdateSchema } from '../schemas.js'
 import { readUpdateOffset, writeDeadLetter, writeUpdateOffset } from '../state/store.js'
+import { sealWebAppData, type WebAppHandover } from './handover-seal.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // Public types
@@ -61,6 +62,11 @@ export interface PollerDeps {
   statePaths: StatePaths
   log: Logger
   onUpdate: (update: Update) => Promise<void>
+  // Called after every successful getUpdates round (the boot health mark needs the first one).
+  onPollSuccess?: () => void
+  // Set only while the secret hand-over spike is on: every update is sealed before validation and a
+  // direct web_app_data submission goes here instead of onUpdate, validation and dead letters.
+  onHandover?: (handover: WebAppHandover) => Promise<void>
 }
 
 export interface PollResult {
@@ -404,6 +410,9 @@ function validateUpdate(
   return { ok: false, error: parsed.error.message, update_id: probedId }
 }
 
+// Marker for an update the hand-over seal consumed.
+const SEALED: unique symbol = Symbol('sealed')
+
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) {
@@ -526,7 +535,9 @@ export class TelegramPoller {
 
     let handled = 0
     let errors = 0
-    for (const update of updates as unknown[]) {
+    for (const raw of updates as unknown[]) {
+      const update = await this.seal(raw)
+      if (update === SEALED) continue
       const v = validateUpdate(update)
       if (!v.ok) {
         errors++
@@ -579,6 +590,27 @@ export class TelegramPoller {
     return { handled, errors, offsetAfter: this.offset }
   }
 
+  // Takes a web_app_data submission out of the normal path (design 7.1): it is handed to
+  // onHandover, never validated, dispatched or dead-lettered, and only a fixed line is logged
+  // (no payload, no error message). Returns SEALED when the update was consumed here.
+  private async seal(raw: unknown): Promise<unknown> {
+    const onHandover = this.deps.onHandover
+    if (!onHandover) return raw
+    const sealed = sealWebAppData(raw)
+    if (sealed.kind === 'update') return sealed.update
+    const { update_id: updateId, message_id: messageId } = sealed.handover
+    try {
+      await onHandover(sealed.handover)
+    } catch {
+      this.deps.log.error('web_app_data consumer failed; dropped', { update_id: updateId, message_id: messageId })
+    }
+    if (updateId !== undefined) {
+      this.offset = updateId + 1
+      writeUpdateOffset(this.deps.statePaths, this.offset)
+    }
+    return SEALED
+  }
+
   // ─────────────────────────────────────────────────────────────────
   // Internal loop
   // ─────────────────────────────────────────────────────────────────
@@ -612,9 +644,12 @@ export class TelegramPoller {
         conflict401Counter = 0
         unauthorizedCounter = 0
         floodCounter = 0
+        this.deps.onPollSuccess?.()
 
-        for (const update of updates as unknown[]) {
+        for (const raw of updates as unknown[]) {
           if (this.stopping) break
+          const update = await this.seal(raw)
+          if (update === SEALED) continue
           const v = validateUpdate(update)
           if (!v.ok) {
             log.error('update failed Zod validation — dead-letter, advancing offset', {
