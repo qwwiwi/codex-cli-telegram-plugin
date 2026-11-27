@@ -5,6 +5,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { z } from 'zod'
 import { parseReactionPalette } from './codex/reactions.js'
+import { BRIDGE_UNIT_NAME } from './codex/unit-contract.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // AppConfig — the merged, validated runtime config.
@@ -528,6 +529,7 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_OPEN_QUESTION_REMINDER_MS: z.coerce.number().int().nonnegative().optional(),
   TELEGRAM_ALBUM_FLUSH_MS: z.coerce.number().int().positive().optional(),
   GROQ_API_KEY: z.string().optional(),
+  KROT_CODEX_SERVICE_NAME: z.string().regex(BRIDGE_UNIT_NAME).or(z.literal('')).optional(),
   // never: no approval cards at all, even with KROT_CODEX_APPROVALS=1 (codex/approval-mode.ts).
   KROT_CODEX_APPROVAL_MODE: z.enum(['standard', 'risky', 'never']).optional(),
   // Codex sandbox (session.ts CodexSandboxMode). Absent means workspace-write.

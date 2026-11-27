@@ -14,7 +14,7 @@ import type { SendMessageOpts, TelegramApi } from '../channel/tools.js'
 import { getStatePaths, loadConfig, resolveAskGuardMode, resolveHudEnabled, resolveOutboxEnabled, RuntimeEnvSchema } from '../config.js'
 import {
   plainTextWithLinks, PreformattedDocumentError, protectPlainFallbackCuts, redactedRenderOffset, resumeMessagePlan,
-  splitMessage, splitMessageFrom, splitPlainFallback, TELEGRAM_MAX_MESSAGE,
+  splitMessage, splitMessageFrom, splitPlainFallback, splitPlainMessage, TELEGRAM_MAX_MESSAGE,
 } from '../format/chunk.js'
 import { splitMessageLegacy } from '../format/chunk-legacy.js'
 import { splitLongBlock, splitLongBlockLegacy } from '../format/paragraphs.js'
@@ -67,7 +67,7 @@ import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, format
   readClaudeArchive, sendConversation } from './conversation-export.js'
 import { CodexInbox, recoveredTurn, type InboxReply } from './inbox.js'
 import { startExternalTasks } from './external.js'
-import { agentWebhookSettings, routeAgentMessage, startAgentWebhook, type AgentDelivery,
+import { agentOwnerNoticeMode, agentWebhookSettings, routeAgentMessage, startAgentWebhook, type AgentDelivery,
   type DeliverOutcome } from './agent-webhook.js'
 import { codexEnvironment, exactSecrets } from './environment.js'
 import { agentBody, agentLabel, agentProvenance, agentReplyText, agentTurnInstructions, ownerProvenance, turnIntent,
@@ -81,7 +81,8 @@ import {
 } from './restart-bridge.js'
 import { BridgeRestartHandoff, isRestartVerificationMessage } from './restart-handoff.js'
 import { readHandoffContext } from './handoff-context.js'
-import { AgentChatActions, agentChatInstructions as baseChatInstructions, chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
+import { AgentChatActions, agentChatInstructions as baseChatInstructions, agentChatInstructionsWithoutWidgets,
+  chatContextPrefix, executeChatAction, isChatAction, requestedChatAction,
   downloadQuotedAttachment, safeActionTarget, type ChatAction } from './chat-actions.js'
 import { AgentComponents, finalAfterComponents, isComponentTool } from './components.js'
 import { ackInbound, ackReactionMode, parseReactionPalette, reactionInstructions } from './reactions.js'
@@ -106,6 +107,7 @@ import { errorDetail, ErrorJournal, errorLogDays } from './error-log.js'
 import { RenderEyes, type RenderView } from './render-eyes.js'
 import { isRenderPreviewTool, renderPreview } from './render-preview.js'
 import { EXIT } from './exit-codes.js'
+import { bridgeUnitName } from './unit-contract.js'
 import { startupFailureExit } from './startup-failure.js'
 import { TurnAdmission } from './turn-admission.js'
 import { BootLedger, HealthMark } from './boot-ledger.js'
@@ -180,7 +182,11 @@ async function main(): Promise<void> {
   // KROT_ACK_REACTION=off: no automatic 👀 on inbound messages; the agent reacts itself from the palette.
   const ackMode = ackReactionMode(env)
   const reactionPalette = parseReactionPalette(env.KROT_REACTION_PALETTE)
-  const agentChatInstructions = baseChatInstructions + ' ' + reactionInstructions(reactionPalette)
+  const widgetCapability = { disabled: false }
+  const widgetsAvailable = () => !widgetCapability.disabled
+  const agentChatInstructions = () => (widgetsAvailable() ? baseChatInstructions : agentChatInstructionsWithoutWidgets) +
+    ' ' + reactionInstructions(reactionPalette)
+  const agentNoticesEnabled = agentOwnerNoticeMode(process.env.KROT_AGENT_WEBHOOK_OWNER_NOTICE) !== 'off'
   // Throws on KROT_CODEX_APPROVAL_MODE=risky without KROT_CODEX_APPROVALS=1.
   const approvalSetup = resolveApprovalSetup({
     KROT_CODEX_APPROVALS: process.env.KROT_CODEX_APPROVALS,
@@ -342,6 +348,7 @@ async function main(): Promise<void> {
     safe: async entry => entry,
   })
   const bridgeRepo = join(import.meta.dir, '..', '..', '..')
+  const unitName = bridgeUnitName(process.env.KROT_CODEX_SERVICE_NAME)
   const sendOwner = (text: string) => reliableTelegram.sendMessage(String(ownerId), redactSecrets(text, secrets), {})
   const proxy = process.env.KROT_CODEX_PROXY
   if (!proxy) {
@@ -362,7 +369,7 @@ async function main(): Promise<void> {
     ...(process.env.KROT_UPDATE_BRANCH ? { branch: process.env.KROT_UPDATE_BRANCH } : {}),
     // The unit must run the guard copy outside the checkout: an update cannot delete or break that one.
     guardInstalled: async () => {
-      const unit = await runCommand('systemctl', ['--user', 'show', '--property=ExecStartPre', '--value', 'krotov-telegram.service'],
+      const unit = await runCommand('systemctl', ['--user', 'show', '--property=ExecStartPre', '--value', unitName],
         { cwd: bridgeRepo, timeoutMs: 10_000 })
       return unit.code === 0 && unit.stdout.includes(guardCopy) && existsSync(guardCopy)
     },
@@ -420,7 +427,7 @@ async function main(): Promise<void> {
       log.error('Update rolled back after failed boots', { from: report.from, to: report.to, markedBad: Boolean(bad) })
       notify('⚠️ Обновление до ' + report.to.slice(0, 12) + ' не заработало нормально, поэтому я вернул прежнюю версию ' +
         report.from.slice(0, 12) + '. Бот работает как раньше.' + badText +
-        ' Причину видно на сервере: journalctl --user -u krotov-telegram.service -n 80')
+        ` Причину видно на сервере: journalctl --user -u ${unitName} -n 80`)
     } else if (report?.kind === 'rollback_failed') {
       log.error('Update rollback failed', { from: report.from, to: report.to, markedBad: Boolean(bad) })
       notify('⚠️ Обновление до ' + report.to.slice(0, 12) + ' не заработало, и вернуть версию ' + report.from.slice(0, 12) +
@@ -459,6 +466,7 @@ async function main(): Promise<void> {
       errors: () => errorJournal.recent(),
       cache: () => ({ thread: cacheStats.thread(threadId), day: cacheStats.day() }),
       renders: () => renderEyes.recent(),
+      widgetsAvailable,
       pendingUpdate: () => selfUpdate.pending(),
       codexUpdate: () => readCodexRecord(paths.root),
       stateDir: paths.root, brain: () => brain.status(),
@@ -698,6 +706,7 @@ async function main(): Promise<void> {
     })
     effects = ownerEffects
     const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => codexEnvironment.test(name)))
+    codexEnv.KROT_CODEX_SERVICE_NAME = unitName
     if (riskyApprovals) codexEnv.KROT_CODEX_APPROVAL_MODE = 'risky'
     const modelCommand = proxy ? ['/usr/bin/sudo', '-n', '--', proxy] as const : undefined
     summarizeBrain = createBrainSummarizer({
@@ -798,6 +807,7 @@ async function main(): Promise<void> {
       // The root relay admits a fixed turn/start key set without `summary`; there the
       // server's own Codex config decides whether summaries stream.
       reasoningSummary: !proxy && config.status.thoughts?.enabled === true,
+      widgetsAvailable,
       onWarning: message => log.warn(message),
       onTokenUsage: (threadId, tokenUsage) => cacheStats.record(threadId, tokenUsage),
       // The one registration point of the owner's main thread (A1, N2): resume, start, fork and archive.
@@ -806,11 +816,15 @@ async function main(): Promise<void> {
       onThread: id => {
         try { controls.remember(id) } catch (error) { warnError(error, 'Could not remember the Codex conversation') }
       },
-      onProgress: kind => {
+      onProgress: (kind, item) => {
         if (controls.mirror) {
           mirror ??= new CodexMirror(telegram, ownerChat, secrets, agentName)
-          mirror.event(kind)
+          mirror.event(kind, item)
         }
+      },
+      onTurnProgressEnd: status => {
+        finishMirror(status === 'interrupted' ? 'Задача остановлена' :
+          status === 'completed' ? 'Работа завершена' : 'Работа завершилась с ошибкой')
       },
       onActivity: (event, thread) => {
         brain.observe(event)
@@ -820,11 +834,6 @@ async function main(): Promise<void> {
         const line = card ? sideActivityLine(event, secrets) : undefined
         if (card && line) card.show(sideThinking + '\n' + line)
         if (!thread || event.params.threadId !== thread) return
-        if (controls.mirror && event.method === 'item/commandExecution/outputDelta' &&
-            typeof event.params.delta === 'string' && typeof event.params.itemId === 'string') {
-          mirror ??= new CodexMirror(telegram, ownerChat, secrets, agentName)
-          mirror.output(event.params.itemId, event.params.delta)
-        }
         if (event.method === 'thread/goal/updated' && controls.goalThread === thread) {
           const state = object(event.params.goal).status
           setGoalActive(state === 'active')
@@ -860,9 +869,6 @@ async function main(): Promise<void> {
         }
         if (hudReady && event.method === 'item/completed') {
           const item = object(event.params.item)
-          if (controls.mirror && item.type === 'commandExecution' && typeof item.id === 'string') {
-            mirror?.output(item.id, '', typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput : '')
-          }
           // A turn answering another agent never asks the owner questions or acts in the Telegram chat.
           const untrusted = typeof event.params.turnId === 'string' && codex.isUntrustedTurn(thread, event.params.turnId)
           if (item.type === 'agentMessage' && item.delivery === 'async' &&
@@ -1518,7 +1524,7 @@ async function main(): Promise<void> {
       components: new AgentComponents(telegram, ownerChat, {
         beforeSend: (): Promise<void> => hudAnchor.settled(),
         redact: (text: string): string => redactSecrets(text, secrets),
-        log, secrets,
+        log, secrets, widgetCapability,
       }),
       reactionPalette,
       redact: text => redactSecrets(text, secrets),
@@ -1679,7 +1685,7 @@ async function main(): Promise<void> {
     }
 
     function finishMirror(text: string): void {
-      mirror?.update(text)
+      mirror?.finish(text)
       mirror = undefined
     }
 
@@ -1882,7 +1888,7 @@ async function main(): Promise<void> {
         try {
           const learned = brain.enabled || mode === 'resume' ? '' : learning?.context(args)
           const goalContext = [
-            ...(completion ? [goalLeasePrefix, leases.instructions(), completion.instructions, agentChatInstructions,
+            ...(completion ? [goalLeasePrefix, leases.instructions(), completion.instructions, agentChatInstructions(),
               'Если в карточке нужны несколько ответов, напиши в заголовке вопроса «Выбери несколько».'] : []),
             learned,
           ].filter(Boolean).join('\n\n')
@@ -2044,7 +2050,7 @@ async function main(): Promise<void> {
         }
         return report
       },
-      send, repo: bridgeRepo, selfRestart: selfRestartEnabled, secrets,
+      send, repo: bridgeRepo, selfRestart: selfRestartEnabled, unitName, secrets,
       // R38: /doctor tests. Each check names only what failed; secrets are masked in self-test.ts.
       selfTest: () => runSelfTests({
         config: () => {
@@ -2392,11 +2398,11 @@ async function main(): Promise<void> {
       }
     }
 
-    function resumeInbox(message?: Message): void {
+    function resumeInbox(message?: Message, notifyOwner = true): void {
       if (stopping) return
       const waiting = !!task || goalActive || externalQuestion
       startNext()
-      if (!waiting) return
+      if (!waiting || !notifyOwner) return
       // Built when it is sent: if this message was taken meanwhile, it waits for nothing and gets no notice.
       const notice = () => stopping || (message && inbox.active?.messages[0]?.message_id === message.message_id)
         ? undefined : (message && message.message_id > 0
@@ -2492,6 +2498,7 @@ async function main(): Promise<void> {
       const id = message.message_id
       const epoch = stopEpoch
       const agent = provenance.origin === 'agent'
+      const notifyOwner = !agent || agentNoticesEnabled
       const brainEnabled = brain.enabled
       sides.begin(id, redactSecrets(taskTitle(agentBody(message.text) ?? message.caption), secrets), reuse)
       const settleSide = () => {
@@ -2535,7 +2542,7 @@ async function main(): Promise<void> {
             release()
             const ticket = await brain.turnStarting({ ...brainInput(message, sideOrigin, undefined, input.text), sessionId: 'unbound' })
             if (ticket) await brain.turnDelivered(ticket, { status: 'failed', error: input.text })
-            await send(input.text)
+            if (notifyOwner) await send(input.text)
             return
           }
           const isolated = sideOrigin.isolate
@@ -2547,7 +2554,7 @@ async function main(): Promise<void> {
             ? [sideInstructions(summary, provenance), input.text].filter(Boolean).join('\n\n')
             : sideOwnerTurn(formatReminderOn,
               [sideInstructions(summary, provenance), chatContext([message]), ownWords ? renderEyes.takeNote() : '', input.text],
-              brainEnabled ? '' : agentChatInstructions)
+              brainEnabled ? '' : agentChatInstructions())
           card?.show(sideThinking)
           const safeReuse = !brainEnabled || !reuse || await brain.isSafeSide(reuse, isolated ? 'guest' : 'side') ? reuse : undefined
           brainTurn = brain.execution(sideOrigin.role, brainInput(message, sideOrigin, input.text))
@@ -2566,6 +2573,10 @@ async function main(): Promise<void> {
             // A finished answer is delivered even if the main task was stopped meanwhile.
             const text = redactSecrets(hideLeaseCompletions(result.text), secrets)
             if (brainTurn.ticket) await brain.turnAnswered(brainTurn.ticket, text)
+            if (!notifyOwner) {
+              await recordBrainDelivery(brainTurn.ticket, { status: 'cancelled' })
+              return
+            }
             let sent = false
             const queued = await sendFinalText(text, sideOrigin, false, id > 0 ? id : undefined, undefined, messageId => {
               sent = true
@@ -2591,7 +2602,7 @@ async function main(): Promise<void> {
             if (result.status === 'failed') log.warn('Codex side turn ended without text', ended)
             else log.info('Codex side turn ended without text', ended)
             const notice = sideEndNotice(result.status, delivered)
-            if (notice && epoch === stopEpoch) await send(notice)
+            if (notice && notifyOwner && epoch === stopEpoch) await send(notice)
           }
         } catch (error) {
           warnError(error, 'Could not finish a parallel Codex turn', { area: 'side-turn', messageId: id })
@@ -2602,7 +2613,7 @@ async function main(): Promise<void> {
             started = true
             inbox.finishFollowUp(id, true)
             resumeInbox(message)
-          } else if (epoch === stopEpoch) {
+          } else if (notifyOwner && epoch === stopEpoch) {
             await send('Не удалось завершить параллельную задачу.').catch(() => undefined)
           }
         } finally {
@@ -2660,7 +2671,7 @@ async function main(): Promise<void> {
             resumeInbox(messages[0])
             return
           }
-          accepted = await codex.steer([followUpInstructions, agentChatInstructions, chatContext(messages), input.text]
+          accepted = await codex.steer([followUpInstructions, agentChatInstructions(), chatContext(messages), input.text]
             .filter(Boolean).join('\n\n'), id, input.images, turnId)
           completedRequest = true
         }
@@ -3003,7 +3014,7 @@ async function main(): Promise<void> {
       if (result.status !== 'completed' || !result.text.trim()) {
         await recordBrainDelivery(brainTurn.ticket, result.status === 'interrupted' ? { status: 'cancelled' } :
           { status: 'failed', error: 'Codex did not produce an agent reply' })
-        await send(result.status === 'interrupted' ? 'Задача от агента ' + agent + ' остановлена.'
+        if (agentNoticesEnabled) await send(result.status === 'interrupted' ? 'Задача от агента ' + agent + ' остановлена.'
           : 'Codex не вернул ответ на сообщение агента ' + agent + '.')
         inbox.finish(id)
         return
@@ -3020,7 +3031,8 @@ async function main(): Promise<void> {
       const id = active.messages[0]!.message_id
       // Continuation and restart act for the owner: only for an owner turn origin with owner provenance,
       // never for an agent's, an isolated forward's or an unknown record.
-      const fromOwner = inbox.provenance(id).origin === 'owner'
+      const provenance = inbox.provenance(id)
+      const fromOwner = provenance.origin === 'owner'
       const origin = inbox.activeOrigin ?? parseTurnOrigin(undefined, id)
       const by = fromOwner ? ownerOrigin(origin) : undefined
       const { reply } = active.outcome
@@ -3029,6 +3041,11 @@ async function main(): Promise<void> {
       const restartVerification = by !== undefined && active.outcome.restartVerification === true
       const ticket = brainTurn ? brainTurn.ticket : (await brainRecovery(active.messages[0]!)) ?? undefined
       if (ticket) await brain.turnAnswered(ticket, reply.text)
+      if (provenance.origin === 'agent' && !agentNoticesEnabled) {
+        await recordBrainDelivery(ticket, { status: 'cancelled' })
+        inbox.finish(id)
+        return
+      }
       let delivered: boolean
       try {
         delivered = await deliverReply(reply, id, origin)
@@ -3085,6 +3102,8 @@ async function main(): Promise<void> {
       // The message waits for nothing now: its «В очереди» notice goes away.
       for (const taken of messages) void queueNotices.pickedUp(taken.message_id)
       const epoch = stopEpoch
+      const sender = inbox.provenance(first.message_id)
+      const notifyOwner = sender.origin !== 'agent' || agentNoticesEnabled
       work.begin(first.message_id > 0 ? first.message_id : undefined)
       mainStartedAt = Date.now()
       task = (async () => {
@@ -3107,20 +3126,19 @@ async function main(): Promise<void> {
           cancelMedia = undefined
           if (stopping) return
           if (cancelled) {
-            await send('Обработка вложения отменена.')
+            if (notifyOwner) await send('Обработка вложения отменена.')
             inbox.finish(first.message_id)
             return
           }
           if (input.kind === 'error') {
-            const failed = brainInput(first, classifyTurn(messages, ownerId, inbox.provenance(first.message_id),
+            const failed = brainInput(first, classifyTurn(messages, ownerId, sender,
               { brain: brain.enabled, key: brainKey(first) }), undefined, input.text)
             const ticket = await brain.turnStarting({ ...failed, sessionId: codex.currentThread ?? 'unbound' })
             if (ticket) await brain.turnDelivered(ticket, { status: 'failed', error: input.text })
-            await send(input.text)
+            if (notifyOwner) await send(input.text)
             inbox.finish(first.message_id)
             return
           }
-          const sender = inbox.provenance(first.message_id)
           if (sender.origin === 'agent') {
             await runAgentTurn(first, input.text, sender, epoch)
             return
@@ -3212,7 +3230,7 @@ async function main(): Promise<void> {
             // R42: how Telegram showed the previous reply, once; after the stable prefix, so the cache prefix holds.
             ...(isolate ? [] : [renderEyes.takeNote()].filter(Boolean)), input.text,
             ...(editTarget ? ['Для редактирования верни только готовый новый текст цитируемого сообщения в нужном формате.'] : []),
-          ], isolate ? '' : agentChatInstructions)
+          ], isolate ? '' : agentChatInstructions())
           // An isolated turn runs on a side thread: restart recovery must find it there, not in the main history.
           const saveSideTurn = (thread: string, turnId: string) => {
             try { inbox.assignTurn(first.message_id, turnId, thread) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
@@ -3317,8 +3335,8 @@ async function main(): Promise<void> {
           warnError(error, 'Codex turn failed', { area: 'codex-turn', messageId: first.message_id })
           progressResult = 'Работа завершилась с ошибкой'
           if (!stopping && inbox.active?.outcome.stage !== 'ready') {
-            await recordBrainDelivery(brainTurn?.ticket, { status: 'failed', error: 'Codex turn failed' }, brainTurn, true)
-            await send('Не удалось завершить задачу Codex.')
+            await recordBrainDelivery(brainTurn?.ticket, { status: 'failed', error: 'Codex turn failed' }, brainTurn, notifyOwner)
+            if (notifyOwner) await send('Не удалось завершить задачу Codex.')
           }
         } finally {
           // A running side turn may be waiting on its own approval card.
@@ -3369,6 +3387,7 @@ async function main(): Promise<void> {
         inbox.retryClaim()
         // Never quotes a synthetic id; a refused notice does not block clearing the record.
         await recoverInterruptedWork(inbox, {
+          notifyAgent: agentNoticesEnabled,
           send: async notice => {
             await withoutDeletedQuote(id => telegram.sendMessage(ownerChat, notice.text,
               id === undefined ? {} : { reply_to_message_id: id }), notice.replyTo)
@@ -3386,6 +3405,9 @@ async function main(): Promise<void> {
         }
         if (await codex.previousTurnIdle()) {
           if (active?.outcome.stage === 'running') {
+            const original = active.messages[0]!
+            const provenance = inbox.provenance(original.message_id)
+            const notifyOwner = provenance.origin !== 'agent' || agentNoticesEnabled
             const turn = await recoveredTurn(active.outcome.turnId, active.outcome.thread, {
               main: async () => (await codex.recentTurns()).turns,
               side: thread => codex.sideTurns(thread),
@@ -3394,10 +3416,9 @@ async function main(): Promise<void> {
             if (typeof answer === 'string') {
               for (const message of active.messages) acknowledge(message)
               const targetId = active.messages[0]?.reply_to_message?.message_id
-              const original = active.messages[0]!
               // Every saved owner capability below needs a saved owner provenance and an owner turn origin;
               // an agent's, an isolated forward's or an unknown record gets none of them.
-              const by = inbox.provenance(original.message_id).origin === 'owner'
+              const by = provenance.origin === 'owner'
                 ? ownerOrigin(inbox.activeOrigin) : undefined
               const fromOwner = by !== undefined
               const work = fromOwner ? active.work : undefined
@@ -3422,10 +3443,10 @@ async function main(): Promise<void> {
               inbox.complete(original.message_id, { ...reply, text: redactSecrets(reply.text, secrets) },
                 interim !== undefined, restart.requested && epoch === stopEpoch, restart.verify)
               await finishOrdinaryReply(epoch, true)
-              if (!context && hideContinuationMarker(answer) !== answer) {
+              if (notifyOwner && !context && hideContinuationMarker(answer) !== answer) {
                 await send('Сохранил промежуточный ответ. Автоматическое продолжение этой задачи не удалось восстановить.')
               }
-            } else {
+            } else if (notifyOwner) {
               await send('После перезапуска не удалось восстановить результат этой задачи. Проверь, какие действия уже выполнились, прежде чем запускать её снова.')
             }
             inbox.finish(active.messages[0]!.message_id)
@@ -3501,28 +3522,34 @@ async function main(): Promise<void> {
         from: { id: Number(ownerChat), is_bot: false, first_name: 'Telegram' },
       }
       const provenance = agentProvenance(delivery.agentId, delivery.senderVerified)
-      const notify = () => { void send(redactSecrets(delivery.notice, secrets)).catch((error: unknown) => warnError(error, 'Could not notify the owner about an agent message')) }
+      const notify = async () => {
+        if (delivery.notice === undefined) return
+        for (const part of splitPlainMessage(redactSecrets(delivery.notice, secrets))) await send(part)
+      }
+      const notifyOwner = () => {
+        void notify().catch((error: unknown) => warnError(error, 'Could not notify the owner about an agent message'))
+      }
       const busy = !!task || goalActive || codex.isRunning
       const route = routeAgentMessage(delivery.input, { busy, parallel, sides })
       // Same paths as an owner message (side thread or queue), but never a steer into the main turn.
       if (route.route === 'side') {
         try {
           if (launchSide(message, route.thread, provenance)) {
-            notify()
+            notifyOwner()
             return 'accepted'
           }
         } catch (error) { warnError(error, 'Could not persist the agent message for a parallel turn') }
       }
       const outcome = inbox.receive(message, provenance)
       if (outcome !== 'accepted') return outcome
-      notify()
+      notifyOwner()
       if (hudReady) hudAnchor.ownerMessage()
       if (busy && parallel.enabled) {
         startNext()
-        if (inbox.active?.messages[0]?.message_id !== id) {
+        if (agentNoticesEnabled && inbox.active?.messages[0]?.message_id !== id) {
           void send(busyNotice(mainSummary(), sides.titles, parallel.maxParallel)).catch(() => undefined)
         }
-      } else resumeInbox(message)
+      } else resumeInbox(message, agentNoticesEnabled)
       return 'accepted'
     }
     const agentWebhookConfig = agentWebhookSettings(process.env)

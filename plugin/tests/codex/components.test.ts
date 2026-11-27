@@ -382,6 +382,24 @@ test('[R12][R13] a send_component replayed after 1,000 schema calls in the same 
 // The shape of a Telegram error description: an UPPER_SNAKE code after the HTTP status. The code below is an example of
 // that shape, not a claim about a real Bot API code.
 const TELEGRAM_CODE = 'INPUT_WIDGET_REPLY_NOT_ALLOWED'
+
+test('a media-widget capability refusal falls back once and skips later widget requests', async () => {
+  const attempts: Array<number | undefined> = []
+  const { actions, calls } = bridge({
+    async sendWidget(_chat, params) {
+      attempts.push(params.reply_to_message_id)
+      throw refusal('INPUT_MEDIA_WIDGET_NOT_ALLOWED')
+    },
+  })
+  actions.remember(1321, false)
+  const args = { component: 'kpi', data: pack('kpi', 'example.json'), target: 1321 }
+  for (const id of ['first', 'second']) {
+    const result = await actions.component(id, 'send_component', args, () => true)
+    expect(parsed(result)).toMatchObject({ ok: true, delivery: 'text' })
+  }
+  expect(attempts).toEqual([1321])
+  expect(calls.map(call => call[0])).toEqual(['text', 'text'])
+})
 const refusal = (code: string) =>
   Object.assign(new Error(`Call to 'sendWidget' failed! (400: Bad Request: ${code})`), { error_code: 400 })
 

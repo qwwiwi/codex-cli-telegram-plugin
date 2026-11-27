@@ -15,6 +15,7 @@
 // always return a `ValidatedHtml`. Empty input is valid.
 
 import { plainTextWithLinks, TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
+import { isTelegramLink } from '../format/html.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // Allowlist. Source of truth: https://core.telegram.org/bots/api#html-style.
@@ -44,11 +45,6 @@ const ALLOWED_TAGS: ReadonlySet<string> = new Set([
 // Void elements never have a closing tag. Currently only `br` in the
 // Telegram allowlist; declared separately so future additions stay tidy.
 const VOID_TAGS: ReadonlySet<string> = new Set(['br'])
-
-// `<a>` accepts a small set of URL schemes. Anything else (javascript:,
-// data:, vbscript:, file:, etc.) is unsafe — even if Telegram clients
-// happen to render it, we refuse and downgrade.
-const SAFE_HREF_RE = /^(https?:|tg:|mailto:)/i
 
 // Per-tag attribute allowlist. Source: Telegram's HTML style spec —
 // https://core.telegram.org/bots/api#html-style. The bot API rejects
@@ -348,7 +344,7 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
       if (href === null) {
         return downgrade(input, '<a> missing href')
       }
-      if (!SAFE_HREF_RE.test(href)) {
+      if (!isTelegramLink(href)) {
         // Reason is payload-free — we never include the href value here.
         return downgrade(input, 'unsafe href protocol on <a>')
       }

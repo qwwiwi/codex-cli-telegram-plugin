@@ -10,6 +10,14 @@ The Telegram bridge runs as a dedicated non-root service user and serves one own
 
 ## Configure
 
+`./install.sh` uses the user service `krotov-telegram.service` by default. For
+another checkout under the same user, pass `--service-name NAME`, for example
+`--service-name krotov-test.service`, and give it its own bot, workspace, and
+state directory. The installer stops if the selected service points to a
+different checkout. It saves the chosen name in `plugin/.env` as
+`KROT_CODEX_SERVICE_NAME`. Later installs, `./update.sh`, `/doctor`, and the
+boot guard use that service.
+
 - Install Bun and the official Codex CLI. Run the normal ChatGPT sign-in as the pilot service user before starting Telegram polling. The pilot checks the account type at startup.
 - Set `TELEGRAM_BOT_TOKEN` to the test bot token and `TELEGRAM_EXPECTED_BOT_ID` to that bot's numeric ID. Keep the token in a private environment file.
 - Set both `TELEGRAM_ALLOWED_USER_IDS` and `TELEGRAM_ALLOWED_CHAT_IDS` to the owner’s numeric Telegram ID.
@@ -193,6 +201,10 @@ Each check fetches the tracked branch (or `KROT_UPDATE_BRANCH`). Only a new
 fast-forward commit goes further. The bridge copies that commit to
 `<state>/update-stage`, installs its locked dependencies there, runs its tests,
 bundles the bridge entry point and then runs `bun run doctor` with the saved `plugin/.env`, as `./update.sh` does.
+Both staged test runs give each Bun test 60,000 ms by default. Set
+`KROT_UPDATE_TEST_TIMEOUT_MS` in `plugin/.env` for `/cc update` and automatic
+updates, or in the shell environment for `./update.sh`. Use a positive integer
+in milliseconds.
 The checkout is touched only after this staged check passes, and only while no
 turn, goal, side thread or queued message is running: the update waits for an
 idle bridge, then fast-forwards, type-checks and restarts.
@@ -254,6 +266,7 @@ listener is off by default; nothing changes until you set
 | `KROT_AGENT_WEBHOOK_LISTEN` | `host:port` to listen on, for example `192.0.2.10:8097`. IPv6 as `[::1]:8097`. |
 | `KROT_AGENT_WEBHOOK_TOKEN` | Bearer token. When set, `Authorization: Bearer <token>` must match (constant-time compare), otherwise 401. |
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | Comma-separated source IPs. When set, any other socket peer gets 403. `X-Forwarded-For` is ignored. |
+| `KROT_AGENT_WEBHOOK_OWNER_NOTICE` | `brief` (default), `full`, or `off`. Controls Telegram notices and whether webhook replies are echoed to the owner. |
 
 Set the token, the IP list or both. With neither, the bridge logs an error and
 does not start the listener: it never runs open. When both are set, both must
@@ -268,6 +281,7 @@ token shared only with those agents):
 KROT_AGENT_WEBHOOK_LISTEN=192.0.2.10:8097
 KROT_AGENT_WEBHOOK_TOKEN=<long random token>
 KROT_AGENT_WEBHOOK_ALLOW_IPS=192.0.2.21,192.0.2.22
+KROT_AGENT_WEBHOOK_OWNER_NOTICE=brief
 ```
 
 A sending agent then calls `POST http://192.0.2.10:8097/webhook` with
@@ -282,8 +296,9 @@ The only route is `POST /webhook` (`POST /` also works); everything else is
 
 The sender shown to the owner and to Codex is `fromAgent`, else the
 `X-From-Agent` header, else a leading `[Inter-agent от <sender> → <recipient>]`
-line at the very start of `message`, else `unknown`. `agentId` is accepted and
-ignored for display: some delivery workers put the recipient there. A worker
+or `[Inter-agent from <sender> -> <recipient>]` header at the start of `message`,
+else `unknown`. Senders inferred from the message text are marked unverified.
+The worker can supply the recipient in `agentId` when the header is missing. A worker
 `ПОРЯДОК ДЕЙСТВИЙ:` block after a `---` line, including the ack-only variant
 `ПОРЯДОК ДЕЙСТВИЙ (ack-only fast path, без dual-report):`, is labelled for Codex
 as delivery protocol.
@@ -306,8 +321,11 @@ Codex receives the message as data, not as an owner instruction:
 <message>
 ```
 
-The owner also gets a Telegram notice «Сообщение от агента <name>: <first 200
-characters>». An idle Codex starts a turn with the message. A busy Codex queues
+In `brief` mode, the owner gets one line in the form `<from> → <to>: <first sentence>`.
+If the sentence exceeds 200 characters, it ends at a word boundary with an ellipsis.
+In `full` mode, the owner gets the whole message body after the sender and recipient.
+Both modes omit the worker header. In `off` mode, Codex still processes the task
+with owner notices and reply echoes disabled. An idle Codex starts a turn. A busy Codex queues
 it like an owner message, or, with `KROT_CODEX_PARALLEL=1`, opens a side thread
 when a slot is free. An agent message never steers the running main turn.
 Logs record the agent name and message length, never the token or the body.
@@ -317,9 +335,9 @@ for an agent message runs with sandbox `workspace-write` and no approvals; the
 owner's own turns keep the configured mode. Agent input never reaches the
 owner-task classifiers, the saved pending owner task, automatic continuation,
 leases, learning, memory, bridge restart, question cards, Telegram chat actions
-or attachments. The reply reaches the owner as «Ответ на сообщение агента
+or attachments. With notices enabled, the main turn's reply reaches the owner as «Ответ на сообщение агента
 <name>: …». If the bridge stops while an agent's side turn runs, the owner gets
-a plain notice after the restart and the message body is kept in the
+a plain notice after the restart when notices are enabled. The message body is kept in the
 `webhook` dead-letter bucket.
 
 ## MCP servers
@@ -347,9 +365,13 @@ bridge passes through for MCP servers is `GBRAIN_BEARER`. It works for any HTTP 
 it by exact value. A server that needs a different variable needs that name
 added to `codexEnvironment` in `environment.ts`.
 
-With `KROT_CODEX_APPROVALS=1`, an MCP tool call that Codex asks to approve
-shows up as an approval card in Telegram. Restart the service after you change the Codex
-configuration.
+With approval cards enabled (`standard` or `risky`), an MCP tool call that
+Codex asks to approve shows up as an approval card in Telegram. When approvals
+are off (`KROT_CODEX_APPROVAL_MODE=never`, or approvals left unset), add
+`default_tools_approval_mode = "approve"` under each enabled HTTP server's
+`[mcp_servers.<name>]` table. This lets Codex call that server's tools without
+waiting for an approval. `/doctor` warns about enabled HTTP servers missing
+this value. Restart the bridge service after changing the Codex configuration.
 
 ## Codex subagents
 

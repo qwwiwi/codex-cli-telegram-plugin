@@ -5,7 +5,7 @@ import { type ApprovalSetup, resolveApprovalSetup } from '../src/codex/approval-
 import { ackReactionMode, parseReactionPalette } from '../src/codex/reactions.js'
 import { OWNER_INSTRUCTIONS_CHECK_PREFIX, ownerInstructionChecks, ownerInstructionsHome } from '../src/codex/owner-instructions-lock.js'
 import { CodexRpc, object } from '../src/codex/rpc.js'
-import { unitDrift } from '../src/codex/unit-contract.js'
+import { bridgeUnitName, unitDrift } from '../src/codex/unit-contract.js'
 import { checkHooksPack, defaultPaths, listedHooks, managedCheck, rulesetCheck, type Check, type ListedHook } from '../../codex-hooks/src/install.js'
 import type { Runner } from '../../codex-hooks/src/types.js'
 
@@ -23,7 +23,7 @@ type TelegramMethod = 'getMe' | 'getWebhookInfo'
 type Probes = {
   checkCodex: (env: NodeJS.ProcessEnv, workspace?: string) => Check | Promise<Check>
   telegram: (method: TelegramMethod, token: string) => Promise<Record<string, unknown> | null>
-  // Text of the installed user unit, undefined when there is none; absent skips the unit check.
+  // Overrides the installed user unit lookup; returns undefined when there is no unit.
   unitFile?: (env: NodeJS.ProcessEnv) => string | undefined
   // Hooks as Codex lists them (App Server hooks/list, trust included); used only with KROT_CODEX_HOOKS=1.
   listHooks?: (env: NodeJS.ProcessEnv, workspace: string) => Promise<ListedHook[]>
@@ -36,7 +36,7 @@ type Probes = {
 function readUnitFile(env: NodeJS.ProcessEnv): string | undefined {
   const base = env.XDG_CONFIG_HOME || (env.HOME ? join(env.HOME, '.config') : undefined)
   if (!base) return
-  const path = join(base, 'systemd', 'user', 'krotov-telegram.service')
+  const path = join(base, 'systemd', 'user', bridgeUnitName(env.KROT_CODEX_SERVICE_NAME))
   if (!existsSync(path)) return
   try {
     return readFileSync(path, 'utf8')
@@ -46,11 +46,11 @@ function readUnitFile(env: NodeJS.ProcessEnv): string | undefined {
 }
 
 // Restart-loop protection of an existing unit: install.sh keeps a changed unit, so drift is reported here.
-function unitCheck(text: string): Check {
-  const missing = unitDrift(text)
+function unitCheck(text: string, unitName: string): Check {
+  const missing = unitDrift(text, unitName)
   return missing.length === 0
-    ? { status: 'ok', message: 'Служба krotov-telegram.service защищена от бесконечных перезапусков.' }
-    : { status: 'warning', message: `Служба krotov-telegram.service без защиты от бесконечных перезапусков. Добавьте строки из examples/krotov-telegram.service: ${missing.join(', ')}; затем systemctl --user daemon-reload.` }
+    ? { status: 'ok', message: `Служба ${unitName} защищена от бесконечных перезапусков.` }
+    : { status: 'warning', message: `Служба ${unitName} без защиты от бесконечных перезапусков. Добавьте строки из examples/krotov-telegram.service: ${missing.join(', ')}; затем systemctl --user daemon-reload.` }
 }
 
 function directory(path: string | undefined, writable = true): string | undefined {
@@ -162,7 +162,7 @@ function reactionCheck(env: RuntimeEnv): Check {
 }
 
 // The approval mode the bridge will run with, as resolveApprovalSetup decides it.
-function approvalModeCheck(env: NodeJS.ProcessEnv): Check {
+function approvalModeChecks(env: NodeJS.ProcessEnv, codexHome: string): Check[] {
   let setup: ApprovalSetup
   try {
     setup = resolveApprovalSetup({
@@ -170,19 +170,38 @@ function approvalModeCheck(env: NodeJS.ProcessEnv): Check {
       KROT_CODEX_APPROVAL_MODE: env.KROT_CODEX_APPROVAL_MODE,
     })
   } catch {
-    return { status: 'error', message: 'Для KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1 в plugin/.env.' }
+    return [{ status: 'error', message: 'Для KROT_CODEX_APPROVAL_MODE=risky укажите KROT_CODEX_APPROVALS=1 в plugin/.env.' }]
   }
   if (!setup.cards) {
-    return { status: 'ok', message: 'Режим подтверждений: never. Агент работает автономно, без карточек подтверждения; действия, которым нужно подтверждение, не выполняются.' }
+    const mode: Check = { status: 'ok', message: 'Режим подтверждений: never. Агент работает автономно, без карточек подтверждения; действия, которым нужно подтверждение, не выполняются.' }
+    return env.KROT_CODEX_PROXY ? [mode] : [mode, ...httpMcpApprovalWarnings(codexHome)]
   }
-  return setup.risky
+  return [setup.risky
     ? { status: 'ok', message: 'Режим подтверждений: risky. Карточки приходят только для рискованных и неясных действий.' }
-    : { status: 'ok', message: 'Режим подтверждений: standard. Codex присылает карточку перед действием за пределами песочницы.' }
+    : { status: 'ok', message: 'Режим подтверждений: standard. Codex присылает карточку перед действием за пределами песочницы.' }]
+}
+
+function httpMcpApprovalWarnings(codexHome: string): Check[] {
+  let config: unknown
+  try {
+    config = Bun.TOML.parse(readFileSync(join(codexHome, 'config.toml'), 'utf8'))
+  } catch {
+    return []
+  }
+  const checks: Check[] = []
+  for (const [name, entry] of Object.entries(object(object(config).mcp_servers))) {
+    const server = object(entry)
+    if (typeof server.url === 'string' && server.url && server.enabled !== false &&
+        server.default_tools_approval_mode !== 'approve') {
+      checks.push({ status: 'warning', message: `HTTP MCP-сервер ${JSON.stringify(name)}: при выключенных подтверждениях задайте default_tools_approval_mode = "approve" в config.toml для этого сервера.` })
+    }
+  }
+  return checks
 }
 
 export async function runDoctor(
   env: NodeJS.ProcessEnv,
-  probes: Probes = { checkCodex, telegram, unitFile: readUnitFile },
+  probes: Probes = { checkCodex, telegram },
 ): Promise<Check[]> {
   const checks: Check[] = []
   const report = (passed: boolean, success: string, failure: string) => {
@@ -191,15 +210,14 @@ export async function runDoctor(
   if (process.getuid?.() === 0) {
     checks.push({ status: 'error', message: 'Запустите doctor от того же непривилегированного пользователя, что и мост.' })
   }
-  const unit = probes.unitFile?.(env)
-  if (unit !== undefined) checks.push(unitCheck(unit))
+  const unit = (probes.unitFile ?? readUnitFile)(env)
+  if (unit !== undefined) checks.push(unitCheck(unit, bridgeUnitName(env.KROT_CODEX_SERVICE_NAME)))
 
   const parsed = RuntimeEnvSchema.safeParse(env)
   if (!parsed.success) {
     const fields = [...new Set(parsed.error.issues.map(issue => issue.path.join('.')))]
     checks.push({ status: 'error', message: `Проверьте переменные в plugin/.env: ${fields.join(', ')}.` })
   }
-  if (parsed.success) checks.push(approvalModeCheck(env), reactionCheck(parsed.data))
   let config: ReturnType<typeof loadConfig> | undefined
   if (parsed.success) {
     try {
@@ -222,10 +240,11 @@ export async function runDoctor(
     'Укажите один и тот же числовой ID владельца в TELEGRAM_ALLOWED_USER_IDS и TELEGRAM_ALLOWED_CHAT_IDS.')
 
   const workspace = directory(config?.workspace_root, !env.KROT_CODEX_PROXY)
+  const codexHome = ownerInstructionsHome(env, workspace)
+  if (parsed.success) checks.push(...approvalModeChecks(env, codexHome), reactionCheck(parsed.data))
   if (env.KROT_CODEX_PROXY) {
     checks.push({ status: 'info', message: `${OWNER_INSTRUCTIONS_CHECK_PREFIX}lock check does not apply in proxy mode` })
   } else {
-    const codexHome = ownerInstructionsHome(env, workspace)
     checks.push(...(probes.ownerInstructionChecks ?? ownerInstructionChecks)(codexHome))
   }
   const state = directory(env.TELEGRAM_STATE_DIR)

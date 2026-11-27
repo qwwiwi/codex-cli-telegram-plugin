@@ -21,6 +21,7 @@ export interface RecoveryNotice {
 
 export interface RecoveryDeps {
   send: (notice: RecoveryNotice) => Promise<void>
+  notifyAgent?: boolean
   /** Keeps the body of an agent message whose turn was lost. */
   deadLetter: (record: { agent: string; messageId: number; text: string; stage: 'unconfirmed' | 'interrupted' }) => void
   log: Logger
@@ -58,6 +59,7 @@ async function settle(inbox: CodexInbox, message: Message, stage: 'unconfirmed' 
       kept = false
       deps.log.warn('Could not keep a lost agent message; its record stays for the next recovery')
     }
+    if (deps.notifyAgent === false) return kept
     const what = 'Сообщение от агента ' + agentLabel(provenance) + ' («' + taskTitle(agentBody(message.text)) + '»)'
     const where = kept ? ' Текст сохранён в журнале недоставленных.'
       : ' Сохранить текст в журнал недоставленных не удалось, запись оставлена до следующего перезапуска.'

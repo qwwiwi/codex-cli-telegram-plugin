@@ -27,13 +27,19 @@ test('doctor verifies ChatGPT login through the configured App Server connection
   expect((await probeProxy(import.meta.dir, process.env, [...command, 'apiKey'])).status).toBe('error')
 })
 
-async function checkInstallation(options: { botId?: number; webhook?: string; omitOwner?: boolean; networkError?: boolean; env?: Record<string, string>; instructionsProtected?: boolean; mutableOverride?: boolean } = {}) {
+async function checkInstallation(options: { botId?: number; webhook?: string; omitOwner?: boolean; networkError?: boolean; env?: Record<string, string>; instructionsProtected?: boolean; mutableOverride?: boolean; codexConfig?: string; unit?: { name: string; text: string } } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'krotov-doctor-'))
   try {
     mkdirSync(join(root, 'workspace'))
     mkdirSync(join(root, 'state'))
     const codexHome = join(root, 'codex')
     mkdirSync(codexHome)
+    if (options.codexConfig !== undefined) writeFileSync(join(codexHome, 'config.toml'), options.codexConfig)
+    if (options.unit) {
+      const units = join(root, 'config/systemd/user')
+      mkdirSync(units, { recursive: true })
+      writeFileSync(join(units, options.unit.name), options.unit.text)
+    }
     writeFileSync(join(codexHome, 'AGENTS.md'), '')
     const override = join(codexHome, 'AGENTS.override.md')
     if (options.mutableOverride) writeFileSync(override, '')
@@ -50,6 +56,7 @@ async function checkInstallation(options: { botId?: number; webhook?: string; om
       TELEGRAM_WORKSPACE_ROOT: join(root, 'workspace'),
       TELEGRAM_STATE_DIR: join(root, 'state'),
       CODEX_HOME: codexHome,
+      XDG_CONFIG_HOME: join(root, 'config'),
       ...options.env,
     }, {
       checkCodex: () => ({ status: 'ok', message: 'Codex CLI готов' }),
@@ -69,6 +76,58 @@ async function checkInstallation(options: { botId?: number; webhook?: string; om
     rmSync(root, { recursive: true, force: true })
   }
 }
+
+test('doctor reads the configured service unit and checks its own failure notifier', async () => {
+  const name = 'fixture-bridge.service'
+  const text = `
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=6
+OnFailure=fixture-bridge-failed.service
+[Service]
+ExecStartPre=-/bin/bash "/fixture state/boot-guard.sh"
+Restart=on-failure
+RestartSec=10s
+RestartForceExitStatus=75
+SuccessExitStatus=75
+RestartPreventExitStatus=78
+TimeoutStopSec=90`
+  const { checks } = await checkInstallation({ unit: { name, text }, env: { KROT_CODEX_SERVICE_NAME: name } })
+  expect(checks.find(check => check.message.includes(name))?.status).toBe('ok')
+})
+
+test('doctor warns about enabled HTTP MCP servers without default tool approval when cards are off', async () => {
+  const codexConfig = `
+[mcp_servers."needs-approval"]
+url = "https://mcp.example.test/private"
+default_tools_approval_mode = "prompt"
+[mcp_servers.missing]
+url = "https://mcp.example.test/missing"
+enabled = true
+[mcp_servers.approved]
+url = "https://mcp.example.test/approved"
+default_tools_approval_mode = "approve"
+[mcp_servers.disabled]
+url = "https://mcp.example.test/disabled"
+enabled = false
+[mcp_servers.local]
+command = "fixture-mcp"
+`
+  const warnings = (checks: Awaited<ReturnType<typeof runDoctor>>) => checks.filter(check =>
+    check.status === 'warning' && check.message.includes('default_tools_approval_mode = "approve"'))
+  const approvalsOff: Record<string, string>[] = [{}, { KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' }]
+  for (const env of approvalsOff) {
+    const { checks } = await checkInstallation({ codexConfig, env })
+    const messages = warnings(checks).map(check => check.message).join('\n')
+    expect(messages).toContain('needs-approval')
+    expect(messages).toContain('missing')
+    expect(messages).not.toMatch(/mcp\.example\.test|approved|disabled|fixture-mcp/)
+  }
+  for (const mode of ['standard', 'risky']) {
+    const { checks } = await checkInstallation({ codexConfig, env: { KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: mode } })
+    expect(warnings(checks)).toEqual([])
+  }
+})
 
 test('doctor verifies a private setup without reading Telegram updates', async () => {
   const { checks, calls } = await checkInstallation()

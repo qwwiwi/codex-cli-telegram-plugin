@@ -237,6 +237,8 @@ type ComponentOptions = {
   log?: Pick<Logger, 'warn'>
   // Configured secret values, masked in the logged description.
   secrets?: readonly string[]
+  // Shared with the Codex tool catalog and /doctor for this process.
+  widgetCapability?: { disabled: boolean }
 }
 
 export type ComponentOutcome = {
@@ -283,15 +285,25 @@ function isNotAllowed(error: unknown): boolean {
   return status === 400 && /\b[A-Z][A-Z_]*ALLOWED\b/.test(error instanceof Error ? error.message : String(error))
 }
 
+function isWidgetCapabilityRefusal(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('error_code' in error) || error.error_code !== 400) return false
+  const detail = 'description' in error && typeof error.description === 'string' ? error.description :
+    error instanceof Error ? error.message : ''
+  return /\bINPUT_MEDIA_WIDGET_NOT_ALLOWED\b/u.test(detail)
+}
+
 // Ids of the messages this process sent as components; update_component may
 // delete only these. In memory: after a restart the model sends a new component.
 const registryLimit = 200
 
 export class AgentComponents {
   private readonly sent = new Set<number>()
+  private readonly widgetCapability: { disabled: boolean }
 
   constructor(private readonly api: ComponentApi, private readonly ownerChat: string,
-    private readonly options: ComponentOptions = {}) {}
+    private readonly options: ComponentOptions = {}) {
+    this.widgetCapability = options.widgetCapability ?? { disabled: false }
+  }
 
   // Runs one component tool call. Never throws; `known` says whether a reply target is a known chat message,
   // `current` whether the turn may still act (checked again after the wait for the HUD card), `delivered` the ID of a
@@ -377,7 +389,7 @@ export class AgentComponents {
     await this.options.beforeSend?.()
     if (!current()) return { kind: 'failed', reason: 'Ход остановлен, компонент не отправлен.' }
     let replyTo = target
-    let reason = checkWidgetChat(this.ownerChat) ??
+    let reason = this.widgetCapability.disabled ? 'Виджеты отключены до перезапуска моста.' : checkWidgetChat(this.ownerChat) ??
       (carriesSecret(data, redact) ? 'данные содержат секрет, он скрыт в текстовой версии' : undefined)
     if (reason === undefined) {
       const rendered = renderComponentWidget(component, data)
@@ -399,6 +411,11 @@ export class AgentComponents {
             this.options.log?.warn('Telegram did not accept a widget', {
               component, error: errorDetail(error, this.options.secrets), ambiguous: isAmbiguous(error),
             })
+            if (isWidgetCapabilityRefusal(error)) {
+              this.widgetCapability.disabled = true
+              reason = 'Telegram не поддерживает виджеты (INPUT_MEDIA_WIDGET_NOT_ALLOWED). Виджеты отключены до перезапуска моста.'
+              break
+            }
             if (isAmbiguous(error)) return { kind: 'unknown', reason: `отправка виджета прервалась (${errorText(error)})` }
             // A flood wait is still running: any text copy now would be one more send into it.
             if (classifySendError(error, 0).kind === 'rate_limited') {

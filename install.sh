@@ -19,6 +19,7 @@ usage() {
   cat <<'HELP'
 Использование
   ./install.sh [--start] [--agent-name NAME] [--workspace PATH] [--state-dir PATH]
+               [--service-name NAME]
                [--approval-mode never|standard|risky] [--hooks | --no-hooks] [--no-memories]
   ./install.sh --non-interactive --token-file PATH [--owner-id ID | --pair-code CODE] [--start]
   ./install.sh --dry-run
@@ -37,6 +38,7 @@ usage() {
   как защита установлена от root: установщик печатает одну строку sudo install, выполни её и
   запусти ./install.sh --hooks ещё раз. Запускай мост под отдельным пользователем без sudo.
 --start включает пользовательскую службу и автозапуск. Нужен вход в Codex через ChatGPT.
+--service-name задаёт имя пользовательской службы (по умолчанию krotov-telegram.service).
 HELP
 }
 
@@ -46,12 +48,13 @@ non_interactive=0
 token_file=''
 pair_code=''
 approval_mode=''
+service_name=''
 memories_default=1
 hooks=''
 fresh=0
 while (( $# )); do
   case $1 in
-    --owner-id|--token-file|--workspace|--state-dir|--agent-name|--pair-code|--approval-mode)
+    --owner-id|--token-file|--workspace|--state-dir|--agent-name|--pair-code|--approval-mode|--service-name)
       (( $# >= 2 )) && [[ -n $2 && $2 != --* ]] || setup_fail 'После параметра нужно указать значение.'
       case $1 in
         --owner-id) owner=$2 ;;
@@ -60,6 +63,10 @@ while (( $# )); do
         --state-dir) state=$2 ;;
         --agent-name) agent_name=$2 ;;
         --pair-code) pair_code=$2 ;;
+        --service-name)
+          service_name=$2
+          if [[ $service_name != *.service ]]; then service_name+=.service; fi
+          setup_valid_unit_name "$service_name" || setup_fail 'Укажи допустимое имя службы, например my-bridge.service.' ;;
         --approval-mode)
           case $2 in
             never|standard|risky) approval_mode=$2 ;;
@@ -80,6 +87,7 @@ done
 
 if (( dry_run )); then
   printf '%s\n' 'План: проверить зависимости и вход Codex, связать личку, установить зависимости проекта, запустить doctor и подготовить службу.'
+  if [[ -n $service_name ]]; then printf 'Служба: %s\n' "$service_name"; fi
   if [[ -n $approval_mode ]]; then printf 'Режим подтверждений: %s\n' "$approval_mode"
   else printf '%s\n' 'Режим подтверждений новой установки: never.'; fi
   if (( memories_default )); then
@@ -97,10 +105,68 @@ setup_prerequisites curl jq systemctl
 setup_lock
 plugin_dir=$setup_repo/plugin
 env_file=$plugin_dir/.env
-unit_name=krotov-telegram.service
+if [[ -e $env_file || -L $env_file ]]; then setup_private_file "$env_file"; fi
+unit_name=${service_name:-$(setup_read_unit_name "$env_file")}
 unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 unit_file=$unit_dir/$unit_name
-failed_unit_name=krotov-telegram-failed.service
+failed_unit_name=${unit_name%.service}-failed.service
+failed_unit_file=$unit_dir/$failed_unit_name
+
+unit_escape() {
+  local text=$1
+  [[ $text != *$'\r'* && $text != *$'\n'* ]] || setup_fail 'В пути службы есть перенос строки.'
+  text=${text//%/%%}
+  text=${text//\\/\\\\}
+  printf '%s' "${text//\"/\\\"}"
+}
+
+write_failed_unit() {
+  printf '%s\n' '[Unit]' 'Description=Tell the Krotov bridge owner that the service stopped restarting' '[Service]' 'Type=oneshot'
+  printf 'ExecStart=/bin/bash "%s" "%s"' "$(unit_escape "$plugin_dir/scripts/notify-failed.sh")" "$(unit_escape "$env_file")"
+  if [[ $unit_name != krotov-telegram.service ]]; then printf ' "%s"' "$unit_name"; fi
+  printf '\n'
+}
+
+foreign_unit() {
+  setup_fail "Служба $unit_name уже привязана к другой рабочей копии ($1). Укажи другое имя через --service-name NAME."
+}
+
+# The unit on disk can exist even if the user manager is unavailable or has not reloaded it.
+if [[ -f $unit_file ]]; then
+  disk_directory=$(awk '
+    /^[[:space:]]*\[/ { service = ($0 ~ /^[[:space:]]*\[Service\][[:space:]]*$/) }
+    service && /^[[:space:]]*WorkingDirectory[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*-?[[:space:]]*/, "")
+      sub(/[[:space:]]*$/, "")
+      if ($0 ~ /^".*"$/) $0 = substr($0, 2, length($0) - 2)
+      directory = $0
+    }
+    END { print directory }
+  ' "$unit_file")
+  # Resolve supported specifiers in one pass, including literal percent signs.
+  directory_tail=$disk_directory
+  resolved_directory=''
+  while [[ $directory_tail == *%* ]]; do
+    resolved_directory+=${directory_tail%%\%*}
+    directory_tail=${directory_tail#*\%}
+    case $directory_tail in
+      h*) resolved_directory+=$HOME ;;
+      %*) resolved_directory+=% ;;
+      *) foreign_unit "$disk_directory" ;;
+    esac
+    directory_tail=${directory_tail:1}
+  done
+  resolved_directory+=$directory_tail
+  setup_same_checkout "$resolved_directory" || foreign_unit "${resolved_directory:-WorkingDirectory}"
+fi
+if live_directory=$(systemctl --user show --property=WorkingDirectory --value "$unit_name" 2>/dev/null) &&
+    [[ $live_directory == /* ]] && ! setup_same_checkout "$live_directory"; then
+  foreign_unit "$live_directory"
+fi
+if [[ -e $failed_unit_file || -L $failed_unit_file ]]; then
+  [[ -f $failed_unit_file && ! -L $failed_unit_file ]] && cmp -s -- "$failed_unit_file" <(write_failed_unit) ||
+    setup_fail "Служба уведомлений $failed_unit_name уже занята. Укажи другое имя через --service-name NAME."
+fi
 
 private_dir() {
   local path=$1
@@ -127,16 +193,21 @@ trap cleanup EXIT
 
 if [[ -e $env_file || -L $env_file ]]; then
   unset setup_token
-  setup_private_file "$env_file"
   printf '%s\n' 'Использую существующий plugin/.env.'
-  if [[ -n $approval_mode ]]; then
+  if [[ -n $approval_mode || -n $service_name ]]; then
     tmp_env=$(mktemp "$plugin_dir/.env.XXXXXXXX")
-    awk '!/^[[:space:]]*(export[[:space:]]+)?KROT_CODEX_(APPROVAL_MODE|APPROVALS)[[:space:]]*=/' \
-      "$env_file" > "$tmp_env"
-    printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "$approval_mode" >> "$tmp_env"
+    awk -v approval="$approval_mode" -v service="$service_name" '
+      approval && /^[[:space:]]*(export[[:space:]]+)?KROT_CODEX_(APPROVAL_MODE|APPROVALS)[[:space:]]*=/ { next }
+      service && /^[[:space:]]*(export[[:space:]]+)?KROT_CODEX_SERVICE_NAME[[:space:]]*=/ { next }
+      { print }
+    ' "$env_file" > "$tmp_env"
+    if [[ -n $approval_mode ]]; then
+      printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "$approval_mode" >> "$tmp_env"
+      printf 'Режим подтверждений: %s\n' "$approval_mode"
+    fi
+    if [[ -n $service_name ]]; then printf 'KROT_CODEX_SERVICE_NAME=%s\n' "$unit_name" >> "$tmp_env"; fi
     mv -fT -- "$tmp_env" "$env_file"
     tmp_env=''
-    printf 'Режим подтверждений: %s\n' "$approval_mode"
   fi
 else
   fresh=1
@@ -202,6 +273,7 @@ else
     printf 'TELEGRAM_ALLOWED_USER_IDS=%s\nTELEGRAM_ALLOWED_CHAT_IDS=%s\n' "$owner" "$owner"
     printf 'TELEGRAM_STATE_DIR="%s"\nTELEGRAM_WORKSPACE_ROOT="%s"\n' "$state" "$workspace"
     printf 'KROT_CODEX_AGENT_NAME="%s"\n' "$agent_name"
+    if [[ -n $service_name ]]; then printf 'KROT_CODEX_SERVICE_NAME=%s\n' "$unit_name"; fi
     # An autonomous agent by default: no approval cards. KROT_CODEX_APPROVALS=1 stays,
     # so switching to standard or risky is one line.
     printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "${approval_mode:-never}"
@@ -273,14 +345,6 @@ fi
   setup_fail 'Не удалось собрать мост. Проверь полноту клона и зависимости.'
 "$setup_bun" run doctor || setup_fail 'Исправь замечания doctor и повтори установку. Настройки уже сохранены.'
 
-unit_escape() {
-  local text=$1
-  [[ $text != *$'\r'* && $text != *$'\n'* ]] || setup_fail 'В пути службы есть перенос строки.'
-  text=${text//%/%%}
-  text=${text//\\/\\\\}
-  printf '%s' "${text//\"/\\\"}"
-}
-
 # The unit runs a copy of the boot guard kept outside the checkout, so an update that deletes or
 # breaks plugin/scripts/boot-guard.sh can still be rolled back; the bridge refreshes it after a healthy update.
 # The bridge reads its state directory from plugin/.env; on a rerun that is the one to use.
@@ -330,15 +394,14 @@ tmp_unit=$(mktemp "$unit_dir/.krotov-telegram.XXXXXXXX")
   printf '%s\n' 'Restart=on-failure' 'RestartSec=10s' 'RestartForceExitStatus=75' 'SuccessExitStatus=75' \
     'RestartPreventExitStatus=78' 'TimeoutStopSec=90' 'UMask=0077' '[Install]' 'WantedBy=default.target'
 } > "$tmp_unit"
-# The failure notifier is ours alone, so it is always rewritten to match this checkout.
+# Publish the per-service notifier without replacing another checkout's unit.
 tmp_failed_unit=$(mktemp "$unit_dir/.krotov-telegram-failed.XXXXXXXX")
-{
-  printf '%s\n' '[Unit]' 'Description=Tell the Krotov bridge owner that the service stopped restarting' '[Service]' 'Type=oneshot'
-  printf 'ExecStart=/bin/bash "%s" "%s"\n' "$(unit_escape "$plugin_dir/scripts/notify-failed.sh")" "$(unit_escape "$plugin_dir/.env")"
-} > "$tmp_failed_unit"
+write_failed_unit > "$tmp_failed_unit"
 chmod 644 -- "$tmp_failed_unit"
-mv -f -- "$tmp_failed_unit" "$unit_dir/$failed_unit_name"
-tmp_failed_unit=''
+if ! ln -T -- "$tmp_failed_unit" "$failed_unit_file" 2>/dev/null; then
+  [[ -f $failed_unit_file && ! -L $failed_unit_file ]] && cmp -s -- "$failed_unit_file" "$tmp_failed_unit" ||
+    setup_fail "Не удалось создать службу уведомлений $failed_unit_name. Укажи другое имя через --service-name NAME."
+fi
 chmod 644 -- "$tmp_unit"
 legacy_old=$(mktemp "$unit_dir/.krotov-telegram-legacy.XXXXXXXX")
 legacy_guard=$(mktemp "$unit_dir/.krotov-telegram-legacy.XXXXXXXX")
@@ -349,7 +412,7 @@ if [[ -f $unit_file && ! -L $unit_file ]] && { cmp -s -- "$legacy_old" "$unit_fi
 fi
 rm -f -- "$legacy_old" "$legacy_guard"
 if [[ ! -e $unit_file && ! -L $unit_file ]]; then
-  ln -- "$tmp_unit" "$unit_file" || setup_fail 'Не удалось создать файл службы.'
+  ln -T -- "$tmp_unit" "$unit_file" || setup_fail 'Не удалось создать файл службы.'
 elif (( legacy )); then
   cp -f -- "$unit_file" "$unit_file.bak"
   mv -f -- "$tmp_unit" "$unit_file"
@@ -367,7 +430,7 @@ if (( start )); then
     setup_fail 'Для автозапуска попроси администратора выполнить sudo loginctl enable-linger ИМЯ и повтори ./install.sh --start.'
   systemctl --user enable --now "$unit_name"
   systemctl --user is-active --quiet "$unit_name" ||
-    setup_fail 'Служба не запустилась. Посмотри journalctl --user -u krotov-telegram.service -n 50.'
+    setup_fail "Служба не запустилась. Посмотри journalctl --user -u $unit_name -n 50."
   printf '%s\n' 'Служба запущена. Отправь боту /help и обычный вопрос, чтобы проверить связь с Codex.'
 else
   printf '%s\n' 'Проверка пройдена. Для запуска и автозапуска выполни ./install.sh --start.'

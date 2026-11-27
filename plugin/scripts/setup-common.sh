@@ -39,6 +39,24 @@ setup_private_file() {
   (( (8#$mode & 077) == 0 )) || setup_fail 'Закрой доступ других пользователей к файлу через chmod 600.'
 }
 
+setup_valid_unit_name() {
+  [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,239}\.service$ ]]
+}
+
+setup_read_unit_name() {
+  local name=''
+  if [[ -e $1 ]]; then
+    name=$("$setup_bun" --no-env-file --env-file="$1" -e 'process.stdout.write(process.env.KROT_CODEX_SERVICE_NAME ?? "")') || return 1
+  fi
+  name=${name:-krotov-telegram.service}
+  setup_valid_unit_name "$name" || setup_fail 'Некорректное имя службы в KROT_CODEX_SERVICE_NAME. Укажи --service-name NAME.'
+  printf '%s\n' "$name"
+}
+
+setup_same_checkout() {
+  [[ $1 == /* && $(realpath -m -- "$1") == "$setup_repo/plugin" ]]
+}
+
 setup_clean_checkout() {
   local changes
   changes=$(git status --porcelain --untracked-files=normal) || return 1

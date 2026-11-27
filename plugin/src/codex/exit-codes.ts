@@ -8,6 +8,7 @@ import { z, ZodError } from 'zod'
 
 import { PollerFatalError } from '../telegram/poller.js'
 import { PublicHomeError } from './public-home.js'
+import { bridgeUnitName } from './unit-contract.js'
 
 export const EXIT = { stop: 0, crash: 1, restart: 75, fatalConfig: 78 } as const
 
@@ -116,7 +117,7 @@ export async function recordFatal({ stateDir, reason, send, now = Date.now, upda
   }
   try {
     await send('Мост остановлен и не будет перезапускаться сам: ошибка настройки.\n\nПричина: ' + reason +
-      '\n\nИсправь настройку на сервере и запусти службу снова: systemctl --user restart krotov-telegram.service')
+      `\n\nИсправь настройку на сервере и запусти службу снова: systemctl --user restart ${bridgeUnitName(process.env.KROT_CODEX_SERVICE_NAME)}`)
   } catch {
     console.error('Could not notify the owner about the fatal configuration error')
   }

@@ -34,6 +34,7 @@
 
 import { resolve } from 'path'
 import { z } from 'zod'
+import { bridgeUnitName } from '../codex/unit-contract.js'
 
 export type PermissionTier = 'allow' | 'deny' | 'confirm'
 
@@ -1201,8 +1202,12 @@ const SYSTEMCTL_VERB_LEAD_RE = /^[a-z][a-z-]*/
 const SYSTEMCTL_OCCURRENCE_RE =
   /(?:^|[\s"'`;|&()<>\\])(?:[^\s"'`;|&()<>=\\]*\/)?systemctl(?=[\s"'`;|&()<>=\\]|$)/g
 
-function systemctlMutation(commandLower: string): boolean {
+function mutatesOwnChannel(commandLower: string): boolean {
   if (!commandLower.includes('systemctl')) return false
+  const legacyUnit = ownChannelUnitRe().test(commandLower)
+  const unit = bridgeUnitName(process.env.KROT_CODEX_SERVICE_NAME).replace(/\.service$/, '').replaceAll('.', '\\.')
+  // systemctl accepts the service stem as shorthand for the full name.
+  const configuredUnit = new RegExp(`(?:^|[^a-z0-9_.@-])${unit}(?:\\.service)?(?![a-z0-9_.@-])`, 'i')
   // Fold backslash line-continuations so `systemctl \<nl> restart` is one call.
   const cmd = commandLower.replace(/\\\r?\n/g, ' ')
   SYSTEMCTL_OCCURRENCE_RE.lastIndex = 0
@@ -1225,6 +1230,8 @@ function systemctlMutation(commandLower: string): boolean {
     }
     const vtok = tokens[k]
     if (vtok === undefined) continue // only flags, no verb (e.g. `-h`) — read-only
+    const args = tokens.slice(k + 1).join(' ').split(/[;|&]/, 1)[0] ?? ''
+    if (!legacyUnit && !configuredUnit.test(args)) continue
     // Strip surrounding quotes (`systemctl 'restart' x`) BEFORE the `$`
     // check, else `systemctl "$verb" unit` strips to `$verb` only after the
     // check and slips through as a mention (Codex review 2026-06-10).
@@ -1255,10 +1262,6 @@ function ownChannelUnitRe(): RegExp {
   // anything else (or empty) falls back to the conservative broad channel match.
   const channelAlt = /^[a-z0-9_-]+$/.test(id) ? `channel-${id}` : 'channel-[a-z0-9_-]+'
   return new RegExp(`(?:^|[^a-z0-9_-])(?:krotov-telegram|${channelAlt}|${GATEWAY_UNIT_ALT})(?![a-z0-9_-])`, 'i')
-}
-
-function mutatesOwnChannel(commandLower: string): boolean {
-  return systemctlMutation(commandLower) && ownChannelUnitRe().test(commandLower)
 }
 
 // ── pipe-to-interpreter: STRUCTURAL network-source → exec detection ──────

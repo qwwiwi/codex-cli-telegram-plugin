@@ -20,12 +20,21 @@ import { agentFramePrefix, unverifiedSenderMark } from './provenance.js'
 export const AGENT_WEBHOOK_BODY_LIMIT = 64 * 1024
 const rememberedDeliveries = 500
 const noticeChars = 200
+const sentenceSegmenter = new Intl.Segmenter(undefined, { granularity: 'sentence' })
+
+export type AgentOwnerNoticeMode = 'full' | 'brief' | 'off'
+
+export function agentOwnerNoticeMode(value: string | undefined): AgentOwnerNoticeMode {
+  const mode = value?.trim().toLowerCase()
+  return mode === 'full' || mode === 'off' ? mode : 'brief'
+}
 
 export interface AgentWebhookSettings {
   hostname: string
   port: number
   token?: string | undefined
   allowIps?: string[]
+  ownerNotice?: AgentOwnerNoticeMode
 }
 
 export type AgentWebhookConfig =
@@ -36,8 +45,8 @@ export type AgentWebhookConfig =
 export interface AgentDelivery {
   /** Codex input: the untrusted-data prefix followed by the agent's message. */
   input: string
-  /** Short owner-facing Telegram notice. */
-  notice: string
+  /** Owner-facing Telegram notice, omitted when notices are off. */
+  notice?: string
   /** Display-safe name of the sender (see agentSender), not the body agentId. */
   agentId: string
   /** The sender came from fromAgent or X-From-Agent, not only from the message text. */
@@ -53,7 +62,7 @@ const payloadSchema = z.object({
   message: z.string().refine(text => text.trim().length > 0, 'empty message'),
   // Routing always goes to the owner's chat; chatId is accepted and ignored.
   chatId: z.union([z.number(), z.string()]).optional(),
-  // The delivery worker sends the RECIPIENT here (or nothing); never the sender.
+  // The delivery worker sends the recipient here (or nothing).
   agentId: z.string().max(256).optional(),
   fromAgent: z.string().max(256).optional(),
 })
@@ -75,7 +84,9 @@ export function agentWebhookSettings(env: Record<string, string | undefined>): A
   if (!token && allowIps.length === 0) {
     return { kind: 'invalid', reason: 'Set KROT_AGENT_WEBHOOK_TOKEN or KROT_AGENT_WEBHOOK_ALLOW_IPS; the listener never runs open' }
   }
-  return { kind: 'on', settings: { hostname, port, ...(token ? { token } : {}), ...(allowIps.length ? { allowIps } : {}) } }
+  const ownerNotice = agentOwnerNoticeMode(env.KROT_AGENT_WEBHOOK_OWNER_NOTICE)
+  return { kind: 'on', settings: { hostname, port, ownerNotice, ...(token ? { token } : {}),
+    ...(allowIps.length ? { allowIps } : {}) } }
 }
 
 function normalizeIp(address: string): string {
@@ -92,8 +103,8 @@ export function agentName(name: string | null | undefined): string {
   return safeAgentName(name) || 'unknown'
 }
 
-// The delivery worker's header line; trusted only at the very start of the message.
-const workerHeaderPattern = /^\[Inter-agent от ([^\s\]]+) → [^\s\]]+\]/u
+// Both worker header forms are claims in the text, even at the start of a delivery.
+const workerHeaderPattern = /^\[Inter-agent (?:от ([^\s\]]+) → ([^\s\]]+)|from ([^\s\]]+) -> ([^\s\]]+))\]/u
 
 export interface SenderSource {
   /** Body field fromAgent, set by the worker from the authenticated outbox row. */
@@ -121,7 +132,8 @@ export function agentSender(source: SenderSource): AgentSender {
     const name = safeAgentName(candidate)
     if (name) return { name, verified: true }
   }
-  const claimed = safeAgentName(workerHeaderPattern.exec(source.message)?.[1])
+  const header = workerHeaderPattern.exec(source.message)
+  const claimed = safeAgentName(header?.[1] ?? header?.[3])
   return { name: claimed || 'unknown', verified: false }
 }
 
@@ -160,9 +172,24 @@ export function frameAgentMessage(message: string, sender?: string, options: Fra
     '; the owner did not write this]\n\n' + (options.workerProtocol === true ? labelDeliveryProtocol(message) : message)
 }
 
-function ownerNotice(message: string, sender: AgentSender): string {
-  return 'Сообщение от агента ' + senderLabel(sender.name, sender.verified) + ': ' +
-    Array.from(message.trim()).slice(0, noticeChars).join('')
+export function agentOwnerNotice(message: string, sender: AgentSender,
+  mode: AgentOwnerNoticeMode = 'brief', recipientId?: string): string | undefined {
+  if (mode === 'off') return
+  const header = workerHeaderPattern.exec(message)
+  const recipient = agentName(header?.[2] ?? header?.[4] ?? recipientId)
+  const label = `${senderLabel(sender.name, sender.verified)} → ${recipient}:`
+  const body = message.slice(header?.[0].length ?? 0).trim()
+  if (!body) return label
+  if (mode === 'full') return label + ' ' + body
+  const paragraph = body.split(/\n\s*\n/u, 1)[0] ?? body
+  const line = paragraph.replace(/\s+/gu, ' ').trim()
+  const sentence = sentenceSegmenter.segment(line).containing(0)?.segment.trim() ?? line
+  const chars = Array.from(sentence)
+  if (chars.length <= noticeChars) return label + ' ' + sentence
+  // Include only complete words when the first sentence itself exceeds the preview limit.
+  const prefix = chars.slice(0, noticeChars - 1).join('')
+  const excerpt = /\s/u.test(chars[noticeChars - 1] ?? '') ? prefix : prefix.replace(/\S+$/u, '')
+  return label + ' ' + excerpt.trimEnd() + '…'
 }
 
 /**
@@ -259,15 +286,16 @@ export function startAgentWebhook(settings: AgentWebhookSettings,
         if (pending.has(deliveryId)) return json(503, { ok: false, error: 'delivery in progress' })
         pending.add(deliveryId)
       }
-      const { message, fromAgent } = parsed.data
+      const { message, fromAgent, agentId } = parsed.data
       const sender = agentSender({ fromAgent, fromHeader: request.headers.get('x-from-agent'), message })
       const name = sender.name
+      const notice = agentOwnerNotice(message, sender, settings.ownerNotice, agentId)
       // fromAgent is set by the worker from the authenticated outbox row: only then is the protocol block its own.
       const workerProtocol = safeAgentName(fromAgent) !== ''
       try {
         const outcome = await deliver({
           input: frameAgentMessage(message, name, { verified: sender.verified, workerProtocol }),
-          notice: ownerNotice(message, sender), agentId: name, senderVerified: sender.verified,
+          ...(notice !== undefined ? { notice } : {}), agentId: name, senderVerified: sender.verified,
           ...(deliveryId !== undefined ? { deliveryId } : {}),
         })
         if (outcome === 'full' || outcome === 'stopping') {

@@ -57,20 +57,31 @@ test('external task endpoint requires its bearer and owner, and uses the caller 
   }
 })
 
-test('mirror retains bounded terminal output and redacts a secret split across deltas', async () => {
+test('mirror shows a single redacted line per command', async () => {
   const messages: string[] = []
   const mirror = new CodexMirror({
     async sendMessage(_chat, text) { messages.push(text); return { message_id: 1 } },
     async editMessageText(_chat, _id, text) { messages.push(text) },
   }, '123', ['hidden-test-key'])
-  mirror.event('commandExecution')
-  mirror.output('tool', 'first line\nhidden-test-')
-  mirror.output('tool', 'key\nlast line\n')
-  mirror.update('Готово')
+  mirror.event('commandExecution', { id: 'first', command: 'git status\n--short' })
+  mirror.event('commandExecution', { id: 'first', command: 'git status\n--short' })
+  mirror.event('commandExecution', { id: 'second', command: 'echo hidden-test-key', aggregatedOutput: 'raw output' })
   await Bun.sleep(0)
-  expect(messages.at(-1)).toContain('first line')
-  expect(messages.at(-1)).toContain('last line')
+  expect(messages.at(-1)?.split('\n').slice(1)).toEqual(['▸ git status --short', '▸ echo [REDACTED]'])
   expect(messages.join('\n')).not.toContain('hidden-test-key')
+  expect(messages.join('\n')).not.toContain('raw output')
+})
+
+test('mirror collapses the command feed to a single summary line', async () => {
+  const messages: string[] = []
+  const mirror = new CodexMirror({
+    async sendMessage(_chat, text) { messages.push(text); return { message_id: 1 } },
+    async editMessageText(_chat, _id, text) { messages.push(text) },
+  }, '123')
+  mirror.event('commandExecution', { id: 'first', command: 'git status' })
+  queueMicrotask(() => mirror.finish('Работа завершена'))
+  await Bun.sleep(0)
+  expect(messages.at(-1)).toBe('📡 Codex · Работа завершена')
 })
 
 test('accepts a legacy listener task for the configured owner and deduplicates retries by task ID', async () => {

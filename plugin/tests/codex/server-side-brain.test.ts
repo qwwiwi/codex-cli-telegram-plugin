@@ -36,12 +36,12 @@ const bindSide = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).trans
   const { brain, codex, inbox, ownerId, sides, sideDeliveries, telegram, classifyTurn, ownerOrigin, redactSecrets, taskTitle,
     agentBody, SideStatusCard, sideFirstStage, sideThinking, sideInstructions, sideOwnerTurn, hasMemoryCue,
     hideLeaseCompletions, sideEndNotice, warnError, sideDone, prepareMessages, sentReplies, formatReminderOn, renderEyes,
-    foreignProvenance, hasForeignReply } = deps
+    foreignProvenance, hasForeignReply, agentNoticesEnabled = true } = deps
   const brainScope = 'test', stopEpoch = 0, stopping = false, hudReady = false, goalActive = false
   const secrets = [], mainStartedAt = Date.now() - 180_000, ownerChat = String(ownerId)
   const plans = [{ content: 'Check the migration', status: 'in_progress' }]
   const sideCards = new Map()
-  const agentChatInstructions = '', chatContext = () => ''
+  const agentChatInstructions = () => '', chatContext = () => ''
   const log = { info: () => {} }, send = async () => {}
   const sendFinalText = async (text, _origin, _files, _replyTo, _inboxId, onSent) => {
     const delivered = await telegram.sendMessage(ownerChat, text, {})

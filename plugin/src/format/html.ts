@@ -134,15 +134,10 @@ function stashCodeBlocks(input: string, store: Placeholder[]): string {
   })
 }
 
-function stashInlineCode(input: string, store: Placeholder[]): string {
-  // `…` — single line only.
-  const re = /`([^`\n]+?)`/g
-  return input.replace(re, (_full, code: string) => {
-    const html = `<code>${escapeHtml(code)}</code>`
-    const key = sentinel('IC', store.length)
-    store.push({ key, html })
-    return key
-  })
+function stashInlineCode(code: string, store: Placeholder[]): string {
+  const key = sentinel('IC', store.length)
+  store.push({ key, html: `<code>${escapeHtml(code)}</code>` })
+  return key
 }
 
 function tableToPre(table: string): string {
@@ -275,16 +270,22 @@ function stashSafeTags(input: string, store: Placeholder[]): string {
   return out
 }
 
-function stashMdLinks(input: string, store: Placeholder[]): string {
-  // Extract [text](url) BEFORE escaping so the URL doesn't get double-
-  // escaped by the global escape pass. gateway.py has a latent bug here
-  // (it would emit &amp;amp; in URLs with &); we improve on that.
-  const re = /\[([^\]\n]+)\]\(([^)\s]+)\)/g
-  return input.replace(re, (_full, label: string, url: string) => {
-    // Escape label as HTML body, URL as attribute.
-    const html = `<a href="${escapeHtmlAttr(url)}">${escapeHtml(label)}</a>`
-    const key = sentinel('LN', store.length)
-    store.push({ key, html })
+export function isTelegramLink(href: string): boolean {
+  return /^(https?:|tg:|mailto:)/iu.test(href)
+}
+
+function stashInlineMarkup(input: string, inlineStore: Placeholder[], linkStore: Placeholder[]): string {
+  // Scan code spans and links together so the first opener wins. Backticks in
+  // a link destination are literal, and links inside code stay literal too.
+  const re = /`([^`\n]+?)`|\[((?:[^\]\n`]|`[^`\n]+`)+|[^\]\n]+)\]\(([^)\s]+)\)/g
+  return input.replace(re, (_full, code: string | undefined, label: string, url: string) => {
+    if (code !== undefined) return stashInlineCode(code, inlineStore)
+    const renderedLabel = escapeHtml(label.replace(/`([^`\n]+?)`/g, (_span, content: string) => stashInlineCode(content, inlineStore)))
+    const html = isTelegramLink(url)
+      ? `<a href="${escapeHtmlAttr(url)}">${renderedLabel}</a>`
+      : label === url ? `<code>${escapeHtml(url)}</code>` : `${renderedLabel} (<code>${escapeHtml(url)}</code>)`
+    const key = sentinel('LN', linkStore.length)
+    linkStore.push({ key, html })
     return key
   })
 }
@@ -323,11 +324,9 @@ export function markdownToTelegramHtml(text: string): string {
   let work = stashCodeBlocks(text, codeStore)
   // 2. Markdown tables → aligned <pre> placeholders.
   work = stashTables(work, tableStore)
-  // 3. Inline code → <code> placeholders.
-  work = stashInlineCode(work, inlineStore)
-  // 4. Markdown links → <a> placeholders BEFORE escaping (avoid double-escape).
-  work = stashMdLinks(work, linkStore)
-  // 5. Stash agent's safe HTML tags so escaping doesn't mangle them.
+  // 3. Inline code and links → placeholders before escaping.
+  work = stashInlineMarkup(work, inlineStore, linkStore)
+  // 4. Stash agent's safe HTML tags so escaping doesn't mangle them.
   work = stashSafeTags(work, tagStore)
 
   // 5. Escape remaining raw text.

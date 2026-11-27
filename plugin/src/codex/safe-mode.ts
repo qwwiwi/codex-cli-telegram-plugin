@@ -6,6 +6,7 @@ import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import type { BootLedger, SafeModeEntry } from './boot-ledger.js'
+import { bridgeUnitName } from './unit-contract.js'
 
 export type { SafeModeEntry } from './boot-ledger.js'
 
@@ -152,7 +153,7 @@ export class SafeMode {
       '',
       commandsHelp,
       '',
-      'Причину падений видно на сервере: journalctl --user -u krotov-telegram.service -n 50',
+      `Причину падений видно на сервере: journalctl --user -u ${bridgeUnitName(process.env.KROT_CODEX_SERVICE_NAME)} -n 50`,
     ].join('\n'))
     this.deps.ledger.noticeSent()
   }

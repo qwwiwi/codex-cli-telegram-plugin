@@ -130,11 +130,19 @@ test('the plain fallback of a downgraded part is no longer than its Telegram len
   expect(validated.text).not.toContain('&amp;')
 })
 
-test('a downgraded link keeps its destination in the plain fallback, within the Telegram limit', () => {
-  const html = markdownToTelegramHtml('See [Open runbook](file:///tmp/runbook.md) now')
-  const validated = validateTelegramHtml(html)
-  expect(validated.downgraded).toBe(true)
-  expect(validated.text).toBe('See Open runbook (file:///tmp/runbook.md) now')
+test('local Markdown links keep their label and escaped path without downgrading surrounding HTML', () => {
+  const html = markdownToTelegramHtml('**See** [Runbook](file:///tmp/runbook.md) [Local](/tmp/a&b.ts:21) [Docs](https://example.org)')
+  expect(html).toBe('<b>See</b> Runbook (<code>file:///tmp/runbook.md</code>) Local (<code>/tmp/a&amp;b.ts:21</code>) <a href="https://example.org">Docs</a>')
+  expect(validateTelegramHtml(html).downgraded).toBe(false)
+})
+
+test('local Markdown paths preserve backticks, asterisks and underscores as literal text', () => {
+  const html = markdownToTelegramHtml('[`Open`](/tmp/`draft`/*plan*/_v2_.md) `[example](/tmp/file)`')
+  expect(html).toBe('<code>Open</code> (<code>/tmp/`draft`/*plan*/_v2_.md</code>) <code>[example](/tmp/file)</code>')
+  expect(validateTelegramHtml(html).downgraded).toBe(false)
+})
+
+test('a downgraded raw HTML link keeps its destination in the plain fallback, within the Telegram limit', () => {
   // The destinations are added only while the fallback stays within Telegram's limit.
   const long = 'x'.repeat(4_000) + '<a href="file:///a">a</a><a href="file:///bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">b</a>'
   const bounded = validateTelegramHtml(long)

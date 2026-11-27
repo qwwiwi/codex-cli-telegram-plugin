@@ -117,6 +117,7 @@ RENDER_PREVIEW_TOOL = {
 }
 # The exact dynamicTools list a trusted thread is opened with. Match chat-actions.ts (agentTools).
 CHAT_TOOLS = [CHAT_TOOL, *COMPONENT_TOOLS, RENDER_PREVIEW_TOOL]
+CHAT_TOOLS_WITHOUT_WIDGET_SEND = [tool for tool in CHAT_TOOLS if tool["name"] != "send_component"]
 CHAT_TOOLS_BY_NAME = {tool["name"]: tool for tool in CHAT_TOOLS}
 ALLOWED = {
     "initialize": {"clientInfo", "capabilities"},
@@ -444,7 +445,7 @@ def allowed_request(message, opened, config, approval_threads=(), observed_worke
             params.get("cwd") == config.workspace
             and params.get("approvalPolicy") == "on-request"
             and params.get("sandbox") == "workspace-write"
-            and ("dynamicTools" not in params or params["dynamicTools"] == CHAT_TOOLS)
+            and ("dynamicTools" not in params or params["dynamicTools"] in (CHAT_TOOLS, CHAT_TOOLS_WITHOUT_WIDGET_SEND))
             and (method == "thread/start" or
                  (isinstance(params.get("threadId"), str) and 0 < len(params["threadId"]) <= 128
                   and params.get("excludeTurns") is True))

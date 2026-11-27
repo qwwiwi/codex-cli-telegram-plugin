@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# OnFailure notifier for krotov-telegram.service: systemd runs it once when the start limit stops the
+# OnFailure notifier for the bridge service: systemd runs it once when the start limit stops the
 # bridge. Plain bash and curl, outside the bun code path, so a broken bridge cannot break the notice.
-# Usage: notify-failed.sh [path to plugin/.env]
+# Usage: notify-failed.sh [path to plugin/.env] [bridge service name]
 set -euo pipefail
 
 env_file=${1:-"$(dirname -- "$0")/../.env"}
+unit_name=${2:-krotov-telegram.service}
 
 # Exit 78 is a fatal setup error the bridge already reported itself (fatal.json and one message).
 # systemd 251+ passes the failed unit's exit status as MONITOR_EXIT_STATUS.
@@ -34,12 +35,12 @@ if [[ ! $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ || ! $chat =~ ^-?[0-9]+$ ]]; then
   exit 1
 fi
 
-text='Мост остановлен: systemd прекратил перезапуски после нескольких падений подряд.
+text="Мост остановлен: systemd прекратил перезапуски после нескольких падений подряд.
 
 Что сделать на сервере:
-1. journalctl --user -u krotov-telegram.service -n 50 — посмотреть причину.
+1. journalctl --user -u $unit_name -n 50 — посмотреть причину.
 2. Исправить причину.
-3. systemctl --user reset-failed krotov-telegram.service && systemctl --user start krotov-telegram.service'
+3. systemctl --user reset-failed $unit_name && systemctl --user start $unit_name"
 
 echo 'notify-failed: sending the failure notice to the owner'
 # The token goes through the curl config on stdin, never through argv.

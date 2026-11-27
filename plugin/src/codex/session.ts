@@ -109,7 +109,8 @@ type Settings = {
   // Ask for reasoning summaries (turn/start `summary: "auto"`) so the working bubble can show them.
   reasoningSummary?: boolean
   onThread?: (threadId: string) => void
-  onProgress?: (kind: string) => void
+  onProgress?: (kind: string, item?: Record<string, unknown>) => void
+  onTurnProgressEnd?: (status: Result['status']) => void
   onActivity?: (event: CodexEvent, currentThread: string | null) => void
   mayRunGoal?: (threadId: string) => boolean
   onGoalResult?: (threadId: string, result: Result) => void
@@ -120,6 +121,7 @@ type Settings = {
   // `tool` is one of agentTools: telegram_action, a component tool or render_preview (text and one PNG).
   chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) =>
     Promise<Awaited<ReturnType<AgentChatActions['call']>> | PreviewToolResult>
+  widgetsAvailable?: () => boolean
   // Operational notes without user content, e.g. a fallback the bridge took.
   onWarning?: (message: string) => void
   // Every thread/tokenUsage/updated of any thread (main, side, subagent): the prompt-cache counters.
@@ -783,14 +785,15 @@ export class CodexSession {
 
   private async openSideThread(model: string | undefined, untrusted: boolean): Promise<string> {
     // Deliberately not openThread: the main thread, its model and usage stay as they are.
-    const fork = untrusted ? undefined : await this.forkMainThread()
+    // A fork inherits its parent's tool catalog, which may still advertise send_component.
+    const fork = untrusted || this.settings.widgetsAvailable?.() === false ? undefined : await this.forkMainThread()
     const reply = fork ?? await this.rpc.request('thread/start', {
       cwd: this.settings.cwd,
       ...this.permissions(),
       ...(model ? { model } : {}),
       // A guest (untrusted) thread gets no client tool catalog: it could never call them (requestApproval refuses
       // untrusted turns), and a tool it is not offered is a tool it cannot even try.
-      ...(this.settings.chatAction && !untrusted ? { dynamicTools: agentTools } : {}),
+      ...(this.settings.chatAction && !untrusted ? { dynamicTools: this.advertisedTools() } : {}),
     })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || id === this.threadId) throw new Error('Codex did not return a side thread ID')
@@ -926,6 +929,11 @@ export class CodexSession {
     }
   }
 
+  private advertisedTools() {
+    return this.settings.widgetsAvailable?.() === false
+      ? agentTools.filter(tool => tool.name !== 'send_component') : agentTools
+  }
+
   private async openThread(expected: string | null): Promise<string> {
     const model = this.settings.selectedModel?.() ?? this.settings.model
     const options = {
@@ -939,7 +947,7 @@ export class CodexSession {
       ? this.rpc.request('thread/resume', { ...options, threadId: expected, excludeTurns: true })
       : this.rpc.request('thread/start', {
         ...options,
-        ...(this.settings.chatAction ? { dynamicTools: agentTools } : {}),
+        ...(this.settings.chatAction ? { dynamicTools: this.advertisedTools() } : {}),
       }))
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || (expected && id !== expected)) {
@@ -1073,7 +1081,7 @@ export class CodexSession {
     } else if (method === 'item/started') {
       if (active.id && params.turnId !== active.id) return
       const item = object(params.item)
-      if (progress && typeof item.type === 'string') this.settings.onProgress?.(item.type)
+      if (progress && typeof item.type === 'string') this.settings.onProgress?.(item.type, item)
       if (typeof item.type === 'string' && !conversationItems.has(item.type)) active.toolItems++
       recordFileChange(active, item)
     } else if (method === 'item/completed') {
@@ -1087,6 +1095,7 @@ export class CodexSession {
       const turn = object(params.turn)
       if (active.id && turn.id !== active.id) return
       const status = turn.status === 'completed' || turn.status === 'interrupted' ? turn.status : 'failed'
+      if (progress) this.settings.onTurnProgressEnd?.(status)
       active.finish({ status, text: active.finalText ?? active.lastText })
     }
   }
