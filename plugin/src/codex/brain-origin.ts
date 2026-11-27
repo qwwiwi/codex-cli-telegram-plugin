@@ -1,5 +1,6 @@
 import type { BrainOrigin, InputKind } from '../../../codex-brain/src/contract.js'
 import { hasMemoryCue } from '../../../codex-brain/src/cue.js'
+import { isOwnBotReply } from '../prompt/build.js'
 
 // The cue the hook pack uses too (one shared pattern).
 export { hasMemoryCue }
@@ -41,6 +42,8 @@ interface OriginOptions {
   confirmedVoice?: string | undefined
   /** The reply target is the bot's answer from the verified owner side thread the reply runs in. */
   trustedReply?: boolean
+  /** Check main-turn text and voice replies against the receiving bot's identity. */
+  replyBotId?: number
 }
 
 export interface BrainClassification {
@@ -56,9 +59,7 @@ export function isOwnerPrivateChat(owner: number, from: MessageOrigin['from'], c
 
 /**
  * Text that is not the owner's own words: a forward, an automatic forward or a pasted block quote.
- * A reply, a reply quote or an external reply is not: the owner's own text stays his, and only that
- * text is journaled (the quoted target is never stored as his words). A side turn also checks the
- * reply target it embeds (hasForeignReply).
+ * Reply metadata and the target it embeds are checked separately by hasForeignReply.
  */
 export function hasForeignText(message: ReplyTarget): boolean {
   return !!(message.forward_origin || message.is_automatic_forward ||
@@ -70,8 +71,9 @@ export function hasForeignText(message: ReplyTarget): boolean {
  * Not sent by the owner himself in his private chat: another sender or a bot, another chat (when the
  * message carries one), a channel, an inline bot, a business bot or connection, or a topic.
  */
-function foreignSender(message: ReplyTarget, owner: number): boolean {
-  return message.from?.id !== owner || message.from.is_bot === true ||
+function foreignSender(message: ReplyTarget, owner: number, botId?: number): boolean {
+  const ownBot = botId !== undefined && isOwnBotReply(message.from, botId)
+  return (!ownBot && (message.from?.id !== owner || message.from.is_bot === true)) ||
     (message.chat !== undefined && !(message.chat.type === 'private' && message.chat.id === owner)) ||
     !!(message.sender_chat || message.via_bot || message.sender_business_bot || message.business_connection_id) ||
     message.message_thread_id !== undefined
@@ -82,8 +84,8 @@ function foreignSender(message: ReplyTarget, owner: number): boolean {
  * foreign sender. It judges an incoming message and the reply target a side turn embeds alike, so a
  * marker that isolates one isolates the other.
  */
-export function foreignProvenance(message: ReplyTarget, owner: number): boolean {
-  return hasForeignText(message) || foreignSender(message, owner)
+export function foreignProvenance(message: ReplyTarget, owner: number, botId?: number): boolean {
+  return hasForeignText(message) || foreignSender(message, owner, botId)
 }
 
 /**
@@ -91,10 +93,10 @@ export function foreignProvenance(message: ReplyTarget, owner: number): boolean 
  * into the turn text, so a target with foreign provenance is foreign, and so is a reply to a message
  * in another chat (external_reply).
  */
-export function hasForeignReply(message: MessageOrigin, owner: number, trustedReply = false): boolean {
-  if (message.external_reply) return true
+export function hasForeignReply(message: MessageOrigin, owner: number, trustedReply = false, botId?: number): boolean {
   const target = message.reply_to_message
-  return !!target && !trustedReply && foreignProvenance(target, owner)
+  if (message.external_reply || (botId !== undefined && message.quote && !target)) return true
+  return !!target && !trustedReply && foreignProvenance(target, owner, botId)
 }
 
 export function classifyBrainOrigin(message: MessageOrigin, owner: number, options: OriginOptions = {}): BrainClassification {
@@ -111,6 +113,7 @@ export function classifyBrainOrigin(message: MessageOrigin, owner: number, optio
   // His typed text, his confirmed voice transcript, or his caption on his own photo or document.
   const direct = inputKind === 'voice' ? options.confirmedVoice?.trim()
     : inputKind === 'text' ? message.text?.trim() : message.caption?.trim()
-  // Unconfirmed or untranscribed voice and media without a caption: main thread, no owner rights.
-  return { origin: direct ? 'owner-direct' : 'owner-forward', inputKind, isolate: false }
+  const foreignReply = inputKind !== 'media' && options.replyBotId !== undefined &&
+    hasForeignReply(message, owner, false, options.replyBotId)
+  return { origin: direct && !foreignReply ? 'owner-direct' : 'owner-forward', inputKind, isolate: false }
 }

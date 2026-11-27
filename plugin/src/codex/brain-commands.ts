@@ -37,7 +37,6 @@ const hooksLabel: Record<BrainStatus['hooks'], string> = {
   managed: 'managed', 'user-trusted': 'user-level trusted', 'user-needs-review': 'user-level needs review', none: 'no hooks',
 }
 const pageSize = 6
-const oldContext = 'В уже загруженном контексте запись может остаться до новой сессии.'
 const reply = (text: string, buttons: MemoryButton[][] = []): MemoryReply => ({ text: text.slice(0, 3900), buttons })
 
 interface CommandOptions {
@@ -49,6 +48,7 @@ interface CommandOptions {
   handoff: HandoffBuilder
   paths: ScopePaths
   clock: Clock
+  reviewButtons: boolean
   clean(text: string): string
   status(): Promise<BrainStatus>
   enabled(): boolean
@@ -100,25 +100,12 @@ export function createBrainCommands(options: CommandOptions) {
     return reply(success)
   }
 
-  function forget(id: string, revision: number, description: string): MemoryReply {
-    return reply('Забыть «' + description + '»?', [[button('Подтвердить удаление', async () =>
-      writeResult(await writer().remove(id, revision), 'Запись удалена. ' + oldContext))]])
-  }
-
-  function forgetButton(fact: Pick<ReceiptWrite, 'id' | 'revision' | 'description'>) {
-    return button('Забыть', async () => {
-      if ((await facts.get(fact.id))?.revision !== fact.revision) return reply(stale)
-      return forget(fact.id, fact.revision, fact.description)
-    })
-  }
-
   async function show(id: string): Promise<MemoryReply> {
     const fact = await facts.get(id)
     if (!fact) return reply('Запись не найдена.')
-    return reply(`${fact.id} · ${fact.kind} · ревизия ${fact.revision}\nИсточник: ${fact.source}\n\n${fact.body}`, [[
+    return reply(`${fact.id} · ${fact.kind} · ревизия ${fact.revision}\nИсточник: ${fact.source}\n/memory forget ${id}\n\n${fact.body}`, [[
       button('Изменить', async () => (await facts.get(id))?.revision === fact.revision
         ? reply(`/memory edit ${id} r${fact.revision} <новый текст>`) : reply(stale)),
-      forgetButton(fact),
     ]])
   }
 
@@ -156,11 +143,12 @@ export function createBrainCommands(options: CommandOptions) {
         return reply('Предложение принято.')
       }
       const factId = proposal.fact.id ?? ('proposal-' + sha256(proposal.id).slice(0, 32))
-      const current = revision === undefined ? (await facts.get(factId))?.revision : revision ?? undefined
+      // Text approval uses the proposal's revision. A legacy proposal can only create an absent fact.
+      const expectedRevision = revision === undefined ? proposal.target_revision : revision ?? undefined
       const result = await facts.writer({ turnId: operation }).put({
         ...proposal.fact, id: factId, source: proposal.source ?? (proposal.from === 'migration' ? SOURCE_MIGRATION : SOURCE_TG_COMMAND),
         ...(proposal.fact.kind === 'task' ? { status: 'open' as const } : {}),
-      }, current)
+      }, expectedRevision)
       const response = await writeResult(result, 'Предложение принято.')
       if (result.ok) await proposals.remove(id)
       return response
@@ -170,13 +158,21 @@ export function createBrainCommands(options: CommandOptions) {
   async function pending(page: number): Promise<MemoryReply> {
     const entries = await proposals.list()
     const visible = entries.slice((page - 1) * pageSize, page * pageSize)
+    const text = visible.map(p => `${p.id} · ${p.fact.description}\n${p.fact.body.slice(0, 350)}`).join('\n\n') ||
+      'Предложений на этой странице нет.'
+    if (!options.reviewButtons) {
+      const hints: string[] = []
+      if (visible.length) hints.push('/memory approve ID · /memory reject ID')
+      if (page > 1) hints.push(`/memory pending ${page - 1}`)
+      if (page * pageSize < entries.length) hints.push(`/memory pending ${page + 1}`)
+      return reply([text, ...hints].join('\n\n'))
+    }
     const revisions = new Map(await Promise.all(visible.map(async p =>
       [p.id, p.fact.id ? (await facts.get(p.fact.id))?.revision ?? null : null] as const)))
-    return reply(visible.map(p => `${p.id} · ${p.fact.description}\n${p.fact.body.slice(0, 350)}`).join('\n\n') ||
-      'Предложений на этой странице нет.', paging(entries, page, pending, p => [
-        button('Принять ' + p.id, () => review(p.id, true, p, revisions.get(p.id))),
-        button('Отклонить ' + p.id, () => review(p.id, false, p)),
-      ]))
+    return reply(text, paging(entries, page, pending, p => [
+      button('Принять ' + p.id, () => review(p.id, true, p, revisions.get(p.id))),
+      button('Отклонить ' + p.id, () => review(p.id, false, p)),
+    ]))
   }
 
   async function search(words: string): Promise<MemoryReply> {
@@ -214,8 +210,8 @@ export function createBrainCommands(options: CommandOptions) {
   return {
     notice(writes: ReceiptWrite[]): MemoryReply {
       const visible = writes.filter(write => write.action !== 'remove').slice(-5)
-      return reply(visible.length ? '💾 Сохранено: ' + visible.map(write => write.description).join(', ') : '',
-        visible.map(write => [forgetButton(write)]))
+      return reply(visible.length ? '💾 Сохранено: ' +
+        visible.map(write => `${write.description}\n/memory forget ${write.id}`).join('\n\n') : '')
     },
     async handle(request: MemoryRequest): Promise<MemoryReply> {
       if (!request.ownerPrivateChat) return reply(MEMORY_REFUSED)
@@ -252,9 +248,10 @@ export function createBrainCommands(options: CommandOptions) {
         return review(id, action === 'approve')
       }
       if (action === 'show' && validId) return show(id)
-      if (action === 'forget' && validId) {
+      if (action === 'forget') {
+        if (!validId || args.length !== 1) return reply('Укажите один ID записи.')
         const fact = await facts.get(id)
-        return fact ? forget(id, fact.revision, fact.description) : reply('Запись не найдена.')
+        return fact ? writeResult(await writer().remove(id, fact.revision), 'Запись удалена.') : reply('Запись не найдена.')
       }
       if (action === 'done' && validId) {
         const fact = await facts.get(id)

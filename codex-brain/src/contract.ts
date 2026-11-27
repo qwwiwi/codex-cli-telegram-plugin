@@ -334,6 +334,8 @@ export const ProposalSchema = z.object({
     description: DescriptionSchema,
     body: z.string(),
   }).strict(),
+  /** The existing target's revision when the proposal was created. */
+  target_revision: FactFields.shape.revision.optional(),
   source: JournalRefSchema.optional(),
   from: z.enum(['remember', 'summarizer', 'reviewer', 'migration']),
   reason: ProposalReasonSchema,

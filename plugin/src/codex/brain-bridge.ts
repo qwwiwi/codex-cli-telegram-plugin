@@ -35,6 +35,7 @@ export interface BrainOptions {
   scope: string
   legacyRoot?: string
   clock?: Clock
+  reviewButtons?: boolean
   secrets?: readonly string[]
   /**
    * The bridge appends every turn permit key it mints here and drops old ones. Pass the array the
@@ -535,6 +536,7 @@ export function createBrainBridge(options: BrainOptions) {
 
   const commands = createBrainCommands({
     facts, proposals, receipts, journal: journal.reader, summaries, handoff, paths, clock, clean,
+    reviewButtons: options.reviewButtons ?? false,
     status: port.status, enabled: () => config().enabled, setEnabled,
     migrate: migrateIfPossible, lastHandoff: () => readJson(lastDeliveryPath, HandoffSchema),
   })

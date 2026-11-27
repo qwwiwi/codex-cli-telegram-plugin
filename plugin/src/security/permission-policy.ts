@@ -1180,16 +1180,14 @@ const SYSTEMCTL_READONLY_VERBS = new Set([
   'list-sockets', 'list-jobs', 'list-machines', 'list-paths', 'list-automounts',
   'get-default', 'show-environment',
 ])
-// Flags whose value is a SEPARATE token. Lowercased command collapses
-// `-H` (--host) into `-h` (help) — treating `-h` as value-taking is safe in
-// both readings (bare `systemctl -h` just ends with no verb → allow).
-const SYSTEMCTL_VALUE_FLAGS = new Set([
-  '-h', '-m', '-p', '-t', '-n', '-o', '-s',
+// Options whose value may be attached or supplied as the next token.
+const SYSTEMCTL_SHORT_VALUE_FLAGS = new Set(['H', 'M', 'p', 'P', 't', 'n', 'o', 's'])
+const SYSTEMCTL_LONG_VALUE_FLAGS = new Set([
   '--host', '--machine', '--root', '--property', '--type', '--lines',
   '--output', '--signal', '--kill-who', '--state', '--job-mode',
 ])
-const SYSTEMCTL_FLAG_RE = /^--?[a-z0-9-]+(=.*)?$/
 const SYSTEMCTL_VERB_LEAD_RE = /^[a-z][a-z-]*/
+const SYSTEMCTL_UNIT_GLOB_RE = /[*?\[]/
 // Command-position occurrences of `systemctl` (optionally path-qualified like
 // `/usr/bin/systemctl`), bounded by a shell separator / quote / start so a
 // verb glued by `|` inside a regex alternation isn't read as argv. The
@@ -1200,16 +1198,39 @@ const SYSTEMCTL_VERB_LEAD_RE = /^[a-z][a-z-]*/
 // the space before `systemctl`. `=` stays in the TRAILING lookahead only as a
 // generic separator.
 const SYSTEMCTL_OCCURRENCE_RE =
-  /(?:^|[\s"'`;|&()<>\\])(?:[^\s"'`;|&()<>=\\]*\/)?systemctl(?=[\s"'`;|&()<>=\\]|$)/g
+  /(?:^|[\s"'`;|&()<>\\])(?:[^\s"'`;|&()<>=\\]*\/)?systemctl(?=[\s"'`;|&()<>=\\]|$)/gi
+// End the invocation at an unquoted shell separator.
+const SYSTEMCTL_INVOCATION_RE = /^(?:[^"';|&\\\n]|"[^"\\]*(?:\\[\s\S][^"\\]*)*"|'[^']*'|\\[\s\S])*/
 
-function mutatesOwnChannel(commandLower: string): boolean {
-  if (!commandLower.includes('systemctl')) return false
-  const legacyUnit = ownChannelUnitRe().test(commandLower)
+function systemctlOption(arg: string): { selector: boolean; takesNext: boolean } | undefined {
+  const long = arg.match(/^(--[a-z0-9-]+)(?==|$)/i)?.[1]?.toLowerCase()
+  if (long !== undefined) {
+    return {
+      selector: long === '--state' || (long === '--all' && arg.length === long.length),
+      takesNext: arg.length === long.length && SYSTEMCTL_LONG_VALUE_FLAGS.has(long),
+    }
+  }
+  if (!/^-[a-z0-9]/i.test(arg)) return
+  let selector = false
+  for (let i = 1; i < arg.length; i++) {
+    const flag = arg.charAt(i)
+    // A value-taking short flag consumes the rest of the cluster or the next
+    // token. Letters in that value are data, even when they contain "a".
+    if (SYSTEMCTL_SHORT_VALUE_FLAGS.has(flag)) return { selector, takesNext: i === arg.length - 1 }
+    if (!/^[a-z0-9-]$/i.test(flag)) return
+    selector ||= flag === 'a' // -a is equivalent to --all.
+  }
+  return { selector, takesNext: false }
+}
+
+function mutatesOwnChannel(command: string): boolean {
+  if (!/systemctl/i.test(command)) return false
+  const legacyUnit = ownChannelUnitRe()
   const unit = bridgeUnitName(process.env.KROT_CODEX_SERVICE_NAME).replace(/\.service$/, '').replaceAll('.', '\\.')
   // systemctl accepts the service stem as shorthand for the full name.
   const configuredUnit = new RegExp(`(?:^|[^a-z0-9_.@-])${unit}(?:\\.service)?(?![a-z0-9_.@-])`, 'i')
   // Fold backslash line-continuations so `systemctl \<nl> restart` is one call.
-  const cmd = commandLower.replace(/\\\r?\n/g, ' ')
+  const cmd = command.replace(/\\\r?\n/g, ' ')
   SYSTEMCTL_OCCURRENCE_RE.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = SYSTEMCTL_OCCURRENCE_RE.exec(cmd)) !== null) {
@@ -1219,33 +1240,38 @@ function mutatesOwnChannel(commandLower: string): boolean {
     // regex alternation, a closing quote from `grep 'systemctl'`) means this
     // occurrence is read-only / a mention — not an invocation. Skip it.
     if (!/^\s/.test(after)) continue
-    const tokens = after.trim().split(/\s+/).filter((t) => t.length > 0)
-    let k = 0
+    const invocation = SYSTEMCTL_INVOCATION_RE.exec(after)?.[0] ?? ''
+    const tokens = tokenizeQuoteAware(invocation) ?? []
+    const positional: string[] = []
+    let options = true
     let sawFlag = false
-    while (k < tokens.length) {
-      const tok = tokens[k] as string
-      if (SYSTEMCTL_VALUE_FLAGS.has(tok)) { sawFlag = true; k += 2; continue }
-      if (SYSTEMCTL_FLAG_RE.test(tok)) { sawFlag = true; k++; continue }
-      break
+    let hasSelector = false
+    for (let i = 0; i < tokens.length; i++) {
+      const arg = tokens[i]
+      if (arg === undefined) break
+      if (options && arg === '--') {
+        options = false
+        continue
+      }
+      const option = options ? systemctlOption(arg) : undefined
+      if (option === undefined) {
+        positional.push(arg)
+        continue
+      }
+      sawFlag ||= positional.length === 0
+      hasSelector ||= option.selector
+      if (option.takesNext) i++
     }
-    const vtok = tokens[k]
+    const [vtok, ...units] = positional
     if (vtok === undefined) continue // only flags, no verb (e.g. `-h`) — read-only
-    const args = tokens.slice(k + 1).join(' ').split(/[;|&]/, 1)[0] ?? ''
-    if (!legacyUnit && !configuredUnit.test(args)) continue
-    // Strip surrounding quotes (`systemctl 'restart' x`) BEFORE the `$`
-    // check, else `systemctl "$verb" unit` strips to `$verb` only after the
-    // check and slips through as a mention (Codex review 2026-06-10).
-    const normalizedVerb = vtok.replace(/^['"]+|['"]+$/g, '')
-    if (normalizedVerb.startsWith('$')) return true // variable verb — cannot prove safe
-    const verbMatch = normalizedVerb.match(SYSTEMCTL_VERB_LEAD_RE)
-    if (verbMatch === null) {
-      // Not verb-shaped (path `./restart`, number). Flags before it prove an
-      // invocation → fail safe; otherwise a mention.
-      if (sawFlag) return true
-      continue
-    }
-    if (SYSTEMCTL_READONLY_VERBS.has(verbMatch[0])) continue
-    return true // mutating OR unknown verb — fail safe to confirm
+    const verbMatch = vtok.toLowerCase().match(SYSTEMCTL_VERB_LEAD_RE)
+    if (verbMatch !== null && SYSTEMCTL_READONLY_VERBS.has(verbMatch[0])) continue
+    // Shell expansion and systemd's unit matching can both resolve a glob to
+    // the protected service. Selectors with no explicit unit also fail closed.
+    const broadSelection = hasSelector && units.length === 0
+    const protectedSelection = units.some(unit => legacyUnit.test(unit) || configuredUnit.test(unit) || SYSTEMCTL_UNIT_GLOB_RE.test(unit))
+    if (!broadSelection && !protectedSelection) continue
+    if (verbMatch !== null || sawFlag || vtok.startsWith('$')) return true
   }
   return false
 }
@@ -2313,7 +2339,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     }
     // Keep this in the hard-deny pass so another part of a mixed command
     // cannot downgrade the verdict to a confirmation.
-    if (commandLower !== undefined && mutatesOwnChannel(commandLower)) {
+    if (mutatesOwnChannel(rawCommand)) {
       return { tier: 'deny', reason: 'changing the bridge service with systemctl would cut off the owner’s Telegram connection', matchedRule: 'builtin:deny:own-channel' }
     }
   }

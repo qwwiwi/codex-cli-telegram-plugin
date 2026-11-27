@@ -3,6 +3,23 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
+## v0.5.2 – 2026-11-27
+
+- The bridge guard blocks service changes that target the bridge through broad
+  `systemctl` selectors. It checks each command in a chain independently.
+- Owner voice transcripts in private chat follow the same memory rules as typed
+  messages, with no confirmation card. Replies to the bot's own messages can
+  count as direct owner input. Replies to forwarded or foreign content cannot
+  grant memory write access.
+- `/stop` prevents an in-flight transcription from starting a Codex turn after cancellation.
+- Memory save notices are off by default. Set `KROT_BRAIN_SAVE_NOTICE=on` for a
+  text notice with a `/memory forget <id>` command.
+- `/memory forget <id>` deletes immediately in Brain and legacy learning. Brain
+  still checks the fact's revision before deleting it.
+- `/memory pending` shows text commands by default. Set
+  `KROT_BRAIN_REVIEW_BUTTONS=on` for review and page buttons. Text approval
+  refuses to overwrite a fact that changed since the proposal was created.
+
 ## v0.5.1 – 2026-11-27
 
 [Release notes in English and Russian](docs/releases/v0.5.1.md).

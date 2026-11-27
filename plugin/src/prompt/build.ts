@@ -15,6 +15,10 @@
 
 export type BotIdentity = { id: number; username: string }
 
+export function isOwnBotReply(from: { id: number } | undefined, botId: number): boolean {
+  return botId !== 0 && from?.id === botId
+}
+
 // Telegram renders a Rich Message (Bot API 10.1) server-side from raw
 // markdown, and a message sent that way carries NO `text`/`caption` at all —
 // its body arrives as a structured block tree under `rich_message`. The shape
@@ -254,7 +258,7 @@ export function buildReplyContext(
   // bot.init() before starting the poller/webhook, so this branch is a
   // belt-and-braces guard for tests and any future call site.
   if (bot.id === 0) return null
-  if (reply.from.id === bot.id) {
+  if (isOwnBotReply(reply.from, bot.id)) {
     return {
       sender: 'agent_previous_message',
       bot_id: bot.id,
