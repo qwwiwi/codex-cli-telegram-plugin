@@ -28,7 +28,7 @@ export function formatConversation(turns: unknown[], partial: boolean, secrets: 
           return part.text
             .replace(attachmentInstructions + '\n\n', '')
             .replace(formatReminder + '\n\n', '')
-            .replace(/^Актуальные мандаты владельца Telegram[^\n]*\n\n/u, '')
+            .replace(/(^|\n\n)Актуальные мандаты владельца Telegram(?: \(этот список заменяет предыдущие\))?:[^\n]*\n\n/u, '$1')
             .replace(/^Для большой задачи составь план[^\n]*(?:\r?\n(?!\r?\n)[^\n]*)*\r?\n\r?\n/mu, '')
             .replace(followUpInstructions + '\n\n', '')
             .replace(/^Действия в личке Telegram доступны во время работы\.[^\n]*\n\n/mu, '')

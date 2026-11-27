@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import {
   collectDoctorReport, dependencyDrift, DoctorCommand, doctorFixTurn, formatDoctorReport, runDoctorScript, type DoctorReport,
 } from '../../src/codex/doctor-command.js'
+import { RenderEyes, type ShownPart } from '../../src/codex/render-eyes.js'
+import { markdownToTelegramHtml } from '../../src/format/html.js'
 import { BRAIN_EVENTS, checkHooksPack, installHooks, PACK_EVENTS } from '../../../codex-hooks/src/install.js'
 
 const roots: string[] = []
@@ -480,4 +482,117 @@ test('[S11] an invalid fatal.json time or boot-ledger exit time shows «врем
   expect(text).toContain('безопасный режим: нет')
   expect(text).toContain('fatal.json: последняя остановка из-за ошибки настройки время недоступно: ' +
     'plugin/.env failed validation: TELEGRAM_BOT_TOKEN.')
+})
+
+test('doctor shows the prompt-cache share and flags a low 24 h share with one fix line', async () => {
+  const { repo } = fixture()
+  const good = await collectDoctorReport({
+    repo, env: {}, doctor: healthy, codexVersion,
+    cache: () => ({ thread: { input: 200_000, cached: 186_000, percent: 93 }, day: { input: 900_000, cached: 819_000, percent: 91 } }),
+  })
+  expect(good.problems).toEqual([])
+  expect(formatDoctorReport(good)).toContain('Кеш: 93% входа в этом диалоге, 91% за 24 ч')
+  const low = await collectDoctorReport({
+    repo, env: {}, doctor: healthy, codexVersion,
+    cache: () => ({ day: { input: 300_000, cached: 150_000, percent: 50 } }),
+  })
+  expect(low.problems).toHaveLength(1)
+  const text = formatDoctorReport(low)
+  expect(text).toContain('Кеш: 50% входа за 24 ч')
+  expect(text.match(/Как исправить/g)).toHaveLength(1)
+})
+
+test('[R42] doctor lists the last 5 render diffs, kept across a bridge restart', async () => {
+  const { repo, root } = fixture()
+  const file = join(root, 'render-diffs.json')
+  const eyes = new RenderEyes({ file, now: () => Date.parse('2026-11-27T11:20:00Z') })
+  for (let index = 1; index <= 5; index++) {
+    eyes.record({ source: 'Ответ ' + index, parts: [{ format: 'HTML', text: 'Ответ ' + index, messageId: 200 + index }] })
+  }
+  const degraded = 'Tom &amp; Jerry'
+  eyes.record({ source: degraded, parts: [{ format: 'HTML', text: markdownToTelegramHtml(degraded), messageId: 206 }] })
+  // The history is written one macrotask after the send path returned.
+  await new Promise(resolve => setImmediate(resolve))
+  const reloaded = new RenderEyes({ file })
+  const report = await collectDoctorReport({ repo, env: {}, doctor: healthy, codexVersion, renders: () => reloaded.recent() })
+  expect(report.problems).toEqual([])
+  const text = formatDoctorReport(report)
+  expect(text).toContain('Показ ответов в Telegram (последние 5')
+  expect(text).toContain('2026-11-27 11:20 UTC · #206 · HTML ×1: raw_markup entity:amp')
+  expect(text).toContain('#202 · HTML ×1: без искажений')
+  expect(text).not.toContain('#201')
+})
+
+test('[R42] the render history keeps only kinds, message IDs and fixed codes, never the reply text', async () => {
+  const { repo, root } = fixture()
+  const file = join(root, 'render-diffs.json')
+  const eyes = new RenderEyes({ file })
+  // A whole reply that is one unknown tag shown raw: an excerpt of the offending markup is the entire reply.
+  const part: ShownPart = { format: 'HTML', text: '&lt;id blue&gt;', messageId: 300 }
+  eyes.record({ source: '<id blue>', parts: [part] })
+  // The write may run after the send path returned (it is diagnostics, not delivery).
+  await new Promise(resolve => setImmediate(resolve))
+  const saved = readFileSync(file, 'utf8')
+  expect(saved).not.toContain('id blue')
+  expect(JSON.parse(saved)).toEqual({ diffs: [{ ts: expect.any(String), messageIds: [300], formats: ['HTML'],
+    collapsedBlankLines: 0, degradations: [{ kind: 'raw_markup', code: 'tag' }] }] })
+  const report = await collectDoctorReport({ repo, env: {}, doctor: healthy, codexVersion,
+    renders: () => new RenderEyes({ file }).recent() })
+  expect(formatDoctorReport(report)).toContain('#300 · HTML ×1: raw_markup tag')
+  // The excerpt stays in memory: the next-turn note and render_preview still see what the owner saw.
+  expect(eyes.shown(300)).toEqual(part)
+  expect(eyes.takeNote()).toContain('«<id blue>» вместо форматирования')
+})
+
+test('[R29] /doctor shows the automatic-update setting, the current commit, the last update attempt and the bad commits', async () => {
+  const { repo } = fixture()
+  const sha = (c: string) => c.repeat(40)
+  const report = await collectDoctorReport({ repo, env: {}, doctor: healthy, codexVersion,
+    updates: () => ({
+      auto: { enabled: true, intervalMs: 6 * 3_600_000 }, commit: sha('c'), bad: [sha('d'), sha('e')],
+      last: { at: Date.UTC(2026, 10, 27, 9, 30), trigger: 'auto', result: 'stage_failed', from: sha('c'), to: sha('f'), detail: '3 tests failed' },
+    }) })
+  const text = formatDoctorReport(report)
+  expect(text).toContain('Автообновление: включено, проверка каждые 6 ч.')
+  expect(text).toContain('Текущий коммит: cccccccccccc.')
+  expect(text).toContain('Последняя попытка обновления: 2026-11-27 09:30 UTC, автоматически, cccccccccccc → ffffffffffff: ' +
+    'новая версия не прошла проверку в отдельной копии (3 tests failed).')
+  expect(text).toContain('Плохие коммиты (автоматически не ставлю): dddddddddddd, eeeeeeeeeeee.')
+  const quiet = formatDoctorReport(await collectDoctorReport({ repo, env: {}, doctor: healthy, codexVersion,
+    updates: () => ({ auto: { enabled: false, intervalMs: 6 * 3_600_000 }, commit: sha('c'), bad: [] }) }))
+  expect(quiet).toContain('Автообновление: выключено (KROT_AUTO_UPDATE=1 включает).')
+  expect(quiet).toContain('Последняя попытка обновления: не записана.')
+  expect(quiet).toContain('Плохие коммиты: нет.')
+  expect(report.problems).toEqual([])
+})
+
+test('[R29] /doctor says why automatic update is refused while the installed boot guard is too old', async () => {
+  const { repo } = fixture()
+  const guard = 'Проверка запуска boot-guard.sh в каталоге состояния устарела (версия 0, нужна 2).'
+  const report = await collectDoctorReport({ repo, env: {}, doctor: healthy, codexVersion,
+    updates: () => ({ auto: { enabled: true, intervalMs: 6 * 3_600_000 }, bad: [], guard }) })
+  expect(report.problems.map(problem => problem.text)).toContain(guard)
+  expect(formatDoctorReport(report)).toContain(guard)
+})
+
+test('[R38] /doctor tests runs the self-test and prints pass or fail per check without secrets', async () => {
+  const sent: string[] = []
+  const token = '123456:SECRET-token-value'
+  const command = new DoctorCommand({
+    collect: async () => { throw new Error('the report is not collected for /doctor tests') },
+    send: async text => { sent.push(text) }, repo: '/srv/bridge', selfRestart: false, secrets: [token],
+    selfTest: async () => [
+      { name: 'Настройки', ok: true, detail: 'plugin/.env разобран' },
+      { name: 'Telegram API', ok: false, detail: 'fetch failed for https://api.telegram.org/bot' + token + '/getMe' },
+    ],
+  })
+  await command.handle('tests', async () => { throw new Error('must not start a turn') })
+  const text = sent.join('\n')
+  expect(text).toContain('✅ Настройки: plugin/.env разобран')
+  expect(text).toContain('❌ Telegram API: fetch failed')
+  expect(text).toContain('Прошло 1 из 2')
+  expect(text).not.toContain('SECRET-token-value')
+  sent.length = 0
+  await command.handle('bogus', async () => undefined)
+  expect(sent).toEqual(['Используйте /doctor, /doctor tests или /doctor fix.'])
 })

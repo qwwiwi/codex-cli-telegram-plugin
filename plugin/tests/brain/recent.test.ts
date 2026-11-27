@@ -5,8 +5,10 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { EvictedLineSchema, formatRecentEntry, renderRecentTail } from '../../../codex-brain/src/contract.js'
-import { FileRecent, openJournal, renderRecent } from '../../../codex-brain/src/journal/index.js'
+import { EvictedLineSchema, formatRecentEntry, type JournalRef, renderRecentTail } from '../../../codex-brain/src/contract.js'
+import {
+  FileRecent, isPublicExchange, openJournal, PUBLIC_KEY_SEGMENT, renderRecent,
+} from '../../../codex-brain/src/journal/index.js'
 import { scopePaths } from '../../../codex-brain/src/store/paths.js'
 import { fixedClock } from './fakes.js'
 
@@ -148,4 +150,35 @@ test('an in-flight exchange is shown with its current status; recent.md follows 
   await writer.answered(ref, 'готово')
   expect(recentText()).toContain('· answered')
   expect(recentText()).toBe(renderRecent(await recent.exchanges()))
+})
+
+test('R3: textless public-lane exchanges are journaled as foreign but never take owner room in the recent window', async () => {
+  const { writer, reader, recent, clock } = await day(400, 3)
+  const ownerHeld = (await recent.exchanges()).map(exchange => exchange.ref)
+  expect(ownerHeld.length).toBeGreaterThan(0)
+  const publicRefs: JournalRef[] = []
+  for (let i = 0; i < 40; i++) {
+    clock.set(`${DAY}T20:${String(i).padStart(2, '0')}:00Z`)
+    const ref = await writer.bind({ key: `local${PUBLIC_KEY_SEGMENT}-100777:${i}`, origin: 'agent', input_kind: 'text' })
+    await writer.delivered(ref)
+    publicRefs.push(ref)
+  }
+  // The owner window is unchanged: no public entry is held and none pushed an owner exchange out.
+  expect((await recent.exchanges()).map(exchange => exchange.ref)).toEqual(ownerHeld)
+  expect(recentText()).not.toContain('· agent ·')
+  // Not queued for the owner's rolling summary either.
+  const evicted = (await recent.evicted()).map(line => line.ref)
+  expect(evicted.some(ref => publicRefs.includes(ref))).toBe(false)
+  // Still recorded, as foreign (origin agent, no text).
+  const stored = await reader.get(publicRefs[0]!)
+  expect(stored).toMatchObject({ origin: 'agent', status: 'delivered' })
+  expect(stored?.input).toBeUndefined()
+  expect(isPublicExchange(stored!)).toBe(true)
+})
+
+test('R3: only an untrusted origin under the public key segment counts as public; an owner exchange never does', () => {
+  expect(isPublicExchange({ key: `local${PUBLIC_KEY_SEGMENT}5:1`, origin: 'agent' })).toBe(true)
+  expect(isPublicExchange({ key: `local${PUBLIC_KEY_SEGMENT}5:1`, origin: 'owner-direct' })).toBe(false)
+  expect(isPublicExchange({ key: `local${PUBLIC_KEY_SEGMENT}5:1`, origin: 'terminal' })).toBe(false)
+  expect(isPublicExchange({ key: 'local:5', origin: 'agent' })).toBe(false)
 })

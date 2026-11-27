@@ -14,7 +14,10 @@ const sessions: CodexSession[] = []
 
 type Logged = { method: string; params: Record<string, unknown> }
 
-function fixture(options: { noFork?: boolean; model?: () => string | undefined; effort?: () => string | undefined } = {}) {
+function fixture(options: {
+  noFork?: boolean; model?: () => string | undefined; effort?: () => string | undefined
+  onTokenUsage?: (threadId: string, tokenUsage: unknown) => void
+} = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-fork-'))
   dirs.push(cwd)
   const log = join(cwd, 'requests.jsonl')
@@ -25,6 +28,7 @@ function fixture(options: { noFork?: boolean; model?: () => string | undefined; 
     command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'],
     ...(options.model ? { selectedModel: options.model } : {}),
     ...(options.effort ? { selectedEffort: options.effort } : {}),
+    ...(options.onTokenUsage ? { onTokenUsage: options.onTokenUsage } : {}),
     onWarning: message => { warnings.push(message) },
   }, () => {})
   sessions.push(session)
@@ -178,4 +182,22 @@ test('[R93] a side turn keeps the model and effort pair it started with when the
   const turn = requests('turn/start').at(-1)?.params ?? {}
   expect(turn.model ?? 'gpt-a').toBe('gpt-a')
   expect(turn.effort).toBe('low')
+})
+
+test('every Codex token-usage notification, main and side threads, reaches the cache counters', async () => {
+  const usageEvents: { threadId: string; tokenUsage: unknown }[] = []
+  const { session } = fixture({ onTokenUsage: (threadId, tokenUsage) => { usageEvents.push({ threadId, tokenUsage }) } })
+  await session.initialize()
+  await session.run('usage:cached')
+  const { main } = await mainBusy(session)
+  await session.runSide('вопрос')
+  await session.stop()
+  await main
+  const mainThread = session.currentThread
+  if (!mainThread) throw new Error('main thread did not start')
+  const threads = usageEvents.map(event => event.threadId)
+  expect(threads).toContain(mainThread)
+  expect(threads.some(thread => thread !== mainThread)).toBe(true)
+  expect(usageEvents.find(event => event.threadId === mainThread)?.tokenUsage)
+    .toMatchObject({ last: { inputTokens: 4000, cachedInputTokens: 3280 } })
 })

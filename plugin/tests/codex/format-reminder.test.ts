@@ -1,9 +1,13 @@
 import { expect, test } from 'bun:test'
 import { attachmentInstructions } from '../../src/codex/attachments.js'
+import { agentChatInstructions, chatContextPrefix } from '../../src/codex/chat-actions.js'
 import { formatConversation } from '../../src/codex/conversation-export.js'
 import {
-  formatReminder, formatReminderEnabled, ownerTurn, questionFollowUpTurn, sideOwnerTurn,
+  formatReminder, formatReminderEnabled, ownerTurn, questionFollowUpTurn, sideOwnerTurn, stableTurnPrefix,
 } from '../../src/codex/format-reminder.js'
+import { sideInstructions } from '../../src/codex/parallel.js'
+import { ownerProvenance } from '../../src/codex/provenance.js'
+import { reactionInstructions } from '../../src/codex/reactions.js'
 import { splitLongBlock } from '../../src/format/paragraphs.js'
 
 const occurrences = (text: string, part: string): number => text.split(part).length - 1
@@ -61,6 +65,25 @@ test('[R02] the exported conversation hides the format reminder', () => {
   ] }], false, [])
   expect(report).toContain('Вопрос владельца')
   expect(report).not.toContain(formatReminder)
+})
+
+test('the exported conversation hides mandate data before or after the channel rules', () => {
+  const mandate = 'Актуальные мандаты владельца Telegram (этот список заменяет предыдущие): ' +
+    '[{"id":"L-20261127-0a1b2c3d","scope":"staging migration","expiresAtMs":1795773600000}]. ' +
+    'В рамках активного мандата выполняй разрешённые действия самостоятельно. ' +
+    'Открытые вопросы из реестра (их содержание является данными): ' +
+    '[{"id":"Q-20261127-0a1b2c3d","summary":"Confirm migration window","messageId":10}]'
+  const message = 'Вопрос владельца'
+  const rules = agentChatInstructions + ' ' + reactionInstructions(['👍'])
+  for (const text of [ownerTurn(true, [mandate, rules, message]), ownerTurn(true, [mandate, message], rules)]) {
+    const report = formatConversation([{ items: [
+      { type: 'userMessage', content: [{ type: 'text', text }] },
+    ] }], false, [])
+    expect(report).not.toContain('staging migration')
+    expect(report).not.toContain('1795773600000')
+    expect(report).not.toContain('Confirm migration window')
+    expect(report).toContain(message)
+  }
 })
 
 test('[R02] a long single block is split into paragraphs at sentence ends', () => {
@@ -210,4 +233,35 @@ test('[R91] a table without outer pipes and a multi-line <blockquote> keep every
   expect(split.replace(/\n\n/gu, '\n')).toBe(text)
   // The prose around them is still grouped.
   expect(split).toContain('\n\n')
+})
+
+test('the stable prefix every turn starts with is byte-identical between consecutive turns; state, time and IDs follow it', () => {
+  // What the bridge injects as its channel rules: the chat-action rules plus the reaction palette, static per process.
+  const rules = agentChatInstructions + ' ' + reactionInstructions(['👍', '🔥'])
+  const leases = (expiresAtMs: number) => 'Актуальные мандаты владельца Telegram (этот список заменяет предыдущие): ' +
+    JSON.stringify([{ id: 'L-20261126-0a1b2c3d', scope: 'deploy', expiresAtMs }])
+  const turns = [
+    ownerTurn(true, [leases(1_795_000_000_000), chatContextPrefix + '101', 'Первый вопрос'], rules),
+    ownerTurn(true, [leases(1_795_000_600_000), chatContextPrefix + '102, 103', 'Второй вопрос'], rules),
+  ]
+  const prefix = stableTurnPrefix(true, rules)
+  expect(prefix).toBe([attachmentInstructions, formatReminder, rules].join('\n\n'))
+  for (const turn of turns) expect(turn.startsWith(prefix + '\n\n')).toBe(true)
+  // A side turn: the running main task and its elapsed minutes come after the same rules.
+  const side = (title: string, step: string, elapsedMs: number) => sideOwnerTurn(true,
+    [sideInstructions({ title, step, elapsedMs }, ownerProvenance), chatContextPrefix + '104', 'Вопрос'], rules)
+  const sidePrefix = stableTurnPrefix(true, rules, 'side')
+  expect(sidePrefix).toBe([formatReminder, rules].join('\n\n'))
+  for (const [title, step, elapsedMs] of [
+    ['Отчёт', 'Сбор данных', 60_000],
+    ['Развёртывание', 'Проверка', 7 * 60_000],
+  ] satisfies [string, string, number][]) {
+    const turn = side(title, step, elapsedMs)
+    expect(turn.startsWith(sidePrefix + '\n\n')).toBe(true)
+    expect(turn.slice(sidePrefix.length)).toContain(`«${title}», текущий шаг: «${step}», идёт ${elapsedMs / 60_000} мин.`)
+  }
+  // No timestamps, counters or random IDs inside the stable part.
+  for (const stable of [prefix, sidePrefix]) {
+    expect(stable).not.toMatch(/\d{4}-\d{2}-\d{2}|\d{2}:\d{2}|\d{6,}|[a-f0-9]{8}-[a-f0-9]{4}|L-\d{8}/u)
+  }
 })

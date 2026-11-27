@@ -5,12 +5,16 @@ import { z } from 'zod'
 import type { BrainStatus } from '../../../codex-brain/src/contract.js'
 import { checkHooksPack, HOOKS_CHECK_PREFIX, managedListing, managedSourcePath, packCommand, type ListedHook, type PackPaths } from '../../../codex-hooks/src/install.js'
 import { redactSecrets } from '../safety/redact.js'
+import type { AutoUpdateConfig, UpdateAttempt } from './auto-update.js'
 import { readBootSummary, type BootSummary } from './boot-ledger.js'
+import { cacheDoctorProblem, cacheStatusLine, type CacheShare } from './cache-stats.js'
 import { type ErrorEntry, type ErrorSummary, repeatedWarnLimit } from './error-log.js'
 import { readFatal, type FatalFile } from './exit-codes.js'
 import type { PendingUpdate } from './self-update.js'
 import type { CodexUpdateRecord } from './codex-update.js'
 import { OWNER_INSTRUCTIONS_CHECK_PREFIX } from './owner-instructions-lock.js'
+import type { RenderDiff } from './render-eyes.js'
+import { formatSelfTests, type SelfTestResult } from './self-test.js'
 
 // The /doctor Telegram command: the doctor script's self-check plus a comparison of the installed
 // bridge with its GitHub repository and the recent entries of the bridge's error journal.
@@ -28,12 +32,63 @@ export interface DoctorReport {
   ownerInstructions?: string[]
   /** A fact line with the error journal's counts when none of its entries counts as a problem. */
   errorJournal?: string
+  /** The prompt-cache share of the current thread and of the last 24 hours. */
+  cache?: string
+  /** R42: the last render diffs, what the owner saw against what the model wrote, newest first. */
+  renders?: string
   /** A fact line: the Codex version the last /update codex replaced, kept for /update codex rollback. */
   codexPrevious?: string
   /** A fact line from <state>/boot-ledger.json: boots, unhealthy chain, last exit code, safe-mode flag (S11). */
   boot?: string
   /** A fact line about <state>/fatal.json, the record of the last stop on a configuration error (S11). */
   fatal?: string
+  /** Live checks that passed, shown as their own lines (the multi-user canary). */
+  passes?: string[]
+  /** R29: fact lines about updates: the automatic-update setting, the current commit, the last attempt, bad commits. */
+  updates?: string[]
+}
+
+/** R29: what /doctor shows about updates. */
+export interface UpdateStatus {
+  auto: AutoUpdateConfig
+  /** The commit the running bridge was started from. */
+  commit?: string
+  last?: UpdateAttempt
+  /** Commits the boot guard rolled back after failed boots. */
+  bad: readonly string[]
+  /** Why the installed boot-guard.sh copy keeps updates out (self-update.ts guardCopyProblem); absent when it is current. */
+  guard?: string
+}
+
+const attemptTrigger: Record<UpdateAttempt['trigger'], string> = { auto: 'автоматически', owner: '/cc update', manual: '/update' }
+const attemptResult: Record<UpdateAttempt['result'], string> = {
+  current: 'версия актуальна',
+  refused: 'проверка отказала',
+  bad: 'новая версия помечена плохой и пропущена',
+  stage_failed: 'новая версия не прошла проверку в отдельной копии',
+  busy: 'бот не освободился, обновление отложено',
+  apply_failed: 'установка не удалась',
+  applied: 'установлено',
+}
+
+/** The update facts as /doctor lines. */
+export function updateStatusLines(status: UpdateStatus): string[] {
+  const short = (sha: string) => sha.slice(0, 12)
+  const hours = status.auto.intervalMs / 3_600_000
+  const lines = [status.auto.enabled
+    ? `Автообновление: включено, проверка каждые ${Number.isInteger(hours) ? hours : hours.toFixed(1)} ч.`
+    : 'Автообновление: выключено (KROT_AUTO_UPDATE=1 включает).']
+  if (status.commit) lines.push(`Текущий коммит: ${short(status.commit)}.`)
+  const last = status.last
+  if (last) {
+    const range = last.from && last.to ? `${short(last.from)} → ${short(last.to)}` : last.from ? short(last.from) : ''
+    // The detail comes from command output: one line, bounded; secrets are masked with the whole report.
+    const detail = last.detail?.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, 200)
+    lines.push(`Последняя попытка обновления: ${[utcMinute(last.at), attemptTrigger[last.trigger], range].filter(Boolean).join(', ')}: ` +
+      attemptResult[last.result] + (detail ? ` (${detail})` : '') + '.')
+  } else lines.push('Последняя попытка обновления: не записана.')
+  lines.push(status.bad.length ? `Плохие коммиты (автоматически не ставлю): ${status.bad.map(short).join(', ')}.` : 'Плохие коммиты: нет.')
+  return lines
 }
 
 // A time a state file holds as an invalid date or one out of the Date range is shown as unavailable, not thrown.
@@ -243,12 +298,18 @@ export interface DoctorOptions {
   secrets?: readonly string[]
   /** The error journal's recent entries; reading it must not throw. */
   errors?: () => ErrorSummary
+  /** The prompt-cache share of the current thread and of the last 24 hours; reading it must not throw. */
+  cache?: () => { thread?: CacheShare | undefined; day?: CacheShare | undefined }
+  /** The last render diffs, newest first (RenderEyes.recent); reading it must not throw. */
+  renders?: () => readonly RenderDiff[]
   /** The /update trial record (S9); reading it must not throw. */
   pendingUpdate?: () => Promise<PendingUpdate | undefined>
   /** The /update codex record (<state>/codex-update.json); reading it must not throw. */
   codexUpdate?: () => CodexUpdateRecord | undefined
   /** The bridge state directory: boot-ledger.json and fatal.json are read from it. */
   stateDir?: string
+  /** R29: the update facts; reading them must not throw. */
+  updates?: () => UpdateStatus | Promise<UpdateStatus>
 }
 
 /** The /update codex record as a /doctor fact (finished) or problem (cut off and not repaired). */
@@ -407,11 +468,41 @@ export async function collectDoctorReport(options: DoctorOptions): Promise<Docto
     }
     report.fatal = fatalLine(readFatal(options.stateDir))
   }
+  if (options.updates) {
+    const updates = await Promise.resolve().then(() => options.updates?.()).catch(() => undefined)
+    if (updates) report.updates = updateStatusLines(updates)
+    if (updates?.guard) report.problems.push({ text: updates.guard, fix: 'на сервере выполни ./install.sh --start.' })
+  }
   const errors = options.errors?.()
   // Only errors and a warning that keeps repeating are problems; other warnings are an info line with the counts.
   if (errors && errors.problemCount > 0) report.problems.push(errorJournalProblem(errors))
   else if (errors) report.errorJournal = `Журнал ошибок: за 24 ч – ${errors.day}, за 7 дн – ${errors.week}.`
+  const cache = options.cache?.()
+  const cacheLine = cacheStatusLine(cache?.thread, cache?.day)
+  if (cacheLine) report.cache = cacheLine + '.'
+  const lowCache = cacheDoctorProblem(cache?.day)
+  if (lowCache) report.problems.push(lowCache)
+  if (options.renders) report.renders = renderDiffLines(options.renders().slice(0, 5))
   return report
+}
+
+/**
+ * R42: the render diffs as /doctor fact lines: kinds, message IDs and fixed codes (render-eyes.ts renderCodes),
+ * never the reply's text.
+ */
+export function renderDiffLines(diffs: readonly RenderDiff[]): string {
+  if (diffs.length === 0) return 'Показ ответов в Telegram: записей пока нет.'
+  const line = (diff: RenderDiff): string => {
+    const counts = new Map<string, number>()
+    for (const format of diff.formats) counts.set(format, (counts.get(format) ?? 0) + 1)
+    const parts = [...counts].map(([format, count]) => `${format} ×${count}`).join(', ')
+    const ids = diff.messageIds.length ? diff.messageIds.map(id => '#' + id).join(', ') : 'в очереди'
+    const found = diff.degradations.map(item => `${item.kind} ${item.code}`)
+    if (diff.collapsedBlankLines > 0) found.push(`пустых строк пропало: ${diff.collapsedBlankLines}`)
+    return `   – ${utcMinute(diff.ts)} · ${ids} · ${parts}: ${found.length ? found.join('; ') : 'без искажений'}`
+  }
+  return `Показ ответов в Telegram (последние ${diffs.length}, новые сверху):\n` +
+    diffs.map(line).join('\n')
 }
 
 // The chat report stays well under Telegram's 4096-character message limit, with room for one closing line.
@@ -455,9 +546,13 @@ export function formatDoctorReport(report: DoctorReport, maxChars = Number.POSIT
     report.brain ?? '',
     ...(report.ownerInstructions ?? []),
     report.errorJournal ?? '',
+    report.cache ?? '',
+    report.renders ?? '',
     report.codexPrevious ?? '',
     report.boot ?? '',
     report.fatal ?? '',
+    ...report.passes ?? [],
+    ...(report.updates ?? []),
   ].filter(Boolean)
   if (!report.problems.length) return ['🩺 Доктор: всё в порядке.', ...facts].join('\n')
   const head = [`🩺 Доктор нашёл проблемы: ${report.problems.length}.`, '']
@@ -508,6 +603,8 @@ interface DoctorCommandHooks {
   selfRestart: boolean
   /** Configured secret values, masked in the chat report and in the turn handed to Codex. */
   secrets: readonly string[]
+  /** R38: the `/doctor tests` smoke set (self-test.ts). */
+  selfTest?: () => Promise<SelfTestResult[]>
 }
 
 export class DoctorCommand {
@@ -515,11 +612,11 @@ export class DoctorCommand {
 
   constructor(private hooks: DoctorCommandHooks) {}
 
-  /** `/doctor` reports; `/doctor fix` also hands the report to Codex through enqueueTurn. */
+  /** `/doctor` reports; `/doctor fix` also hands the report to Codex through enqueueTurn; `/doctor tests` runs the smoke set. */
   async handle(args: string, enqueueTurn: (text: string) => Promise<unknown>): Promise<void> {
     const mode = args.trim().toLowerCase()
-    if (mode && mode !== 'fix') {
-      await this.hooks.send('Используйте /doctor или /doctor fix.')
+    if (mode && mode !== 'fix' && !(mode === 'tests' && this.hooks.selfTest)) {
+      await this.hooks.send(this.hooks.selfTest ? 'Используйте /doctor, /doctor tests или /doctor fix.' : 'Используйте /doctor или /doctor fix.')
       return
     }
     if (this.running) {
@@ -528,6 +625,13 @@ export class DoctorCommand {
     }
     this.running = true
     try {
+      if (mode === 'tests' && this.hooks.selfTest) {
+        await this.hooks.send('Запускаю тесты моста: настройки, Telegram, Codex, хуки, каталог состояния. Это займёт до минуты.')
+        const results = await this.hooks.selfTest().catch(() => undefined)
+        await this.hooks.send(results ? formatSelfTests(results, this.hooks.secrets)
+          : 'Не удалось выполнить тесты моста. Запустите на сервере в папке plugin: bun run doctor.')
+        return
+      }
       await this.hooks.send('Запускаю самопроверку и сравниваю мост с GitHub. Это займёт до минуты.')
       let report: DoctorReport
       try {

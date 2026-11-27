@@ -2,9 +2,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, realpathSync, statSync } from 'node:fs'
 import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { Bot } from 'grammy'
 import type { Message } from 'grammy/types'
+import {
+  ACCESS_CALLBACK, accessCommand, AccessController, accessSettings, AccessStore, assertSingleOwnerEnv, CHAT_CALLBACK,
+  currentPublicRole, gateInbound, GroupController,
+} from '../access/index.js'
 import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
 import type { SendMessageOpts, TelegramApi } from '../channel/tools.js'
 import { getStatePaths, loadConfig, resolveAskGuardMode, resolveHudEnabled, resolveOutboxEnabled, RuntimeEnvSchema } from '../config.js'
@@ -45,12 +49,13 @@ import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
 import { sendAttachment } from './attachments.js'
 import { formatReminderEnabled, ownerTurn, questionFollowUpTurn, sideOwnerTurn } from './format-reminder.js'
+import { CacheStats, cacheStatusLine } from './cache-stats.js'
 import { codexAgentName, codexCommandSet, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
 import { brainHookStatus, chatReportChars, collectDoctorReport, DoctorCommand, formatDoctorReport, runDoctorScript } from './doctor-command.js'
 import { collectUsage, usageCommand } from './usage-command.js'
 import { startupSandbox } from './full-access.js'
-import { ETC_CODEX, defaultPaths as hookPaths, fullAccessGuards, listedHooks } from '../../../codex-hooks/src/install.js'
-import { listHooksViaAppServer } from '../../scripts/doctor.js'
+import { checkHooksPack, ETC_CODEX, defaultPaths as hookPaths, fullAccessGuards, listedHooks } from '../../../codex-hooks/src/install.js'
+import { codexHandshake, listHooksViaAppServer } from '../../scripts/doctor.js'
 import {
   directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply,
   ownerTaskWithdrawn, publicProgress,
@@ -85,7 +90,7 @@ import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } 
 import { LearningMemory } from './learning.js'
 import { createBrainBridge } from './brain-bridge.js'
 import { BRAIN_CALLBACK, BRAIN_UNAVAILABLE, MEMORY_REFUSED, MEMORY_WRITE_REFUSED, mayRunMemoryCommand } from './brain-commands.js'
-import { classifyBrainOrigin, hasMemoryCue, isOwnerPrivateChat } from './brain-origin.js'
+import { classifyBrainOrigin, foreignProvenance, hasForeignReply, hasMemoryCue, isOwnerPrivateChat } from './brain-origin.js'
 import { createOwnerEffects, createUnansweredQuestionHandler, type OwnerEffects } from './owner-effects.js'
 import {
   bridgeOrigin, classifyTurn, mainOrigin, ownerOrigin, ownerWords, parseTurnOrigin, storedOrigin, type TurnOrigin,
@@ -98,16 +103,20 @@ import { legacyCommand } from './legacy-command.js'
 import { sideQuestion, sideReply, sideReplySchema } from './side-reply.js'
 import { SideDeliveries, sideEndNotice } from './side-delivery.js'
 import { errorDetail, ErrorJournal, errorLogDays } from './error-log.js'
+import { RenderEyes, type RenderView } from './render-eyes.js'
+import { isRenderPreviewTool, renderPreview } from './render-preview.js'
 import { EXIT } from './exit-codes.js'
 import { startupFailureExit } from './startup-failure.js'
 import { TurnAdmission } from './turn-admission.js'
 import { BootLedger, HealthMark } from './boot-ledger.js'
+import { AutoUpdater, autoUpdateConfig, stageUpdate, UpdateAttempts, type AttemptInput } from './auto-update.js'
+import { runSelfTests, selfTestHooks } from './self-test.js'
 import { bootBridge, pollThroughConflicts, SafeMode, SafeModeInbox, safeModeStop, type SafeModeEntry } from './safe-mode.js'
 import { RestartIntents, refusedRestartText, type RestartAdmission, type RestartIntent } from './restart-intent.js'
 import { RestartNotices } from './restart-notice.js'
 import { createTelegramStack, ownerNoticeSender } from './telegram-stack.js'
 import { ownerInstructionsHome, reportOwnerInstructionsAtStartup } from './owner-instructions-lock.js'
-import { GUARD_FILE, recordTrialOutcome, runCommand, SelfUpdate, trialOutcomeFor } from './self-update.js'
+import { GUARD_FILE, guardCopyProblem, recordTrialOutcome, runCommand, SelfUpdate, trialOutcomeFor } from './self-update.js'
 import { codexRollback, CodexUpdate, fetchTextOrUndefined, findOnPath, readCodexRecord, recoverCodexUpdate, stagedCodexProbe } from './codex-update.js'
 import { KeySpike, keyspikeUrl } from './keyspike.js'
 import { isCodexUpdateRequest, UpdateCommands } from './update-commands.js'
@@ -120,6 +129,15 @@ import { QueueNotices } from './queue-notice.js'
 import { hasMedia, prepareInbound, type MediaInput } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { codexAppServerCommand } from './native-memories.js'
+import { HookDenials, multiuserProblems } from './multiuser-readiness.js'
+import { startupErrorMessage } from './startup-error.js'
+import {
+  assertPublicHomesSafe, loadPublicPolicy, preparePublicHome, publicAppServerCommand, publicCodexEnv, publicCodexRuntime, publicRolesSummary, PUBLIC_ROLES,
+  type HookRuntime, type PublicPolicy,
+} from './public-home.js'
+import { publicIntake } from './public-intake.js'
+import { PublicLane, PublicRouter } from './public-lane.js'
+import { doctorPublicRoles, provePublicHooks, startPublicBackends, type StartedPublicRole } from './public-backends.js'
 import { CodexSession, readSavedMainThread } from './session.js'
 import { hideQuestionMarker, questionFallback, QuestionCards, QUESTION_CALLBACK } from './questions.js'
 import { CodexWorkStatus } from './work-status.js'
@@ -174,6 +192,10 @@ async function main(): Promise<void> {
   const agentName = codexAgentName(process.env.KROT_CODEX_AGENT_NAME, config.memory.agent_label)
   const agentTitle = agentName === 'Codex' ? agentName : agentName + ' · Codex'
   const configuredOwnerId = config.allowed_user_ids[0]
+  // Throws on an unknown KROT_MULTIUSER value; with the flag on also on an unknown
+  // KROT_MEMBER_USER_IDS / KROT_START_ID_REPLY value and when TELEGRAM_ALLOWED_USER_IDS holds more than the owner.
+  const accessEnv = accessSettings(process.env)
+  assertSingleOwnerEnv(config.allowed_user_ids, accessEnv.enabled)
   if (config.allowed_user_ids.length !== 1 || config.allowed_chat_ids.length !== 1
       || configuredOwnerId === undefined || String(config.allowed_chat_ids[0]) !== String(configuredOwnerId)) {
     throw new Error('The pilot requires exactly one owner and that owner’s private chat')
@@ -193,6 +215,29 @@ async function main(): Promise<void> {
       && stateRelativeToWorkspace.split(/[\\/]/)[0] !== '..')) {
     throw new Error('Telegram state must be outside the Codex workspace')
   }
+  // KROT_MULTIUSER=1 starts only when the public profile can be applied (fail closed).
+  let publicRoot: string | undefined
+  let publicPolicy: PublicPolicy | undefined
+  let publicRuntime: HookRuntime | undefined
+  // The owner CODEX_HOME a public home is built from and must never overlap.
+  const ownerCodexHome = process.env.CODEX_HOME || join(process.env.HOME ?? '', '.codex')
+  if (accessEnv.enabled) {
+    const problems = multiuserProblems({ env: process.env, workspace, stateRoot })
+    if (problems.length) throw new Error('Multi-user mode cannot start: ' + problems.join('; '))
+    const root = resolvePath(process.env.KROT_PUBLIC_WORKSPACE_ROOT!.trim())
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    publicRoot = realpathSync(root)
+    // The per-role allowlist (skills, MCP servers, web search); throws on anything it does not understand.
+    publicPolicy = loadPublicPolicy(paths.root, process.env)
+    // Before any role home is cleaned: none of them may overlap the owner workspace, the owner Codex home or HOME.
+    assertPublicHomesSafe({
+      homesRoot: join(paths.root, 'codex-public'), ownerWorkspace: workspace, ownerCodexHome,
+      userHome: process.env.HOME ?? '',
+    })
+    // The public hooks run on this bridge's own bun; the Codex build and that bun are part of each home hash.
+    // One absolute Codex executable, resolved here, is both probed for that build and launched for every public app-server.
+    publicRuntime = publicCodexRuntime(process.env, process.execPath)
+  }
   if (!tokenLock.acquire(paths)) throw new Error('A bot already owns this state directory')
 
   const policyToken = process.env.KROT_CODEX_POLICY_TOKEN
@@ -200,12 +245,15 @@ async function main(): Promise<void> {
   const secrets = exactSecrets(process.env)
   // Every warn and error line also lands in <state dir>/errors-YYYY-MM-DD.jsonl (see error-log.ts).
   const errorJournal = new ErrorJournal({ dir: paths.root, days: errorLogDays(process.env.KROT_ERROR_LOG_DAYS), secrets })
+  const cacheStats = new CacheStats({ file: join(paths.root, 'codex-cache-stats.json') })
   const log = createLogger('krot-codex', {
     secrets, sink: (level, name, message, context) => errorJournal.record(level, name, message, context),
   })
   // A caught error logged at warn with its name, code and redacted description.
   const warnError = (error: unknown, message: string, context: Record<string, unknown> = {}): void =>
     log.warn(message, { ...context, error: errorDetail(error, secrets) })
+  // R42: what the owner sees after each send, diffed against the model's text (see render-eyes.ts).
+  const renderEyes = new RenderEyes({ file: join(paths.root, 'render-diffs.json'), log, secrets })
   const brainHome = resolveBrainHome(process.env)
   const brainScope = bridgeScope(String(env.TELEGRAM_EXPECTED_BOT_ID), String(ownerId))
   const brain = createBrainBridge({
@@ -246,6 +294,7 @@ async function main(): Promise<void> {
   let outboxTimer: ReturnType<typeof setInterval> | undefined
   let watchdogTimer: ReturnType<typeof setInterval> | undefined
   let workerStatusTimer: ReturnType<typeof setInterval> | undefined
+  let groupSweepTimer: ReturnType<typeof setInterval> | undefined
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined
   let goalRecoveryTimer: ReturnType<typeof setTimeout> | undefined
   const memory = config.memory.enabled && config.memory.workspace_path ? new MemoryWriter({
@@ -282,7 +331,9 @@ async function main(): Promise<void> {
       healthMark?.polled()
       void restartNotices?.back()
     },
-    ...(keyspike ? { onHandover: (handover: WebAppHandover) => keyspike.handover(handover) } : {}) })
+    ...(keyspike ? { onHandover: (handover: WebAppHandover) => keyspike.handover(handover) } : {}),
+    // KROT_MULTIUSER=1: the bot's own group membership changes drive group approval.
+    ...(accessEnv.enabled ? { extraUpdates: ['my_chat_member'] as const } : {}) })
   const safeEntry = await bootBridge<SafeModeEntry | undefined>({
     ledger, boot: { commit: bridgeCommit(), invocation: process.env.INVOCATION_ID || randomUUID() },
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
@@ -317,6 +368,12 @@ async function main(): Promise<void> {
     },
   })
   const headCommit = (await runCommand('git', ['rev-parse', 'HEAD'], { cwd: bridgeRepo, timeoutMs: 10_000 })).stdout.trim()
+  // R29: the last update attempt (/update, /cc update, the timer) for /doctor; KROT_AUTO_UPDATE=1 arms the timer.
+  const updateAttempts = new UpdateAttempts(paths.root)
+  const autoConfig = autoUpdateConfig(process.env)
+  const recordUpdateAttempt = (attempt: AttemptInput): void => {
+    try { updateAttempts.record(attempt) } catch (error) { warnError(error, 'Could not record the update attempt') }
+  }
   // S6: every planned restart is recorded before exit 75; a stale or looping one is refused.
   const intents = new RestartIntents(paths.root)
   function admitRestart(kind: RestartIntent['kind'], ownerMessageId: number | undefined, toCommit?: string): RestartAdmission {
@@ -356,12 +413,18 @@ async function main(): Promise<void> {
     const report = await selfUpdate.bootReport(headCommit)
     // Not awaited: a slow Telegram must not delay polling and the health mark.
     const notify = (text: string) => { void sendOwner(text).catch((error: unknown) => warnError(error, 'Could not send the update notice')) }
+    // R29: the record is reported once (bootReport removes it); the journal keeps it for /doctor.
+    const bad = report && report.kind !== 'trial' && (await selfUpdate.badCommits()).includes(report.to)
+    const badText = bad ? ' Эта версия помечена плохой: автоматически я её больше не поставлю.' : ''
     if (report?.kind === 'rolled_back') {
+      log.error('Update rolled back after failed boots', { from: report.from, to: report.to, markedBad: Boolean(bad) })
       notify('⚠️ Обновление до ' + report.to.slice(0, 12) + ' не заработало нормально, поэтому я вернул прежнюю версию ' +
-        report.from.slice(0, 12) + '. Бот работает как раньше. Причину видно на сервере: journalctl --user -u krotov-telegram.service -n 80')
+        report.from.slice(0, 12) + '. Бот работает как раньше.' + badText +
+        ' Причину видно на сервере: journalctl --user -u krotov-telegram.service -n 80')
     } else if (report?.kind === 'rollback_failed') {
+      log.error('Update rollback failed', { from: report.from, to: report.to, markedBad: Boolean(bad) })
       notify('⚠️ Обновление до ' + report.to.slice(0, 12) + ' не заработало, и вернуть версию ' + report.from.slice(0, 12) +
-        ' автоматически не удалось. Проверь на сервере git status и bun install.')
+        ' автоматически не удалось.' + badText + ' Проверь на сервере git status и bun install.')
     } else if (report?.kind === 'trial') {
       trialPending = true
       log.info('Trial boot of an update', { from: report.from, to: report.to })
@@ -388,15 +451,23 @@ async function main(): Promise<void> {
     return
   }
 
-  function collectBridgeDoctorReport(sandboxFallback?: string) {
+  function collectBridgeDoctorReport(sandboxFallback?: string, threadId?: string | null) {
     const doctorEnv = { ...process.env, KROT_CODEX_SANDBOX_FALLBACK: sandboxFallback }
     return collectDoctorReport({
       repo: bridgeRepo, env: process.env, secrets,
       doctor: () => runDoctorScript(join(import.meta.dir, '..', '..', 'scripts', 'doctor.ts'), doctorEnv),
       errors: () => errorJournal.recent(),
+      cache: () => ({ thread: cacheStats.thread(threadId), day: cacheStats.day() }),
+      renders: () => renderEyes.recent(),
       pendingUpdate: () => selfUpdate.pending(),
       codexUpdate: () => readCodexRecord(paths.root),
       stateDir: paths.root, brain: () => brain.status(),
+      updates: async () => {
+        const last = updateAttempts.last()
+        const guard = guardCopyProblem(paths.root)
+        return { auto: autoConfig, bad: await selfUpdate.badCommits(), ...(headCommit ? { commit: headCommit } : {}),
+          ...(last ? { last } : {}), ...(guard ? { guard } : {}) }
+      },
     })
   }
 
@@ -540,6 +611,11 @@ async function main(): Promise<void> {
   if (sandbox.fallback) log.warn(`Full access refused at startup, Codex runs in workspace-write: ${sandbox.fallback}`)
   let stopping = false
   let session: CodexSession | undefined
+  // KROT_MULTIUSER=1: one app-server per public role, separate from the owner's.
+  const publicSessions: CodexSession[] = []
+  // KROT_MULTIUSER=1: the member and guest lane, assigned once the access list exists. An access change
+  // rechecks its queued and running work; shutdown() stops it first.
+  let publicLane: PublicLane | undefined
   let task: Promise<void> | undefined
   function syncBrainQuestions(): void {
     const thread = session?.currentThread
@@ -562,6 +638,8 @@ async function main(): Promise<void> {
   function shutdown(): void {
     if (stopping) return
     stopping = true
+    // First: no queued public turn may start, and no running one replies or apologizes while the bridge stops.
+    publicLane?.stop()
     // S7: a hanging close must not leave the bridge alive and deaf; the chosen exit code is kept.
     armShutdownWatchdog({
       exit: code => process.exit(code),
@@ -575,6 +653,7 @@ async function main(): Promise<void> {
     clearInterval(outboxTimer)
     clearInterval(watchdogTimer)
     clearInterval(workerStatusTimer)
+    clearInterval(groupSweepTimer)
     clearInterval(questionTimer)
     clearTimeout(recoveryTimer)
     clearTimeout(goalRecoveryTimer)
@@ -583,6 +662,7 @@ async function main(): Promise<void> {
     externalTasks?.close()
     void agentWebhook?.stop(true)
     session?.close()
+    for (const publicSession of publicSessions) publicSession.close()
     void poller.stop()
   }
   process.once('SIGINT', shutdown)
@@ -719,6 +799,7 @@ async function main(): Promise<void> {
       // server's own Codex config decides whether summaries stream.
       reasoningSummary: !proxy && config.status.thoughts?.enabled === true,
       onWarning: message => log.warn(message),
+      onTokenUsage: (threadId, tokenUsage) => cacheStats.record(threadId, tokenUsage),
       // The one registration point of the owner's main thread (A1, N2): resume, start, fork and archive.
       onMain: id => brain.registerOwnerMain(id),
       aroundMainOpen: open => brain.mainOpen(open),
@@ -859,6 +940,8 @@ async function main(): Promise<void> {
       ...(sandbox.sandbox ? { sandbox: sandbox.sandbox } : {}),
       ask: (input, signal) => askWithBrain(input, signal),
       chatAction: (key, args, current, tool) => {
+        // R42: a picture for the agent only; nothing goes to Telegram, so it bypasses the action queue.
+        if (isRenderPreviewTool(tool)) return Promise.resolve(renderPreview(args, { shown: id => renderEyes.shown(id), secrets }))
         const epoch = stopEpoch
         const result = isComponentTool(tool)
           ? agentChat.component(key, tool, args, () => !stopping && epoch === stopEpoch && current())
@@ -898,6 +981,7 @@ async function main(): Promise<void> {
       onIdle: () => startNext(),
       restart: plannedRestart,
       trialPending: () => trialPending,
+      recordAttempt: recordUpdateAttempt,
       selfUpdate,
       codexUpdate: proxy ? undefined : new CodexUpdate({
         run: runCommand, fetchText: fetchTextOrUndefined, home: process.env.HOME ?? workspace, stateDir: paths.root,
@@ -907,12 +991,78 @@ async function main(): Promise<void> {
       }),
     })
     maintenanceActive = () => updateCommands.maintenance()
+    // R29: the timer (KROT_AUTO_UPDATE=1) and /cc update. Staged check first; the apply waits for an idle bridge.
+    const autoUpdater = new AutoUpdater({
+      config: autoConfig,
+      check: () => selfUpdate.check(),
+      badCommits: () => selfUpdate.badCommits(),
+      stage: to => stageUpdate({ repo: bridgeRepo, stateDir: paths.root, run: runCommand, bun: process.execPath, to }),
+      applyWhenIdle: (plan, trigger) => updateCommands.applyWhenIdle(plan, trigger),
+      send: text => send(text),
+      attempts: { last: () => updateAttempts.last(), record: recordUpdateAttempt },
+      sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    })
+    const runAutoUpdate = (trigger: 'auto' | 'owner'): void => {
+      // The boot after an update proves itself first: no new update before its health mark.
+      if (trigger === 'auto' && trialPending) return
+      void autoUpdater.run(trigger).catch((error: unknown) => warnError(error, 'Automatic update check failed'))
+    }
+    // The timer goes through runAutoUpdate: it skips a trial boot and logs a failed check.
+    if (autoUpdater.start((_tick, ms) => { setInterval(() => runAutoUpdate('auto'), ms).unref() })) {
+      log.info('Automatic update armed', { hours: autoConfig.intervalMs / 3_600_000 })
+    }
     await codex.initialize()
     health.handshake()
     if (brain.enabled) {
       await refreshBrainHooks().catch(() => log.warn('Brain hook status could not be checked'))
       await brain.start()
       syncBrainQuestions()
+    }
+    // KROT_MULTIUSER=1: each public role gets its own app-server and CODEX_HOME built from the
+    // allowlist (public-home.ts), never the owner's. Live half of the startup check: a fresh
+    // thread of each must report the public profile and reach exactly the allowlist (fail closed).
+    let publicRoles: StartedPublicRole<CodexSession>[] = []
+    // Thread-role denials the loopback endpoint answered; the hook proof of each role reads them.
+    const hookDenials = new HookDenials()
+    let publicRouter: PublicRouter | undefined
+    if (publicRoot && publicPolicy && publicRuntime) {
+      const policy = publicPolicy
+      const runtime = publicRuntime
+      const started = await startPublicBackends({
+        roles: PUBLIC_ROLES,
+        // The role home is checked against this root, the owner workspace, the owner Codex home and HOME before anything in it is cleaned.
+        prepare: role => preparePublicHome({
+          role, policy, home: join(paths.root, 'codex-public', role), homesRoot: join(paths.root, 'codex-public'),
+          ownerWorkspace: workspace, ownerCodexHome, userHome: process.env.HOME ?? '', runtime,
+        }),
+        probeCwd: join(publicRoot, '_probe'),
+        stopping: () => stopping,
+        // Outside the role's home: a rebuild clears the home, the proof stays valid while the home hash matches.
+        proofFile: role => join(paths.root, 'codex-public', role + '.hook-proof.json'),
+        createSession: (role, prepared, onExit) => {
+          const publicSession = new CodexSession({
+            cwd: publicRoot,
+            stateFile: join(prepared.home, 'bridge-thread.json'),
+            env: publicCodexEnv(process.env, prepared.home, prepared.envVars),
+            // The executable whose --version is in the home hash, never a PATH lookup from this cwd.
+            command: publicAppServerCommand(runtime),
+            onWarning: message => log.warn(message),
+            // Per thread too (thread/start config), not only the home's config.toml; guests are never live.
+            publicWebSearch: prepared.webSearch ? 'live' : 'disabled',
+            // Every newly opened thread is checked against the allowlist before its first turn.
+            publicAllow: prepared,
+          }, () => {
+            onExit()
+            // Never a fallback to the owner's app-server: this role's messages get «временно недоступно».
+            if (!stopping) log.warn('The ' + role + ' public Codex app-server stopped; ' + role + ' messages are unavailable until a restart')
+          })
+          // Pushed before initialize, so a failed start still closes it in shutdown().
+          publicSessions.push(publicSession)
+          return publicSession
+        },
+      })
+      publicRoles = started.roles
+      publicRouter = started.router
     }
     workerStatusTimer = setInterval(() => {
       if (!stopping) {
@@ -943,7 +1093,11 @@ async function main(): Promise<void> {
 
     // Every enabled command is accepted and listed in /help; Telegram's menu
     // shows only the short list (KROT_MENU_COMMANDS or the default).
-    const buildCommands = () => codexCommandSet(config, !!learning, process.env.KROT_MENU_COMMANDS, log, [], brain.enabled)
+    const accessCommands = accessEnv.enabled ? [
+      { command: 'users', description: 'доступ: list | add | remove | role | invite' },
+      { command: 'chats', description: 'группы: список | remove <id>' },
+    ] : []
+    const buildCommands = () => codexCommandSet(config, !!learning, process.env.KROT_MENU_COMMANDS, log, accessCommands, brain.enabled)
     let commands = buildCommands()
     // Account limits for the HUD: cached for a minute and refreshed in the
     // background, so a slow or failing read never delays or breaks the HUD.
@@ -1021,6 +1175,55 @@ async function main(): Promise<void> {
       remove: id => telegram.deleteMessage(ownerChat, id),
       onError: error => warnError(error, 'Could not remove a queue notice'),
     })
+    // KROT_MULTIUSER=1: the access list, /users and the /start ID reply. Non-owner
+    // messages reach Codex only through the public lane below.
+    const accessStore = accessEnv.enabled ? new AccessStore({
+      stateDir: paths.root, ownerId: ownerChat, envMembers: accessEnv.envMembers, warn: message => log.warn(message),
+      // A removed user, a changed role or a dropped group: their queued public turns are cancelled, running ones interrupted.
+      onChange: () => publicLane?.revokeStale(),
+    }) : undefined
+    const access = accessStore ? new AccessController({
+      store: accessStore,
+      stateDir: paths.root,
+      ownerId: ownerChat,
+      botUsername: () => bot.botInfo.username ?? '',
+      startIdReply: accessEnv.startIdReply,
+      warn: message => log.warn(message),
+      async send(chat, text, keyboard) {
+        if (chat === ownerChat) await hudAnchor.settled()
+        await telegram.sendMessage(chat, text, keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {})
+      },
+    }) : undefined
+    // KROT_MULTIUSER=1: group approval cards, my_chat_member, /chats and leaving
+    // a group nobody approved within 24 hours.
+    const groups = accessStore ? new GroupController({
+      store: accessStore,
+      stateDir: paths.root,
+      ownerId: ownerChat,
+      warn: message => log.warn(message),
+      async send(chat, text, keyboard) {
+        if (chat === ownerChat) await hudAnchor.settled()
+        await telegram.sendMessage(chat, text, keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {})
+      },
+      async leave(chat) { await bot.api.leaveChat(chat) },
+    }) : undefined
+    if (groups) {
+      const sweepGroups = () => { if (!stopping) void groups.sweep().catch(() => log.warn('Could not sweep group requests')) }
+      sweepGroups()
+      groupSweepTimer = setInterval(sweepGroups, 3_600_000)
+      groupSweepTimer.unref()
+    }
+    // KROT_MULTIUSER=1: member and guest messages run here, apart from the owner's inbox,
+    // on read-only no-shell threads of the role's own app-server; replies are plain text into the origin chat.
+    publicLane = publicRoot ? new PublicLane({
+      root: publicRoot, stateDir: paths.root, maxParallel: parallel.maxParallel, runner: publicRouter ?? new PublicRouter({}), secrets,
+      // Rechecked at dispatch: a sender who lost access (or whose role changed) while queued never runs.
+      authorize: item => accessStore ? currentPublicRole(item, {
+        ownerId: ownerChat, roleOf: id => accessStore.roleOf(id), chat: id => accessStore.chat(id),
+      }) : undefined,
+      warn: message => log.warn(message),
+      async send(chat, text, opts) { await telegram.sendMessage(chat, text, opts) },
+    }) : undefined
     let learningRetryAfter = 0
     function runLearning(force = false): void {
       if (brain.enabled || !learning || stopping || !force && Date.now() < learningRetryAfter) return
@@ -1052,6 +1255,16 @@ async function main(): Promise<void> {
     // `origin`: the turn the text answers; a question in it is the owner's only for an owner turn.
     async function sendFinalText(source: string, origin: TurnOrigin, containsFiles: boolean, replyTo?: number,
       messageId?: number, onSent?: (id: number) => void, brainKey?: string): Promise<boolean> {
+      // R42: what the owner is shown, part by part, is diffed against the model's text once the send ends.
+      const view = renderEyes.begin(redactSecrets(source, secrets))
+      try {
+        return await sendFinalTextParts(view, source, origin, containsFiles, replyTo, messageId, onSent, brainKey)
+      } finally {
+        view.finish()
+      }
+    }
+    async function sendFinalTextParts(view: RenderView, source: string, origin: TurnOrigin, containsFiles: boolean,
+      replyTo?: number, messageId?: number, onSent?: (id: number) => void, brainKey?: string): Promise<boolean> {
       // Secrets are masked in the source: HTML rendering escapes `&`, `<`, `>` and quotes past exact matching.
       const normalized = normalizeChatReply(redactSecrets(source, secrets))
       const text = splitLongBlock(normalized)
@@ -1151,6 +1364,7 @@ async function main(): Promise<void> {
               { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }), replyTo),
             value => !('message_id' in value))
           if (result.value && 'message_id' in result.value) {
+            view.shown('rich', text, result.value.message_id)
             agentChat.remember(result.value.message_id, true, true, true)
             await recordQuestion(result.value.message_id)
           }
@@ -1169,6 +1383,7 @@ async function main(): Promise<void> {
           const result = await deliver(documentKey, () =>
             withoutDeletedQuote(id => sendTextDocument(telegram, ownerChat, document, id), replyTo))
           if (result.value) {
+            view.shown('document', document, result.value.message_id)
             agentChat.remember(result.value.message_id, true, true)
             await recordQuestion(result.value.message_id)
           }
@@ -1182,10 +1397,12 @@ async function main(): Promise<void> {
           const result = await deliver(key, () => withoutDeletedQuote(id => tryHtml(part, id), target),
             value => 'fallback' in value)
           if (result.value && 'message_id' in result.value) {
+            view.shown('HTML', part, result.value.message_id)
             agentChat.remember(result.value.message_id, true, true)
             if (index === 0) await recordQuestion(result.value.message_id)
           }
           if (result.state !== 'fallback') continue
+          view.brokenHtml()
           let pieces = plainPlans.get(index)
           if (!pieces) {
             // A plan saved by the previous bridge may already have plain receipts. Its saved HTML
@@ -1207,6 +1424,7 @@ async function main(): Promise<void> {
               subIndex === 0 ? target : undefined)
             })
             if (sent.value) {
+              view.shown('plain', redactSecrets(piece, secrets), sent.value.message_id)
               agentChat.remember(sent.value.message_id, true, true)
               if (index === 0 && subIndex === 0) await recordQuestion(sent.value.message_id)
             }
@@ -1226,6 +1444,7 @@ async function main(): Promise<void> {
         retryAfter = flood.retryAfter
       }
       if (rich && 'message_id' in rich) {
+        view.shown('rich', text, rich.message_id)
         agentChat.remember(rich.message_id, true, true, true)
         onSent?.(rich.message_id)
         await recordQuestion(rich.message_id)
@@ -1238,9 +1457,12 @@ async function main(): Promise<void> {
         if (format === 'HTML') options.parse_mode = 'HTML'
         const target = first ? replyTo : undefined
         const queue = (pending: Outbox, wait: number): true => {
+          const queuedText = redactSecrets(part, secrets)
           // Per-chat FIFO: only the last piece of the final part completes the exchange.
-          pending.enqueue(ownerChat, redactSecrets(part, secrets), options, wait, { origin,
+          pending.enqueue(ownerChat, queuedText, options, wait, { origin,
             question: first ? question : undefined, brainKey: last ? brainKey : undefined, document: format === 'document' })
+          // Shown later, in this format: the send is recorded once the outbox delivered it (onDeferredDelivery).
+          view.deferred(format, queuedText)
           queued = true
           return true
         }
@@ -1261,6 +1483,7 @@ async function main(): Promise<void> {
           return queue(outbox, retryAfter)
         }
         if ('fallback' in sent) return false
+        view.shown(format, part, sent.message_id)
         agentChat.remember(sent.message_id, true, true)
         onSent?.(sent.message_id)
         if (first) await recordQuestion(sent.message_id)
@@ -1273,6 +1496,7 @@ async function main(): Promise<void> {
           const first = index === 0
           const last = index === parts.length - 1
           if (validateTelegramHtml(part).downgraded || !await sendOrDefer(part, 'HTML', first, last)) {
+            view.brokenHtml()
             const pieces = splitPlainFallback(part)
             for (const [subIndex, plain] of pieces.entries()) {
               await sendOrDefer(plain, 'plain', first && subIndex === 0, last && subIndex === pieces.length - 1)
@@ -1307,9 +1531,15 @@ async function main(): Promise<void> {
         // Redacted before rendering: HTML escaping hides a secret holding `&`, `<`, `>` or quotes from exact matching.
         const text = redactSecrets(source, secrets)
         const quote = { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }
+        // R42: the interim reply is diffed like a final one.
+        const view = renderEyes.begin(text)
         if (sendsAsRich(text, ownerChat, config.richMessages)) {
           const result = await telegram.sendRichMessage(ownerChat, text, quote)
-          if ('message_id' in result) return { messageId: result.message_id, rich: true as const }
+          if ('message_id' in result) {
+            view.shown('rich', text, result.message_id)
+            view.finish()
+            return { messageId: result.message_id, rich: true as const }
+          }
         }
         const html = markdownToTelegramHtml(text)
         let singlePart: boolean
@@ -1317,15 +1547,32 @@ async function main(): Promise<void> {
           singlePart = splitMessage(html).length === 1
         } catch (error) {
           if (!(error instanceof PreformattedDocumentError)) throw error
-          const result = await sendTextDocument(telegram, ownerChat, plainTextWithLinks(error.html, Infinity), id)
+          const document = plainTextWithLinks(error.html, Infinity)
+          const result = await sendTextDocument(telegram, ownerChat, document, id)
+          view.shown('document', document, result.message_id)
+          view.finish()
           return { messageId: result.message_id }
         }
-        const { message_id: messageId } = singlePart
-          ? await telegram.sendMessage(ownerChat, html, { ...quote, parse_mode: 'HTML' }).catch(error => {
-            if (!isTelegramHtmlParseError(error)) throw error
-            return telegram.sendMessage(ownerChat, text, quote)
-          })
-          : await telegram.sendMessage(ownerChat, text, quote)
+        const sent = singlePart
+          ? await telegram.sendMessage(ownerChat, html, { ...quote, parse_mode: 'HTML' })
+            .then(result => ({ ...result, format: 'HTML' as const }), error => {
+              if (!isTelegramHtmlParseError(error)) throw error
+              view.brokenHtml()
+              return telegram.sendMessage(ownerChat, text, quote).then(result => ({ ...result, format: 'plain' as const }))
+            })
+          : { ...await telegram.sendMessage(ownerChat, text, quote), format: 'plain' as const }
+        const messageId = sent.message_id
+        if (sent.format === 'HTML') {
+          // The safe wrapper redacts the HTML and sends a part its validator refuses as plain text without
+          // parse_mode: record that effective payload and format, the way the wrapper computes them.
+          const checked = validateTelegramHtml(redactOutboundText(html, 'HTML', secrets))
+          if (checked.downgraded) view.brokenHtml()
+          view.shown(checked.downgraded ? 'plain' : 'HTML', checked.downgraded ? redactSecrets(checked.text, secrets) : checked.text,
+            messageId)
+        } else {
+          view.shown('plain', text, messageId)
+        }
+        view.finish()
         return { messageId }
       }, target),
       autonomy: async (action, id, resolution) => {
@@ -1354,6 +1601,8 @@ async function main(): Promise<void> {
       }
       work.repost(id)
       agentChat.remember(id, true, true)
+      // R42: a deferred part is shown now, under this message ID; its send is recorded once all its parts are.
+      renderEyes.delivered(item.text, id)
       // An item saved without an origin is a guest's: its question never becomes the owner's.
       if (questionConfig.enabled && item.question) {
         void ownerEffects.questionSeen(parseTurnOrigin(item.origin, id), id, item.question)
@@ -1668,6 +1917,11 @@ async function main(): Promise<void> {
           } })
           return
         }
+        if (action === 'update') {
+          // R29: an automatic-update check now (staged check, idle-only apply), also when the timer is off.
+          runAutoUpdate('owner')
+          return
+        }
         if (action === 'archive') {
           const archive = join(paths.root, 'claude-archive')
           if (!value) {
@@ -1775,11 +2029,49 @@ async function main(): Promise<void> {
 
     const usage = usageCommand(days => collectUsage(bridgeRepo, paths.root, days), send)
     const doctor = new DoctorCommand({
-      collect: () => collectBridgeDoctorReport(sandbox.fallback),
+      collect: async () => {
+        const report = await collectBridgeDoctorReport(sandbox.fallback, codex.currentThread)
+        // KROT_MULTIUSER=1, per role on its own public app-server: what the role may use, a fresh
+        // thread must reach exactly the allowlist, and a live turn asked to run `id` must come back NO_SHELL.
+        // A role that fails is quarantined until a restart (public-backends.ts).
+        if (publicRoot) {
+          const roles = await doctorPublicRoles(publicRoles, {
+            probeCwd: join(publicRoot, '_probe'), canaryDir: join(publicRoot, '_canary'), canaryTimeoutMs: 120_000,
+          })
+          report.passes = [...report.passes ?? [],
+            ...publicRolesSummary(publicRoles.map(role => role.prepared)).map(line => 'ℹ️ ' + line), ...roles.passes]
+          report.problems.push(...roles.problems)
+        }
+        return report
+      },
       send, repo: bridgeRepo, selfRestart: selfRestartEnabled, secrets,
+      // R38: /doctor tests. Each check names only what failed; secrets are masked in self-test.ts.
+      selfTest: () => runSelfTests({
+        config: () => {
+          const parsed = RuntimeEnvSchema.safeParse(process.env)
+          if (!parsed.success) throw new Error('не разбираются: ' + parsed.error.issues.map(issue => issue.path.join('.')).join(', '))
+          loadConfig(process.env)
+        },
+        getMe: async () => {
+          const me = await bot.api.getMe()
+          return { id: me.id, username: me.username }
+        },
+        expectedBotId: String(env.TELEGRAM_EXPECTED_BOT_ID),
+        codexHandshake: () => proxy
+          ? codexHandshake(process.env, workspace, ['/usr/bin/sudo', '-n', '--', proxy])
+          : codexHandshake(process.env, workspace),
+        hooks: () => selfTestHooks(process.env.KROT_CODEX_HOOKS === '1',
+          () => checkHooksPack(hookPaths(process.env), () => listHooksViaAppServer(process.env, workspace))),
+        stateDir: paths.root, secrets,
+      }),
     })
 
     async function compact(): Promise<void> {
+      // A compaction is a Codex turn: none starts while /restart or /update holds the maintenance reservation.
+      if (admission.blocker() === 'maintenance') {
+        await send('Сейчас обновляюсь или перезапускаюсь. Сжатие не запускаю: повтори его, когда я вернусь.')
+        return
+      }
       if (task || codex.isRunning) {
         await send('Дождись завершения текущей задачи или отправь /stop.')
         return
@@ -1943,12 +2235,14 @@ async function main(): Promise<void> {
         const { hasThread, model, usage } = codex.status
         const busy = !!task || codex.isRunning || goalActive || !!recoveringGoal || deliveringGoal
         const step = busy ? plans.find(item => item.status === 'in_progress') : undefined
+        const cache = cacheStatusLine(cacheStats.thread(codex.currentThread), cacheStats.day())
         await send([
           agentTitle,
           'Сессия ' + (busy ? 'занята' : hasThread ? 'готова к продолжению' : 'ещё не начата'),
           ...(step ? ['Текущий этап: ' + step.content] : []),
           ...(model ? ['Модель ' + model] : []),
           ...(usage ? ['Контекст ' + usage.usedTokens.toLocaleString('ru') + ' / ' + usage.windowTokens.toLocaleString('ru')] : []),
+          ...(cache ? [cache] : []),
           ...(inbox.size ? ['В очереди: ' + inbox.size] : []),
           'Зеркало ' + (controls.mirror ? 'включено' : 'выключено'),
           'Подтверждения ' + (approvals ? 'в Telegram' : 'отключены'),
@@ -2019,6 +2313,34 @@ async function main(): Promise<void> {
       }
       await sendMemory(await brain.memoryCommand({ args: '', ownerPrivateChat: true, callback }))
     })
+    if (access) {
+      bot.callbackQuery(ACCESS_CALLBACK, async ctx => {
+        if (stopping || ctx.from.id !== ownerId || ctx.chat?.type !== 'private' || ctx.chat.id !== ownerId) return
+        const answer = await access.callback(ctx.callbackQuery.data, ctx.from.id, ctx.chat.id)
+          .catch(() => { log.warn('Could not apply an access request'); return 'Не получилось, попробуй ещё раз.' })
+        await ctx.answerCallbackQuery(answer ? { text: answer } : undefined).catch(() => undefined)
+      })
+    }
+    if (groups) {
+      bot.callbackQuery(CHAT_CALLBACK, async ctx => {
+        if (stopping || ctx.from.id !== ownerId || ctx.chat?.type !== 'private' || ctx.chat.id !== ownerId) return
+        const answer = await groups.callback(ctx.callbackQuery.data, ctx.from.id, ctx.chat.id)
+          .catch(() => { log.warn('Could not apply a group decision'); return 'Не получилось, попробуй ещё раз.' })
+        await ctx.answerCallbackQuery(answer ? { text: answer } : undefined).catch(() => undefined)
+      })
+      bot.on('my_chat_member', async ctx => {
+        if (stopping) return
+        const update = ctx.myChatMember
+        // A restricted bot that is no longer a member has in fact left.
+        const status = (member: typeof update.new_chat_member): string =>
+          member.status === 'restricted' && !member.is_member ? 'left' : member.status
+        await groups.memberUpdate({
+          chatId: update.chat.id, chatType: update.chat.type,
+          title: 'title' in update.chat ? update.chat.title : undefined,
+          fromId: update.from.id, oldStatus: status(update.old_chat_member), newStatus: status(update.new_chat_member),
+        }).catch(() => log.warn('Could not handle a group membership change'))
+      })
+    }
 
     bot.callbackQuery(APPROVAL_CALLBACK, async ctx => {
       if (ctx.from.id !== ownerId || ctx.chat?.type !== 'private' || ctx.chat.id !== ownerId) return
@@ -2161,6 +2483,8 @@ async function main(): Promise<void> {
     // Starts a side turn for one message; false leaves it to the usual path.
     // The record stays in the inbox until the side turn finished (see side-recovery.ts).
     function launchSide(message: Message, reuse: string | undefined, provenance: Provenance): boolean {
+      // Under the maintenance reservation the message takes the usual path: it waits in the inbox.
+      if (admission.blocker() === 'maintenance') return false
       const outcome = inbox.beginFollowUp(message, provenance)
       if (outcome === 'duplicate') return true
       if (outcome !== 'accepted') return false
@@ -2216,10 +2540,14 @@ async function main(): Promise<void> {
           }
           const isolated = sideOrigin.isolate
           const summary = isolated ? { title: 'основная задача', elapsedMs: 0 } : mainSummary()
+          // R42: the render note belongs to the owner's own words. Provenance decides, with Brain on or off (off,
+          // nothing isolates): a forwarded or foreign-reply side turn neither sees nor takes the pending note.
+          const ownWords = !isolated && !foreignProvenance(message, ownerId) && !hasForeignReply(message, ownerId, trustedReply)
           const prompt = agent
             ? [sideInstructions(summary, provenance), input.text].filter(Boolean).join('\n\n')
             : sideOwnerTurn(formatReminderOn,
-              [sideInstructions(summary, provenance), ...(brainEnabled ? [] : [agentChatInstructions]), chatContext([message]), input.text])
+              [sideInstructions(summary, provenance), chatContext([message]), ownWords ? renderEyes.takeNote() : '', input.text],
+              brainEnabled ? '' : agentChatInstructions)
           card?.show(sideThinking)
           const safeReuse = !brainEnabled || !reuse || await brain.isSafeSide(reuse, isolated ? 'guest' : 'side') ? reuse : undefined
           brainTurn = brain.execution(sideOrigin.role, brainInput(message, sideOrigin, input.text))
@@ -2423,6 +2751,48 @@ async function main(): Promise<void> {
     })
     bot.on('message', async ctx => {
       if (stopping) return
+      if (access && groups && accessStore) {
+        const message = ctx.message
+        if (message.migrate_to_chat_id !== undefined) {
+          await groups.migrate(ctx.chat.id, message.migrate_to_chat_id)
+            .catch(() => log.warn('Could not move a group approval to its new ID'))
+          return
+        }
+        const reply = message.reply_to_message
+        const decision = gateInbound({
+          messageId: message.message_id, chatId: ctx.chat.id, chatType: ctx.chat.type,
+          isForum: 'is_forum' in ctx.chat && ctx.chat.is_forum === true,
+          fromId: ctx.from.id, isBot: ctx.from.is_bot,
+          text: message.text, caption: message.caption, entities: message.entities, captionEntities: message.caption_entities,
+          replyTo: reply ? { fromId: reply.from?.id, topicRoot: reply.forum_topic_created !== undefined } : undefined,
+          threadId: message.message_thread_id, isTopicMessage: message.is_topic_message,
+          forwarded: !!message.forward_origin,
+        }, {
+          ownerId: ownerChat, botId: bot.botInfo.id, botUsername: bot.botInfo.username ?? '',
+          roleOf: id => accessStore.roleOf(id), chat: id => accessStore.chat(id),
+        })
+        if (decision.kind === 'drop') return
+        if (decision.kind === 'access') {
+          // Answers only a private /start; nothing from a non-owner reaches Codex in this slice.
+          await access.inbound({
+            chatId: ctx.chat.id, chatType: ctx.chat.type, fromId: ctx.from.id, isBot: ctx.from.is_bot,
+            text: message.text, firstName: ctx.from.first_name, username: ctx.from.username,
+            forwarded: !!message.forward_origin,
+          }).catch(() => log.warn('Could not answer a non-owner message'))
+          return
+        }
+        if (decision.kind === 'placeholder') {
+          // A member or guest thread: the public lane, never the owner's inbox, main thread or memory;
+          // Brain journals it as foreign (public-intake.ts).
+          await publicIntake({
+            lane: publicLane, brain, ownerId, scope: brainScope, botUsername: bot.botInfo.username ?? '',
+            async send(chat, text, opts) { await telegram.sendMessage(chat, text, opts) },
+            warn: text => log.warn(text),
+          }, message, decision)
+          return
+        }
+      }
+      // Flag off, or the gate said owner: only the owner's own private chat continues.
       if (!isOwnerPrivateChat(ownerId, ctx.from, ctx.chat)) {
         const command = !ctx.message.forward_origin && parseCodexCommand(ctx.message.text, bot.botInfo.username ?? '')
         if (command && command.name === 'memory' && !ctx.from?.is_bot) await ctx.reply(MEMORY_REFUSED).catch(() => undefined)
@@ -2452,7 +2822,10 @@ async function main(): Promise<void> {
         return
       }
       if (command) {
-        if (isChatAction(command.name)) await applyChatAction(command.name, ctx.message, command.args)
+        const accessName = accessCommand(command.name, !!access)
+        if (accessName === 'chats' && groups) await groups.ownerCommand(command.args)
+        else if (accessName && accessName !== 'chats' && access) await access.ownerCommand(accessName, command.args)
+        else if (isChatAction(command.name)) await applyChatAction(command.name, ctx.message, command.args)
         else if (isBuiltInCommand(command.name) ||
             !await enqueueCustomCommand(command.name, command.args, ctx.message.message_id)) {
           await handleCommand(command.name, command.args, ctx.message.message_id)
@@ -2823,7 +3196,7 @@ async function main(): Promise<void> {
             ? (ownerWords(messages, confirmedVoice) ?? input.text) : input.text
           brainTurn = brain.execution(turnOrigin.role, brainInput(first, turnOrigin, journalInput, voiceError))
           const prompt = ownerTurn(formatReminderOn, [
-            ...(isolate ? [] : [leases.instructions(), agentChatInstructions]),
+            ...(isolate ? [] : [leases.instructions()]),
             chatContext(messages), handoff,
             brain.enabled ? '' : learning?.context(ownerText ?? input.text) ?? '',
             config.ask_user_question.enabled
@@ -2835,9 +3208,11 @@ async function main(): Promise<void> {
               sameTaskStatus && 'Владелец спросил о состоянии. В этом ходе дай только отчёт и при необходимости проверь состояние чтением. ' +
                 'Если по той же задаче остался разрешённый шаг, укажи его и передай в следующий ход служебной строкой. ' +
                 'Изменения выполняй после того, как мост подтвердит, что отчёт относится к сохранённому поручению.',
-              !editTarget && question.instructions].filter(Boolean).join(' '), input.text,
+              !editTarget && question.instructions].filter(Boolean).join(' '),
+            // R42: how Telegram showed the previous reply, once; after the stable prefix, so the cache prefix holds.
+            ...(isolate ? [] : [renderEyes.takeNote()].filter(Boolean)), input.text,
             ...(editTarget ? ['Для редактирования верни только готовый новый текст цитируемого сообщения в нужном формате.'] : []),
-          ])
+          ], isolate ? '' : agentChatInstructions)
           // An isolated turn runs on a side thread: restart recovery must find it there, not in the main history.
           const saveSideTurn = (thread: string, turnId: string) => {
             try { inbox.assignTurn(first.message_id, turnId, thread) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
@@ -3075,12 +3450,19 @@ async function main(): Promise<void> {
         }, ownerProvenance)
         if (outcome === 'accepted') startNext()
         return outcome
-      }, approvals && policyToken && /^[a-z0-9_-]{32,128}$/i.test(policyToken) && policyToken !== env.TELEGRAM_WEBHOOK_TOKEN
+      }, (approvals || accessEnv.enabled) && policyToken && /^[a-z0-9_-]{32,128}$/i.test(policyToken) &&
+        policyToken !== env.TELEGRAM_WEBHOOK_TOKEN
         ? {
           token: policyToken,
-          request: request => stopping ? Promise.resolve('decline')
+          // Without approval cards (approval mode never) a confirm-tier call is declined, as before.
+          request: request => stopping || !approvals ? Promise.resolve('decline')
             : session ? session.requestPolicyApproval(request) : approvals.request(request),
-          ...(config.permission_gate.enabled ? { legacy: {
+          // The permission hook's --thread-role check (KROT_MULTIUSER=1 needs it; see multiuser-readiness.ts).
+          // A subagent asked about before its turn/started is verified by thread/read (resolveThreadRole).
+          threadRole: threadId => session && !stopping ? session.resolveThreadRole(threadId) : 'unknown',
+          multiuser: accessEnv.enabled,
+          onDenied: threadId => hookDenials.record(threadId),
+          ...(approvals && config.permission_gate.enabled ? { legacy: {
             timeoutMs: config.permission_gate.timeout_ms,
             request: (request, signal) => stopping ? Promise.resolve('decline') : approvals.request(request, signal),
           } } : {}),
@@ -3155,6 +3537,16 @@ async function main(): Promise<void> {
         log.error('Agent webhook could not listen', { hostname, port, error: error instanceof Error ? error.message : String(error) })
       }
     }
+    // KROT_MULTIUSER=1: a role takes messages only once its permission hook denied a fixture tool call
+    // through the endpoint above (or the proof cached for the same home hash); until then and after a
+    // failure its messages get «временно недоступно». Runs in the background: one model turn per role.
+    if (publicRoot && publicRoles.length) {
+      void provePublicHooks(publicRoles, { denials: hookDenials, probeCwd: join(publicRoot, '_probe'), timeoutMs: 120_000 })
+        .then(problems => {
+          for (const problem of problems) log.error('Public role disabled until a restart: ' + problem)
+        })
+        .catch(() => log.error('The public hook proof failed; public roles stay disabled'))
+    }
     if (recoveringInbox) void resumeRecoveredInbox()
     startNext()
     await poller.start()
@@ -3175,9 +3567,8 @@ await main().then(() => {
   recordTrialOutcome(bridgeRepoRoot, trialOutcomeFor(code, startupWatchdogFired))
   activeLedger?.recordExit(code)
 }, async (error: unknown) => {
-  // Avoid printing validation payloads or dependency errors containing secrets.
-  const safe = error instanceof Error && /^(Run the Codex pilot|The pilot requires|Set absolute|The Codex workspace|Telegram state must|A bot already|This private pilot|A Codex proxy requires|Configured Telegram token)/.test(error.message)
-  console.error(safe ? error.message : 'Krot Codex pilot could not start')
+  // Avoid printing validation payloads or dependency errors containing secrets (startup-error.ts).
+  console.error(startupErrorMessage(error))
   // A fatal configuration error on the trial boot of an /update is the update's fault: exit 1, so
   // systemd starts again and the boot guard rolls back at once (outcome=crash), instead of exit 78,
   // which systemd never restarts (startup-failure.ts, tested there).

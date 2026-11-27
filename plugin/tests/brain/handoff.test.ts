@@ -8,7 +8,8 @@ import {
   type BrainConfig, DEFAULT_SUMMARIZER, estimateTokens, type FactInput, HANDOFF_HISTORY_KEEP, HANDOFF_MAX_TOKENS,
   type HandoffBuilder, HandoffSchema, PROVENANCE_VERSION, type SessionRole, type SnapshotBuilder,
 } from '../../../codex-brain/src/contract.js'
-import { createHandoffBuilder, HANDOFF_TITLE } from '../../../codex-brain/src/handoff/index.js'
+import { createHandoffBuilder, HANDOFF_TITLE, IN_FLIGHT_SCAN } from '../../../codex-brain/src/handoff/index.js'
+import { PUBLIC_KEY_SEGMENT } from '../../../codex-brain/src/journal/index.js'
 import { createSnapshotBuilder } from '../../../codex-brain/src/snapshot/index.js'
 import { ensureScope, scopePaths } from '../../../codex-brain/src/store/paths.js'
 import { FakeFacts, FakeJournal, FakeRecent, FakeSessions, FakeSummaries, fixedClock } from './fakes.js'
@@ -278,6 +279,26 @@ test('the same state renders the same handoff bytes across ten turns', async () 
   }
   expect(hashes.size).toBe(1)
 })
+
+// ---------------------------------------------------------------- review fixes: public exchanges and the in-flight scan
+
+// 49 fits next to the owner exchange in one scan; 50 and 60 would push it out if public entries counted.
+for (const count of [IN_FLIGHT_SCAN - 1, IN_FLIGHT_SCAN, IN_FLIGHT_SCAN + 10]) {
+  test(`${count} newer public-lane exchanges never hide the bound owner exchange from the in-flight scan`, async () => {
+    const r = await rig()
+    const owner = await r.journal.bind({
+      key: 'k-owner', origin: 'owner-direct', input_kind: 'text', input: 'Finish the quarterly plan', thread: SID, turn: 'turn-9',
+    })
+    for (let i = 0; i < count; i++) {
+      const ref = await r.journal.bind({ key: `${SCOPE}${PUBLIC_KEY_SEGMENT}-100777:${i}`, origin: 'agent', input_kind: 'text' })
+      await r.journal.delivered(ref)
+    }
+    const expected: { ref: string; origin: 'owner-direct'; quote: string } = { ref: owner, origin: 'owner-direct', quote: 'Finish the quarterly plan' }
+    expect((await r.handoff.write({ sessionId: SID, turnId: 'turn-9', trigger: 'auto' })).in_flight).toEqual(expected)
+    // Without a turn id the newest in-flight exchange of this thread is found the same way.
+    expect((await r.handoff.write({ sessionId: SID, trigger: 'auto' })).in_flight).toEqual(expected)
+  })
+}
 
 // ---------------------------------------------------------------- review fixes: note binding
 

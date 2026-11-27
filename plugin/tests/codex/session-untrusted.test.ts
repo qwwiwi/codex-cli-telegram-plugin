@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
-import type { CodexEvent, CodexServerRequest, Json } from '../../src/codex/rpc.js'
+import { object, type CodexEvent, type CodexServerRequest, type Json } from '../../src/codex/rpc.js'
 import { CodexSession, type ApprovalRequest } from '../../src/codex/session.js'
 
 const dirs: string[] = []
@@ -184,6 +184,26 @@ test('F1: an agent side turn is restricted and never reaches owner approvals, qu
   expect((await side).status).toBe('completed')
 })
 
+test('[R42] a fresh guest side thread is opened without the client tools, an owner side one with them', async () => {
+  const rpc = new HeldRpc()
+  const { session, complete } = fixture(rpc, {
+    chatAction: async () => ({ contentItems: [{ type: 'inputText', text: 'ok' }], success: true }),
+  })
+  const sideStarts = () => rpc.calls.filter(call => call.method === 'thread/start').map(call => object(call.params))
+  const guest = session.runSide('guest side', [], undefined, undefined, { untrusted: true })
+  await until(() => turnStarts(rpc).length === 1)
+  // No catalog at all: render_preview (and every other client tool) is never offered to a guest thread.
+  expect(sideStarts()[0]).not.toHaveProperty('dynamicTools')
+  complete(String(turnStarts(rpc)[0]!.threadId), 'turn-1')
+  await guest
+  const owner = session.runSide('owner side')
+  await until(() => turnStarts(rpc).length === 2)
+  const tools = sideStarts()[1]?.dynamicTools
+  expect(Array.isArray(tools) ? tools.map(tool => object(tool).name) : tools).toContain('render_preview')
+  complete(String(turnStarts(rpc)[1]!.threadId), 'turn-2')
+  await owner
+})
+
 test('F1: in workspace-write mode the owner turn after an agent turn restores a full workspaceWrite policy', async () => {
   const rpc = new HeldRpc()
   const { session, complete, cwd } = fixture(rpc, { sandbox: 'workspace-write' })
@@ -213,7 +233,7 @@ test('[R12][R13] a trusted Codex thread is offered the component tools and their
   await until(() => turnStarts(rpc).length === 1)
   const start = rpc.calls.find(call => call.method === 'thread/start')!.params as { dynamicTools: Array<{ name: string }> }
   expect(start.dynamicTools.map(tool => tool.name))
-    .toEqual(['telegram_action', 'send_component', 'update_component', 'component_schema'])
+    .toEqual(['telegram_action', 'send_component', 'update_component', 'component_schema', 'render_preview'])
   const threadId = String(turnStarts(rpc)[0]!.threadId)
   await until(() => session.steerableTurn === 'turn-1')
   const call = (tool: string, id: number) => internals.requestApproval({ id, method: 'item/tool/call', params: {

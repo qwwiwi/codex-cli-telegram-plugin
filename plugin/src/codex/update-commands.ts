@@ -1,6 +1,7 @@
 // Owner commands /restart and /update [check | rollback | codex [check]] (docs/design/self-update-spec.md, S6 and S9).
 // Every answer goes to the owner before the restart; the restart itself is the caller's: it
 // records the intent (restart-intent.ts) and exits 75, so systemd starts the bridge again.
+import type { IdleApply, UpdateAttempt } from './auto-update.js'
 import type { CodexCheck, CodexApply, CodexRollback } from './codex-update.js'
 import type { RestartAdmission, RestartIntent } from './restart-intent.js'
 import { refusedRestartText } from './restart-intent.js'
@@ -32,12 +33,14 @@ export interface UpdateCommandDeps {
   sleep: (ms: number) => Promise<void>
   /** The reservation ended without a restart: the bridge may start the turns that queued meanwhile. */
   onIdle?: () => void
+  /** R29: the last update attempt, shown by /doctor; must not throw. */
+  recordAttempt?: (attempt: Omit<UpdateAttempt, 'at'>) => void
 }
 
 const short = (sha: string) => sha.slice(0, 12)
 const busyText = 'Сейчас идёт задача. Дождись её конца или отправь /stop, потом повтори команду.'
 const stageText: Record<string, string> = {
-  state: 'проверка копии', merge: 'git fast-forward', install: 'установка зависимостей', tsc: 'проверка типов (tsc)',
+  state: 'проверка копии', guard: 'проверка запуска (boot-guard.sh)', merge: 'git fast-forward', install: 'установка зависимостей', tsc: 'проверка типов (tsc)',
   version: 'проверка версии', handshake: 'проверка связи с Codex App Server',
 }
 
@@ -105,6 +108,37 @@ export class UpdateCommands {
     return true
   }
 
+  /**
+   * R29: applies a plan whose staged check passed, only while nothing runs: no owner turn, goal or side
+   * thread, no queued message, no other /restart or /update, no trial boot. The reservation is taken
+   * synchronously after the idle check, so no turn can start between the check and the apply.
+   */
+  async applyWhenIdle(plan: Extract<UpdateCheck, { kind: 'plan' }>, trigger: 'auto' | 'owner' = 'auto'): Promise<IdleApply> {
+    if (this.reserved || this.deps.busy() || this.deps.turnActive() || this.deps.trialPending?.()) return { kind: 'busy' }
+    this.reserved = 'update'
+    let restarting = false
+    try {
+      const result = await this.deps.selfUpdate.apply(plan)
+      if (!result.ok) {
+        const detail = (stageText[result.stage] ?? result.stage) + ': ' + result.detail
+        this.deps.recordAttempt?.({ trigger, result: 'apply_failed', from: plan.from, to: plan.to, detail })
+        return { kind: 'failed', detail, restored: result.restored }
+      }
+      this.deps.recordAttempt?.({ trigger, result: 'applied', from: plan.from, to: plan.to })
+      await this.notify(`${trigger === 'owner' ? 'Обновление по /cc update' : 'Автообновление'}: установил ` +
+        `${short(plan.from)} → ${short(plan.to)} (новых коммитов: ${plan.total}). ` +
+        'Перезапускаюсь. Если новая версия не заработает, сам верну прежнюю и напишу.')
+      restarting = await this.restart('update', undefined, result.to)
+      // A refused restart (loop guard) leaves the new commit installed; it starts with the next restart.
+      return restarting ? { kind: 'restarting' } : { kind: 'installed' }
+    } finally {
+      if (!restarting) {
+        this.reserved = undefined
+        this.deps.onIdle?.()
+      }
+    }
+  }
+
   /** A notice before a committed step: a failed or silent Telegram send must never stop the restart. */
   private async notify(text: string): Promise<void> {
     await this.deps.acknowledge(text)
@@ -145,6 +179,8 @@ export class UpdateCommands {
     }
     await this.deps.send(head + '\n\nОбновляю. После перезапуска проверю, что новая версия работает; если нет, сам верну прежнюю и напишу.')
     const result = await this.deps.selfUpdate.apply(plan)
+    this.deps.recordAttempt?.(result.ok ? { trigger: 'manual', result: 'applied', from: plan.from, to: plan.to }
+      : { trigger: 'manual', result: 'apply_failed', from: plan.from, to: plan.to, detail: (stageText[result.stage] ?? result.stage) + ': ' + result.detail })
     if (!result.ok) {
       await this.deps.send('Не обновился: ' + (stageText[result.stage] ?? result.stage) + '.\n\n' + result.detail + '\n\n' +
         (result.restored ? 'Копия осталась на прежней версии, бот работает как раньше.'

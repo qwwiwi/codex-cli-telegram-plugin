@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { INSTALL_ARGS, recordTrialOutcome, runCommand, SelfUpdate, trialOutcomeFor, type Runner } from '../../src/codex/self-update.js'
+import { GUARD_VERSION, guardCopyProblem, guardVersion, INSTALL_ARGS, recordTrialOutcome, runCommand, SelfUpdate, trialOutcomeFor, type Runner } from '../../src/codex/self-update.js'
 
 const temporary: string[] = []
 afterEach(() => { for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true }) })
@@ -195,7 +195,8 @@ test('[S9] a trial record left behind after HEAD was moved by hand does not bloc
   writeFileSync(join(repo, '.git', 'krotov-update-pending'), `v=1\nphase=trial\nfrom=${'c'.repeat(40)}\nto=${'d'.repeat(40)}\nboots=1\nat=1\n`)
   const plan = await updater(repo, runner().run).check()
   expect(plan).toMatchObject({ kind: 'plan', from: base, to: target })
-  expect(existsSync(join(repo, '.git', 'krotov-update-pending'))).toBe(false)
+  // The check never deletes a record it did not write; the next apply overwrites it.
+  expect(readFileSync(join(repo, '.git', 'krotov-update-pending'), 'utf8')).toContain('phase=trial')
 })
 
 test('[S9] the fast-forward never overwrites an ignored local file that the target starts tracking', async () => {
@@ -292,17 +293,225 @@ test('[S9.5] the end of a trial boot is written into the record for the guard; o
 test('[S9] a healthy trial refreshes the guard copy the unit runs from the state directory', async () => {
   const { author, repo } = repos()
   mkdirSync(join(author, 'plugin', 'scripts'), { recursive: true })
-  const target = commit(author, 'plugin/scripts/boot-guard.sh', '# new guard\n', 'New guard')
+  const marker = `# krotov-boot-guard-version: ${GUARD_VERSION}\n`
+  const target = commit(author, 'plugin/scripts/boot-guard.sh', marker + '# new guard\n', 'New guard')
   git(author, 'push', '-q', 'origin', 'main')
   const state = mkdtempSync(join(tmpdir(), 'krot-state-'))
   temporary.push(state)
-  writeFileSync(join(state, 'boot-guard.sh'), '# old guard\n')
+  writeFileSync(join(state, 'boot-guard.sh'), marker + '# old guard\n')
   const { run } = runner()
   const plan = await updater(repo, run, { stateDir: state }).check()
   if (plan.kind !== 'plan') throw new Error('no plan')
   await updater(repo, run, { stateDir: state }).apply(plan)
   // Not before the health mark: the trial is still running the old copy.
-  expect(readFileSync(join(state, 'boot-guard.sh'), 'utf8')).toBe('# old guard\n')
+  expect(readFileSync(join(state, 'boot-guard.sh'), 'utf8')).toBe(marker + '# old guard\n')
   expect(await updater(repo, run, { stateDir: state }).markHealthy(target)).toMatchObject({ to: target })
-  expect(readFileSync(join(state, 'boot-guard.sh'), 'utf8')).toBe('# new guard\n')
+  expect(readFileSync(join(state, 'boot-guard.sh'), 'utf8')).toBe(marker + '# new guard\n')
+})
+
+test('[R29] the health mark of an update starts a 10-minute probation that the boot guard reads', async () => {
+  const { author, repo, base } = repos()
+  const target = commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const { run } = runner()
+  const plan = await updater(repo, run).check()
+  if (plan.kind !== 'plan') throw new Error('no plan')
+  await updater(repo, run).apply(plan)
+  // now() is 5000 ms: the probation ends 600 s after the health mark, in whole seconds for bash.
+  expect(await updater(repo, run).markHealthy(target)).toEqual({ from: base, to: target })
+  const probation = readFileSync(join(repo, '.git', 'krotov-update-probation'), 'utf8')
+  expect(probation).toBe(`v=1\nfrom=${base}\nto=${target}\nuntil=605\ncrashes=0\n`)
+})
+
+test('[R29] the exit of a commit on probation is written for the guard; another commit or no probation writes nothing', () => {
+  const { repo, base } = repos()
+  const path = join(repo, '.git', 'krotov-update-probation')
+  recordTrialOutcome(repo, 'crash')
+  expect(existsSync(path)).toBe(false)
+  writeFileSync(path, `v=1\nfrom=${'c'.repeat(40)}\nto=${base}\nuntil=999\ncrashes=1\n`)
+  recordTrialOutcome(repo, 'crash')
+  expect(readFileSync(path, 'utf8')).toBe(`v=1\nfrom=${'c'.repeat(40)}\nto=${base}\nuntil=999\ncrashes=1\noutcome=crash\n`)
+  writeFileSync(path, `v=1\nfrom=${'c'.repeat(40)}\nto=${'d'.repeat(40)}\nuntil=999\ncrashes=1\n`)
+  recordTrialOutcome(repo, 'crash')
+  expect(readFileSync(path, 'utf8')).not.toContain('outcome=')
+})
+
+test('[R29] the bad-commit list the boot guard writes is read back, malformed lines ignored', async () => {
+  const { repo } = repos()
+  const update = updater(repo, runner().run)
+  expect(await update.badCommits()).toEqual([])
+  writeFileSync(join(repo, '.git', 'krotov-update-bad'), `${'e'.repeat(40)}\nnot a sha\n${'f'.repeat(40)}\n`)
+  expect(await update.badCommits()).toEqual(['e'.repeat(40), 'f'.repeat(40)])
+})
+
+test('[S9] check and apply are serialized: an apply while a check runs is refused and changes nothing', async () => {
+  const { author, repo, base } = repos()
+  commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const plan = await updater(repo, runner().run).check()
+  if (plan.kind !== 'plan') throw new Error('no plan')
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let paused = false
+  const { run } = runner()
+  const gated: Runner = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'fetch' && !paused) {
+      paused = true
+      await gate
+    }
+    return run(command, args, options)
+  }
+  const update = updater(repo, gated)
+  const checking = update.check()
+  while (!paused) await new Promise(resolve => setTimeout(resolve, 5))
+  const applied = await update.apply(plan)
+  expect(applied).toMatchObject({ ok: false, stage: 'state' })
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(base)
+  expect(existsSync(join(repo, '.git', 'krotov-update-pending'))).toBe(false)
+  release()
+  expect(await checking).toMatchObject({ kind: 'plan' })
+})
+
+test('[S9] a check never deletes an applying record it did not create, so the boot guard can still recover it', async () => {
+  const { author, repo, base } = repos()
+  const target = commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const record = `v=1\nphase=applying\nfrom=${base}\nto=${target}\nboots=0\nat=1\nfails=0\n`
+  writeFileSync(join(repo, '.git', 'krotov-update-pending'), record)
+  await updater(repo, runner().run).check()
+  expect(readFileSync(join(repo, '.git', 'krotov-update-pending'), 'utf8')).toBe(record)
+})
+
+test('[S9] the update lock file in the state directory keeps out a second process; a stale one is taken over', async () => {
+  const { author, repo } = repos()
+  commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const state = mkdtempSync(join(tmpdir(), 'krot-state-'))
+  temporary.push(state)
+  writeFileSync(join(state, 'boot-guard.sh'), `# krotov-boot-guard-version: ${GUARD_VERSION}\n`)
+  const lock = join(state, 'self-update.lock')
+  const tenMinutesAgo = new Date(Date.now() - 600_000)
+  // A live process (the test runner's parent) holds the lock, however old the lock is.
+  const live = JSON.stringify({ pid: process.ppid, startedAt: tenMinutesAgo.getTime(), token: 'live' }) + '\n'
+  writeFileSync(lock, live)
+  utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
+  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'refused', reason: 'busy' })
+  expect(readFileSync(lock, 'utf8')).toBe(live)
+  // A fresh lock of a process that no longer exists is still held: it is never taken over before the grace period.
+  writeFileSync(lock, JSON.stringify({ pid: 2147483646, startedAt: Date.now(), token: 'dead' }) + '\n')
+  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'refused', reason: 'busy' })
+  // Once it is older than that, a dead holder's lock does not block forever and is gone afterwards.
+  utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
+  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'plan' })
+  expect(existsSync(lock)).toBe(false)
+})
+
+test('[S9] a lock file another updater created but has not written yet is held, never taken over', async () => {
+  const { author, repo } = repos()
+  commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const state = mkdtempSync(join(tmpdir(), 'krot-state-'))
+  temporary.push(state)
+  writeFileSync(join(state, 'boot-guard.sh'), `# krotov-boot-guard-version: ${GUARD_VERSION}\n`)
+  const lock = join(state, 'self-update.lock')
+  // Contender A is paused between creating the lock file and writing its holder into it.
+  writeFileSync(lock, '')
+  // Contender B must refuse instead of reading the empty file as a dead holder.
+  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'refused', reason: 'busy' })
+  expect(readFileSync(lock, 'utf8')).toBe('')
+})
+
+test('[S9] a failed merge of one updater never deletes the recovery record another updater wrote', async () => {
+  const { author, repo, base } = repos()
+  const target = commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const plan = await updater(repo, runner().run).check()
+  if (plan.kind !== 'plan') throw new Error('no plan')
+  const pending = join(repo, '.git', 'krotov-update-pending')
+  const pause = () => {
+    let release: () => void = () => undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    return { gate, release: () => release() }
+  }
+  // Two contenders that both got past the lock (separate state directories stand in for the lost race).
+  const atMerge = pause()
+  let bPaused = false
+  const contenderB: Runner = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'merge') {
+      bPaused = true
+      await atMerge.gate
+      return { code: 1, stdout: '', stderr: 'fatal: Not possible to fast-forward, aborting.' }
+    }
+    return runner().run(command, args, options)
+  }
+  const atInstall = pause()
+  let aPaused = false
+  const contenderA: Runner = async (command, args, options) => {
+    if (command === 'bun-bin' && args[0] === 'install' && !aPaused) {
+      aPaused = true
+      await atInstall.gate
+    }
+    return runner().run(command, args, options)
+  }
+  const stateB = mkdtempSync(join(tmpdir(), 'krot-state-'))
+  const stateA = mkdtempSync(join(tmpdir(), 'krot-state-'))
+  temporary.push(stateA, stateB)
+  for (const state of [stateA, stateB]) writeFileSync(join(state, 'boot-guard.sh'), `# krotov-boot-guard-version: ${GUARD_VERSION}\n`)
+  const applyingB = updater(repo, contenderB, { stateDir: stateB }).apply(plan)
+  while (!bPaused) await new Promise(resolve => setTimeout(resolve, 5))
+  const applyingA = updater(repo, contenderA, { stateDir: stateA }).apply(plan)
+  while (!aPaused) await new Promise(resolve => setTimeout(resolve, 5))
+  // A has merged and its applying record is what the boot guard would recover from.
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(target)
+  atMerge.release()
+  expect(await applyingB).toMatchObject({ ok: false, stage: 'merge' })
+  expect(existsSync(pending)).toBe(true)
+  expect(readFileSync(pending, 'utf8')).toContain(`phase=applying\nfrom=${base}\nto=${target}\n`)
+  atInstall.release()
+  expect(await applyingA).toEqual({ ok: true, from: base, to: target })
+  expect(readFileSync(pending, 'utf8')).toBe(`v=1\nphase=trial\nfrom=${base}\nto=${target}\nboots=0\nat=5000\nfails=0\n`)
+})
+
+test('[R29] the boot guard of this checkout carries the version marker the bridge requires', () => {
+  const guard = readFileSync(join(import.meta.dir, '..', '..', 'scripts', 'boot-guard.sh'), 'utf8')
+  expect(guardVersion(guard)).toBe(GUARD_VERSION)
+  expect(guardVersion('#!/usr/bin/env bash\n# an older guard without a marker\n')).toBe(0)
+})
+
+test('[R29] an installed guard copy older than the bridge needs is refreshed from the checkout before an update', async () => {
+  const { author, repo } = repos()
+  mkdirSync(join(author, 'plugin', 'scripts'), { recursive: true })
+  const current = `#!/usr/bin/env bash\n# krotov-boot-guard-version: ${GUARD_VERSION}\n`
+  commit(author, 'plugin/scripts/boot-guard.sh', current, 'Current guard')
+  git(author, 'push', '-q', 'origin', 'main')
+  git(repo, 'pull', '-q', '--ff-only')
+  commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const state = mkdtempSync(join(tmpdir(), 'krot-state-'))
+  temporary.push(state)
+  // The guard copy an install of an earlier release left: it exists, but it does not mark bad commits.
+  writeFileSync(join(state, 'boot-guard.sh'), '#!/usr/bin/env bash\n# old guard\n')
+  expect(guardCopyProblem(state)).toContain(`версия 0, нужна ${GUARD_VERSION}`)
+  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'plan' })
+  expect(readFileSync(join(state, 'boot-guard.sh'), 'utf8')).toBe(current)
+  expect(guardCopyProblem(state)).toBeUndefined()
+})
+
+test('[R29] without a compatible guard copy the update is refused with the reason, and nothing is applied', async () => {
+  const { author, repo, base } = repos()
+  commit(author, 'b.txt', '2\n', 'Second version')
+  git(author, 'push', '-q', 'origin', 'main')
+  const state = mkdtempSync(join(tmpdir(), 'krot-state-'))
+  temporary.push(state)
+  writeFileSync(join(state, 'boot-guard.sh'), '#!/usr/bin/env bash\n# old guard\n')
+  // This checkout has no current guard to install: the old copy cannot be replaced.
+  const refused = await updater(repo, runner().run, { stateDir: state }).check()
+  expect(refused).toMatchObject({ kind: 'refused', reason: 'old-guard' })
+  if (refused.kind !== 'refused') throw new Error('not refused')
+  expect(refused.text).toContain('boot-guard.sh')
+  const plan = await updater(repo, runner().run).check()
+  if (plan.kind !== 'plan') throw new Error('no plan')
+  expect(await updater(repo, runner().run, { stateDir: state }).apply(plan)).toMatchObject({ ok: false, stage: 'guard', restored: true })
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(base)
+  expect(existsSync(join(repo, '.git', 'krotov-update-pending'))).toBe(false)
 })

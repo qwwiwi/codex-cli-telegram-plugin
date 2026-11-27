@@ -17,9 +17,20 @@ export function formatReminderEnabled(value: string | undefined): boolean {
   throw new Error('KROT_FORMAT_REMINDER must be on or off')
 }
 
-/** Builds an owner turn: the static channel rules first, then the turn's own parts. */
-export function ownerTurn(reminder: boolean, parts: readonly string[]): string {
-  return [attachmentInstructions, ...(reminder ? [formatReminder] : []), ...parts].join('\n\n')
+/**
+ * The stable prefix every owner turn starts with: the attachment rule (owner turns only), the format reminder and
+ * the bridge's static channel rules (`rules`: the chat-action and reaction rules, fixed per process). It never
+ * carries state, times, counters or IDs, so it is byte-identical from turn to turn and the prompt-cache prefix
+ * never breaks inside it; mandates, message IDs and the running task come after it.
+ */
+export function stableTurnPrefix(reminder: boolean, rules: string, kind: 'owner' | 'side' = 'owner'): string {
+  return [...(kind === 'owner' ? [attachmentInstructions] : []), ...(reminder ? [formatReminder] : []), rules]
+    .filter(Boolean).join('\n\n')
+}
+
+/** Builds an owner turn: the stable prefix first, then the turn's own parts. */
+export function ownerTurn(reminder: boolean, parts: readonly string[], rules = ''): string {
+  return [stableTurnPrefix(reminder, rules), ...parts].join('\n\n')
 }
 
 /** The main-thread turn that carries the owner's answers from a question card: an owner turn too. */
@@ -29,6 +40,6 @@ export function questionFollowUpTurn(reminder: boolean, instructions: string, an
 }
 
 /** A parallel (side) owner turn. Its reply is delivered without files, so it carries no attachment rule. */
-export function sideOwnerTurn(reminder: boolean, parts: readonly string[]): string {
-  return [...(reminder ? [formatReminder] : []), ...parts.filter(Boolean)].join('\n\n')
+export function sideOwnerTurn(reminder: boolean, parts: readonly string[], rules = ''): string {
+  return [stableTurnPrefix(reminder, rules, 'side'), ...parts].filter(Boolean).join('\n\n')
 }

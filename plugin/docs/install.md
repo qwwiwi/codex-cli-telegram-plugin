@@ -182,6 +182,35 @@ Server uses its own configuration.
 - Check that a message from another account or a group receives no reply.
 - Confirm that only the intended service is polling the production bot.
 
+## Automatic update
+
+Off by default. Set `KROT_AUTO_UPDATE=1` in `plugin/.env` and restart the bridge
+to let it update itself. `KROT_AUTO_UPDATE_HOURS` sets the check interval in
+hours (default `6`, minimum `1`). The owner can start a check at any time with
+`/cc update`, also while the timer is off.
+
+Each check fetches the tracked branch (or `KROT_UPDATE_BRANCH`). Only a new
+fast-forward commit goes further. The bridge copies that commit to
+`<state>/update-stage`, installs its locked dependencies there, runs its tests,
+bundles the bridge entry point and then runs `bun run doctor` with the saved `plugin/.env`, as `./update.sh` does.
+The checkout is touched only after this staged check passes, and only while no
+turn, goal, side thread or queued message is running: the update waits for an
+idle bridge, then fast-forwards, type-checks and restarts.
+
+The boot guard protects against restart loops:
+
+- the new version must reach the health mark within the startup window, or it
+  is rolled back on the next start;
+- after the health mark the new commit stays on probation for 10 minutes: a
+  third crash in that time rolls it back too;
+- a rolled-back commit is appended to `.git/krotov-update-bad` and is never
+  installed automatically again. A manual `/update` can still install it.
+  Delete the line from that file to allow it again.
+
+After a rollback the previous version tells the owner once and writes the
+event to the error journal. `/doctor` shows the setting, the current commit,
+the last update attempt and the bad-commit list.
+
 ## Local task submission
 
 Set both `TELEGRAM_WEBHOOK_PORT` and `TELEGRAM_WEBHOOK_TOKEN` to enable the

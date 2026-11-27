@@ -61,7 +61,12 @@ export interface ModelMenuOptions {
   efforts: boolean
   // KROT_CODEX_MODEL: what `/cc model default` selects when set.
   defaultModel?: string
+  // Monotonic time in milliseconds, injectable for tests.
+  now?: () => number
 }
+
+// model/list answers are reused for at most 10 minutes; opening the menu always asks again.
+export const modelListTtlMs = 10 * 60 * 1000
 
 export interface MenuQuery {
   data: string
@@ -76,12 +81,23 @@ type Menu = { models: CodexModel[]; picked?: CodexModel }
 // The /cc model picker: one button per model, then a row of the efforts the picked model supports.
 export class ModelMenu {
   private readonly menus = new Map<string, Menu>()
+  private cached: { at: number; models: CodexModel[] } | undefined
 
   constructor(private readonly options: ModelMenuOptions) {}
 
+  // The App Server's model list, reused for up to 10 minutes; `refresh` always asks again. An empty list is not kept.
+  private async models(refresh = false): Promise<CodexModel[]> {
+    const now = this.options.now?.() ?? performance.now()
+    if (!refresh && this.cached && now - this.cached.at < modelListTtlMs) return this.cached.models
+    const models = await this.options.models()
+    this.cached = models.length ? { at: now, models } : undefined
+    return models
+  }
+
   async open(): Promise<void> {
     const { telegram, chat, controls } = this.options
-    const models = orderModels(await this.options.models())
+    // /cc → «Модель»: a fresh list, so a model added or removed on the App Server shows up at once.
+    const models = orderModels(await this.models(true))
     if (!models.length) {
       await telegram.sendMessage(chat, 'Codex не вернул список моделей.', {})
       return
@@ -95,7 +111,7 @@ export class ModelMenu {
 
   // `/cc model <name>`: the reply text for the owner.
   async choose(value: string): Promise<string> {
-    const models = await this.options.models()
+    const models = await this.models()
     const name = value === 'default'
       ? this.options.defaultModel ?? models.find(x => x.default)?.name
       : models.find(x => x.name === value)?.name
@@ -115,8 +131,8 @@ export class ModelMenu {
     if (match[1] === 'm') {
       const choice = menu.models[index]
       if (!choice) return STALE_MENU
-      // The same check as /cc model <name>: the model must still be on the App Server's list.
-      const models = await this.options.models()
+      // Check the model against the latest cached or refreshed list, as in /cc model <name>.
+      const models = await this.models()
       const model = models.find(x => x.name === choice.name)
       if (!model) return unknownModel
       this.select(model.name, models)

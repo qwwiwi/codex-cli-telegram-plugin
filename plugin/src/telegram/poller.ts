@@ -67,6 +67,8 @@ export interface PollerDeps {
   // Set only while the secret hand-over spike is on: every update is sealed before validation and a
   // direct web_app_data submission goes here instead of onUpdate, validation and dead letters.
   onHandover?: (handover: WebAppHandover) => Promise<void>
+  // Update types requested on top of ALLOWED_UPDATES (KROT_MULTIUSER=1 adds my_chat_member).
+  extraUpdates?: ReadonlyArray<Exclude<keyof Update, 'update_id'>>
 }
 
 export interface PollResult {
@@ -434,6 +436,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 export class TelegramPoller {
   private readonly deps: PollerDeps
   private readonly getUpdates: GetUpdatesFn
+  private readonly allowedUpdates: ReadonlyArray<Exclude<keyof Update, 'update_id'>>
   private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>
   private stopping = false
   private offset: number | undefined
@@ -450,6 +453,7 @@ export class TelegramPoller {
     },
   ) {
     this.deps = deps
+    this.allowedUpdates = [...new Set([...ALLOWED_UPDATES, ...(deps.extraUpdates ?? [])])]
     this.offset = readUpdateOffset(deps.statePaths)
     this.sleepFn = overrides?.sleep ?? sleep
     // Default: real grammY API. Test seam: override.
@@ -528,7 +532,7 @@ export class TelegramPoller {
       offset?: number
       timeout: number
       allowed_updates: ReadonlyArray<Exclude<keyof Update, 'update_id'>>
-    } = { timeout: 0, allowed_updates: ALLOWED_UPDATES }
+    } = { timeout: 0, allowed_updates: this.allowedUpdates }
     if (this.offset !== undefined) getUpdatesParams.offset = this.offset
 
     const updates = await this.getUpdates(getUpdatesParams)
@@ -633,7 +637,7 @@ export class TelegramPoller {
           allowed_updates: ReadonlyArray<Exclude<keyof Update, 'update_id'>>
         } = {
           timeout: LONG_POLL_TIMEOUT_SEC,
-          allowed_updates: ALLOWED_UPDATES,
+          allowed_updates: this.allowedUpdates,
         }
         if (this.offset !== undefined) getUpdatesParams.offset = this.offset
 

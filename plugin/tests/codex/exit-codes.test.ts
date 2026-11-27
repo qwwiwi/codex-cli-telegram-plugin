@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GrammyError } from 'grammy'
 
-import { EXIT, exitCodeDuringTrial, exitCodeFor, fatalReason, recordFatal } from '../../src/codex/exit-codes.js'
+import {
+  EXIT, exitCodeDuringTrial, exitCodeFor, fatalReason, PUBLIC_HOME_FATAL, recordFatal,
+} from '../../src/codex/exit-codes.js'
+import { PublicHomeError } from '../../src/codex/public-home.js'
 import { RuntimeEnvSchema } from '../../src/config.js'
 import { PollerFatalError } from '../../src/telegram/poller.js'
 
@@ -96,6 +99,24 @@ test('[S1] the fatal reason names the bad .env fields without their values', () 
 
 test('[S1] an invalid KROT_FORMAT_REMINDER is a fatal configuration error (78), not a crash loop', () => {
   expect(exitCodeFor(new Error('KROT_FORMAT_REMINDER must be on or off'))).toBe(EXIT.fatalConfig)
+})
+
+test('[S1/S4] a multi-user configuration error is fatal (78), never a crash loop, and its reason carries no file content', () => {
+  for (const message of [
+    'Multi-user mode cannot start: KROT_PUBLIC_WORKSPACE_ROOT is not set',
+    'KROT_MULTIUSER must be 1, 0 or unset',
+    'KROT_START_ID_REPLY must be on, off or unset',
+    'KROT_MEMBER_USER_IDS must be a comma list of numeric Telegram user IDs',
+    'TELEGRAM_ALLOWED_USER_IDS holds only the owner; list other people in KROT_MEMBER_USER_IDS or add them with /users add',
+  ]) {
+    expect(exitCodeFor(new Error(message))).toBe(EXIT.fatalConfig)
+    expect(fatalReason(new Error(message))).toBe(message)
+  }
+  const home = new PublicHomeError('MCP server "kbase" carries credentials; mark it public_safe')
+  expect(exitCodeFor(home)).toBe(EXIT.fatalConfig)
+  expect(fatalReason(home)).toBe(PUBLIC_HOME_FATAL)
+  // A live probe of a role's app-server may fail for a passing reason: a spaced restart, as for any crash.
+  expect(exitCodeFor(new Error('Multi-user mode cannot start (guest): Codex did not answer skills/list'))).toBe(EXIT.crash)
 })
 
 test('[S9] exit 78 on the trial boot of an /update becomes 1, so systemd starts again and the guard rolls back', () => {

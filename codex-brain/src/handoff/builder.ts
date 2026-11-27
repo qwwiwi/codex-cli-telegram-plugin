@@ -19,6 +19,7 @@ import {
   isTrustedNote, NOTE_MAX, NoteSchema, OpenQuestionsSchema, PlanStateSchema, type PlanStep, PromptCaptureSchema, type Scope, type SessionRegistry,
   PROVENANCE_VERSION, TRUSTED_ORIGINS,
 } from '../contract.js'
+import { isPublicExchange } from '../journal/recent.js'
 import { readJson, readStoredSnapshot } from '../snapshot/index.js'
 import { isPersonalSession } from '../snapshot/builder.js'
 import { writeFileAtomic } from '../store/atomic.js'
@@ -26,7 +27,7 @@ import { type LockOptions, withLock } from '../store/lock.js'
 import { ensureScope, scopePaths } from '../store/paths.js'
 import { fitHandoff, oneLine, renderHandoff, truncate } from './render.js'
 
-/** Journal exchanges searched for the in-flight one, newest last. */
+/** Owner-side journal exchanges (public-lane ones left out first) searched for the in-flight one, newest last. */
 export const IN_FLIGHT_SCAN = 50
 /** Max code points of the quoted in-flight owner message. */
 export const IN_FLIGHT_QUOTE_MAX = 600
@@ -64,11 +65,23 @@ export function createHandoffBuilder(options: HandoffBuilderOptions): HandoffBui
     })
   }
 
+  // The last IN_FLIGHT_SCAN exchanges once public-lane ones are left out, oldest first: a burst of
+  // member or guest turns never pushes a bound owner exchange out of the scan.
+  async function ownerExchanges(): Promise<Exchange[]> {
+    const out: Exchange[] = []
+    const days = await journal.days()
+    for (let i = days.length - 1; i >= 0 && out.length < IN_FLIGHT_SCAN; i--) {
+      const day = days[i]
+      if (day !== undefined) out.unshift(...(await journal.fold(day)).filter(exchange => !isPublicExchange(exchange)))
+    }
+    return out.slice(-IN_FLIGHT_SCAN)
+  }
+
   async function draft(request: HandoffRequest): Promise<Handoff> {
     const { sessionId } = request
     const entry = await sessions.resolve(sessionId)
     const threadKey = entry?.thread_id ?? sessionId
-    const exchanges = await journal.tail(IN_FLIGHT_SCAN)
+    const exchanges = await ownerExchanges()
 
     // In-flight: the active turn's exchange; without a turn id, the newest of this thread. Never a guess
     // across turns: a turn id that matches nothing gives none.
