@@ -64,13 +64,27 @@ test('[R29] the new commit is checked in a staged copy inside the state director
     `git archive --format=tar -o ${join(state, 'update-stage.tar')} ${plan.to} @/repo`,
     `tar -xf ${join(state, 'update-stage.tar')} -C ${stage} @${state}`,
     `bun-bin install --frozen-lockfile --ignore-scripts @${join(stage, 'plugin')}`,
-    `bun-bin --no-env-file test @${join(stage, 'plugin')}`,
+    `bun-bin --no-env-file test --timeout=60000 @${join(stage, 'plugin')}`,
     `bun-bin --no-env-file build src/codex/server.ts --target=bun --outdir ${join(stage, 'build')} @${join(stage, 'plugin')}`,
     `bun-bin --env-file=/repo/plugin/.env run doctor @${join(stage, 'plugin')}`,
   ])
   // Nothing of the staged copy is left behind.
   expect(existsSync(stage)).toBe(false)
   expect(existsSync(join(state, 'update-stage.tar'))).toBe(false)
+})
+
+test('the staged auto-update command uses KROT_UPDATE_TEST_TIMEOUT_MS when set', async () => {
+  const previous = process.env.KROT_UPDATE_TEST_TIMEOUT_MS
+  process.env.KROT_UPDATE_TEST_TIMEOUT_MS = '90000'
+  try {
+    const state = tempDir()
+    const { run, calls } = stageRunner()
+    expect(await stageUpdate({ repo: '/repo', stateDir: state, run, bun: 'bun-bin', to: plan.to })).toEqual({ ok: true })
+    expect(calls).toContain(`bun-bin --no-env-file test --timeout=90000 @${join(state, 'update-stage', 'plugin')}`)
+  } finally {
+    if (previous === undefined) delete process.env.KROT_UPDATE_TEST_TIMEOUT_MS
+    else process.env.KROT_UPDATE_TEST_TIMEOUT_MS = previous
+  }
 })
 
 test('[R29] a failing staged step stops the check there and names it', async () => {

@@ -86,6 +86,8 @@ params = {
     'dynamicTools': tools,
 }
 assert allowed_request({'method': 'thread/start', 'params': params}, opened, config)
+without_widget_send = [entry for entry in tools if entry['name'] != 'send_component']
+assert allowed_request({'method': 'thread/start', 'params': dict(params, dynamicTools=without_widget_send)}, opened, config)
 assert not allowed_request({'method': 'thread/start', 'params': dict(params, cwd='/srv/other/workspace')}, opened, config)
 assert not allowed_request({'method': 'thread/start', 'params': dict(params, dynamicTools=tools + [tool])}, opened, config)
 assert not allowed_request({'method': 'thread/start', 'params': dict(params, dynamicTools=[dict(tool, name='other')] + tools[1:])}, opened, config)

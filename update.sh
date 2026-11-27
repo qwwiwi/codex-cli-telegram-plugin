@@ -30,6 +30,11 @@ if (( dry_run )); then
   exit 0
 fi
 
+test_timeout_ms=${KROT_UPDATE_TEST_TIMEOUT_MS:-60000}
+if [[ ! $test_timeout_ms =~ ^[1-9][0-9]{0,9}$ ]] || (( test_timeout_ms > 2147483647 )); then
+  test_timeout_ms=60000
+fi
+
 setup_prerequisites tar
 setup_lock
 cd "$setup_repo"
@@ -37,17 +42,17 @@ setup_clean_checkout || setup_fail 'Есть локальные изменени
 env_file=$setup_repo/plugin/.env
 [[ -f $env_file ]] || setup_fail 'Сначала установи эту копию с помощью ./install.sh.'
 setup_private_file "$env_file"
-unit=krotov-telegram.service
+unit=$(setup_read_unit_name "$env_file")
 
 restart_target() {
   local directory
   command -v systemctl >/dev/null || return 1
   directory=$(systemctl --user show --property=WorkingDirectory --value "$unit") || return 1
-  [[ $directory == "$setup_repo/plugin" ]]
+  setup_same_checkout "$directory"
 }
 
 if (( restart )); then
-  restart_target || setup_fail 'Пользовательская служба krotov-telegram.service не привязана к этой копии.'
+  restart_target || setup_fail "Пользовательская служба $unit не привязана к этой копии."
 fi
 
 branch=$(git symbolic-ref --quiet --short HEAD) || setup_fail 'Переключись на ветку, которая отслеживает upstream.'
@@ -69,7 +74,7 @@ printf 'Проверяю версию %s в отдельном каталоге.
 if ! (
   cd "$stage/plugin"
   setup_install_deps &&
-    "$setup_bun" --no-env-file test &&
+    "$setup_bun" --no-env-file test "--timeout=$test_timeout_ms" &&
     "$setup_bun" --no-env-file build src/codex/server.ts --target=bun >/dev/null
 ); then setup_fail 'Проверка обновления не прошла. Рабочая копия и служба остались на прежней версии.'; fi
 
@@ -109,5 +114,5 @@ if (( restart )); then
   fi
   printf '%s\n' 'Служба перезапущена. Проверь обычный ответ бота в Telegram.'
 else
-  printf '%s\n' 'Обновление готово. Когда бот свободен, перезапусти его командой systemctl --user restart krotov-telegram.service.'
+  printf 'Обновление готово. Когда бот свободен, перезапусти его командой systemctl --user restart %s.\n' "$unit"
 fi

@@ -94,6 +94,54 @@ test('moves the lazy working card below a burst of public messages with its orig
   }
 })
 
+test('status teardown makes no Telegram edit for a zero message ID', async () => {
+  const edits: number[] = []
+  const manager = new StatusManager({
+    config: AppConfigSchema.parse({ status: { delete_on_complete: false } }),
+    log: createLogger('work-status-test'),
+    telegramApi: {
+      async sendMessage() { return { message_id: 0 } },
+      async editMessageText(_chat, id) { edits.push(id) },
+    },
+  })
+  await manager.start('123', undefined, { kind: 'tool', toolName: 'Bash' })
+  await manager.cancel('123', '/new')
+  await manager.start('123', undefined, { kind: 'tool', toolName: 'Bash' })
+  await manager.complete('123')
+  expect(edits).toEqual([])
+})
+
+test('a late missing-status edit cannot retire a replacement bubble', async () => {
+  const edits: number[] = []
+  const pending = Promise.withResolvers<void>()
+  const missing = { error_code: 400, description: 'Bad Request: message to edit not found' }
+  let nextMessageId = 16
+  const manager = new StatusManager({
+    config: AppConfigSchema.parse({ status: { delete_on_complete: false } }),
+    log: createLogger('work-status-test'),
+    telegramApi: {
+      async sendMessage() { return { message_id: ++nextMessageId } },
+      async editMessageText(_chat, id) {
+        edits.push(id)
+        if (edits.length === 1) return pending.promise
+        if (id === 17) throw missing
+      },
+    },
+  })
+  const handle = await manager.start('123', undefined, { kind: 'tool', toolName: 'Start' })
+  try {
+    const late = manager.update(handle, { kind: 'tool', toolName: 'First' })
+    await manager.update(handle, { kind: 'tool', toolName: 'Second' })
+    expect(manager.activeMessageId('123')).toBe(18)
+    pending.reject(missing)
+    await late
+    expect(manager.activeMessageId('123')).toBe(18)
+  } finally {
+    await manager.cancel('123', '/new')
+  }
+  expect(edits).toEqual([17, 17, 18])
+})
+
 test('shortens the commentary separately from the latest three command summaries', () => {
   const html = renderActivityBlock({
     startedAtMs: 1000,

@@ -45,6 +45,32 @@ test('protects the installer service from direct stop or restart commands', () =
   expect(verdict('systemctl --user stop unrelated.service').tier).toBe('allow')
 })
 
+test('protects both the configured bridge unit and the default unit', () => {
+  const previous = process.env.KROT_CODEX_SERVICE_NAME
+  try {
+    process.env.KROT_CODEX_SERVICE_NAME = 'fixture.worker.service'
+    const policy = 'version: 1\ndefault_tier: allow'
+    const verdict = (command: string) => assessPolicy(policy, {
+      hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command },
+    })
+    for (const unit of ['krotov-telegram.service', 'fixture.worker.service', 'fixture.worker']) {
+      expect(verdict(`systemctl --user restart ${unit}`)).toMatchObject({
+        tier: 'deny', matchedRule: 'builtin:deny:own-channel',
+      })
+    }
+    expect(verdict('systemctl --user stop fixtureXworker.service').tier).toBe('allow')
+    expect(verdict('systemctl --user stop other.fixture.worker.service').tier).toBe('allow')
+    expect(verdict('systemctl --user status fixture.worker.service').tier).toBe('allow')
+    expect(verdict('systemctl --user stop gateway.service').tier).toBe('deny')
+    process.env.KROT_CODEX_SERVICE_NAME = 'fixture.*.service'
+    expect(verdict('systemctl --user stop fixture.worker.service').tier).toBe('allow')
+    expect(verdict('systemctl --user stop krotov-telegram.service').tier).toBe('deny')
+  } finally {
+    if (previous === undefined) delete process.env.KROT_CODEX_SERVICE_NAME
+    else process.env.KROT_CODEX_SERVICE_NAME = previous
+  }
+})
+
 test('only eligible standalone questions can get a tool-free side reply', async () => {
   expect(sideQuestion('Отдельный вопрос: что такое JSON?')).toBe('что такое JSON?')
   expect(sideQuestion('Что такое JSON?')).toBe('Что такое JSON?')

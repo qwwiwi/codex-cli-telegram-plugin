@@ -3,6 +3,21 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
+## v0.5.1 – 2026-11-27
+
+[Release notes in English and Russian](docs/releases/v0.5.1.md).
+
+### Fixed
+
+- Staged update tests use a 60 s per-test timeout (`KROT_UPDATE_TEST_TIMEOUT_MS`) (#20).
+- `install.sh --service-name`; refuse a service owned by another checkout (#18).
+- Inter-agent sender in both header forms; `KROT_AGENT_WEBHOOK_OWNER_NOTICE=full|brief|off` (#17, #21).
+- Local-file links render as code without downgrading the reply (#14).
+- `/mirror` shows commands only and collapses after the turn (#15).
+- Widgets are switched off after Telegram refuses them; `/doctor` shows it (#16).
+- `/doctor` warns about MCP servers without automatic approval when approvals are off (#12).
+- Known problems: D-Bus inside the workspace-write sandbox (#13).
+
 ## v0.5.0 – 2026-11-27
 
 [Release notes in English and Russian](docs/releases/v0.5.0.md).

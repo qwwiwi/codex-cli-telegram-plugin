@@ -2,7 +2,7 @@
 # krotov-boot-guard-version: 2
 # The bridge refuses to update while the installed copy carries an older version (GUARD_VERSION in
 # plugin/src/codex/self-update.ts): bump both together whenever the bridge starts relying on new behaviour.
-# Boot guard (docs/design/self-update-spec.md, S9): ExecStartPre=- of krotov-telegram.service.
+# Boot guard (docs/design/self-update-spec.md, S9): ExecStartPre=- of the configured bridge service.
 # The unit runs a copy of this file kept outside the checkout (<state>/boot-guard.sh, written by
 # install.sh and refreshed only when an update reached its health mark), so an update that deletes
 # or breaks plugin/scripts/boot-guard.sh can still be rolled back. It runs in the unit's

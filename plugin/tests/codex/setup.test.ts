@@ -17,10 +17,10 @@ function command(cwd: string, env: NodeJS.ProcessEnv, ...cmd: string[]) {
   return { code: result.exitCode, text: result.stdout.toString() + result.stderr.toString() }
 }
 
-function checkout() {
+function checkout(name = 'repo with spaces') {
   const root = mkdtempSync(join(tmpdir(), 'krotov-setup-test-'))
   temporary.push(root)
-  const repo = join(root, 'repo with spaces')
+  const repo = join(root, name)
   const bin = join(root, 'bin')
   const home = join(root, 'home')
   mkdirSync(join(repo, 'plugin/scripts'), { recursive: true })
@@ -42,7 +42,7 @@ function checkout() {
   const stub = (name: string, body: string) => writeFileSync(join(bin, name), '#!/usr/bin/env bash\n' + body + '\n', { mode: 0o700 })
   stub('bun', `printf 'bun %s\\n' "$*" >> "$SETUP_CALLS"
 if [[ "$1" == --no-env-file && "$2" == --env-file=* && "$3" == -e ]]; then exec "$SETUP_REAL_BUN" "$@"; fi
-if [[ "$*" == *' test' && -f broken ]]; then exit 8; fi
+if [[ "$1" == --no-env-file && "$2" == test && -f broken ]]; then exit 8; fi
 if [[ "$*" == *'run doctor' && -v FAIL_DOCTOR ]]; then exit 9; fi
 if [[ "$*" == --env-file* && "$1" != --env-file=* ]]; then exit 13; fi`)
   stub('codex', 'exit 0')
@@ -54,7 +54,9 @@ case "$input" in
   *getUpdates*) printf '%s\\n' '{"ok":true,"result":[{"message":{"text":"${pairCode}","from":{"id":17,"is_bot":false},"chat":{"id":31,"type":"group"}}},{"message":{"text":"${pairCode}","from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"}}}]}' ;;
   *) exit 11 ;;
 esac`)
-  stub('systemctl', 'printf \'systemctl %s\\n\' "$*" >> "$SETUP_CALLS"')
+  stub('systemctl', `printf 'systemctl %s\\n' "$*" >> "$SETUP_CALLS"
+if [[ -v SETUP_MANAGER_UNAVAILABLE ]]; then exit 1; fi
+if [[ "$2" == show && -v SETUP_UNIT_DIRECTORY ]]; then printf '%s\\n' "$SETUP_UNIT_DIRECTORY"; fi`)
   stub('loginctl', 'printf \'loginctl %s\\n\' "$*" >> "$SETUP_CALLS"')
   const git = (...args: string[]) => {
     const result = command(repo, env, 'git', ...args)
@@ -70,6 +72,15 @@ esac`)
 afterEach(() => {
   for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
+
+function localUpstream(root: string, git: ReturnType<typeof checkout>['git']): string {
+  const remote = join(root, 'remote.git')
+  git('init', '--bare', '-q', '-b', 'main', remote)
+  git('remote', 'add', 'origin', remote)
+  git('config', 'branch.main.remote', 'origin')
+  git('config', 'branch.main.merge', 'refs/heads/main')
+  return remote
+}
 
 test('install configures a private owner and checks doctor without starting the bot by default', () => {
   const { repo, env, home } = checkout()
@@ -291,13 +302,96 @@ test('installation dry-run leaves the checkout and home untouched', () => {
   expect(existsSync(env.SETUP_CALLS)).toBe(false)
 })
 
+test('update.sh passes the default and configured per-test timeout to staged Bun', () => {
+  const { root, repo, env, git } = checkout()
+  const remote = localUpstream(root, git)
+  git('checkout', '-qb', 'release')
+  git('commit', '-qm', 'fixture release', '--allow-empty')
+  git('-C', remote, 'fetch', '-q', repo, 'release:main')
+  git('checkout', '-q', 'main')
+  writeFileSync(join(repo, 'plugin/.env'), 'KROT_CODEX_SERVICE_NAME=fixture-bridge.service\n', { mode: 0o600 })
+
+  const failed = command(repo, { ...env, FAIL_DOCTOR: '1' }, 'bash', './update.sh')
+  expect(failed.code).not.toBe(0)
+  expect(readFileSync(env.SETUP_CALLS, 'utf8').split('\n')).toContain('bun --no-env-file test --timeout=60000')
+  const updated = command(repo, { ...env, KROT_UPDATE_TEST_TIMEOUT_MS: '90000', SETUP_UNIT_DIRECTORY: join(repo, 'plugin') },
+    'bash', './update.sh', '--restart')
+  expect(updated.code, updated.text).toBe(0)
+  const calls = readFileSync(env.SETUP_CALLS, 'utf8').split('\n')
+  expect(calls).toContain('bun --no-env-file test --timeout=90000')
+  expect(calls).toContain('systemctl --user show --property=WorkingDirectory --value fixture-bridge.service')
+  expect(calls).toContain('systemctl --user restart fixture-bridge.service')
+})
+
+test('install refuses a foreign default unit and retains a custom service name on rerun', () => {
+  const { repo, env, home } = checkout()
+  const units = join(home, '.config/systemd/user')
+  mkdirSync(units, { recursive: true })
+  const defaultUnit = join(units, 'krotov-telegram.service')
+  const foreign = '[Service]\nWorkingDirectory="/another checkout/plugin"\n'
+  writeFileSync(defaultUnit, foreign)
+  const args = ['bash', './install.sh', '--non-interactive', '--owner-id', '987654321']
+
+  const refused = command(repo, env, ...args)
+  expect(refused.code).not.toBe(0)
+  expect(refused.text).toContain('--service-name')
+  expect(existsSync(join(repo, 'plugin/.env'))).toBe(false)
+
+  const installed = command(repo, env, ...args, '--service-name', 'fixture-bridge.service')
+  expect(installed.code, installed.text).toBe(0)
+  expect(readFileSync(defaultUnit, 'utf8')).toBe(foreign)
+  const unit = readFileSync(join(units, 'fixture-bridge.service'), 'utf8')
+  expect(unit).toContain(`WorkingDirectory=${repo}/plugin\n`)
+  expect(unit).toContain('OnFailure=fixture-bridge-failed.service')
+  expect(unit).toContain('boot-guard.sh')
+  expect(readFileSync(join(units, 'fixture-bridge-failed.service'), 'utf8')).toContain('"fixture-bridge.service"\n')
+  expect(readFileSync(join(repo, 'plugin/.env'), 'utf8')).toContain('KROT_CODEX_SERVICE_NAME=fixture-bridge.service\n')
+
+  const rerun = command(repo, env, 'bash', './install.sh', '--start')
+  expect(rerun.code, rerun.text).toBe(0)
+  expect(readFileSync(env.SETUP_CALLS, 'utf8')).toContain('systemctl --user enable --now fixture-bridge.service')
+})
+
+test.each(['%h/other/plugin', '%u/plugin', '%h/%u/plugin'])(
+  'install refuses foreign or unresolved WorkingDirectory=%s without a user manager', directory => {
+    const { repo, env, home } = checkout()
+    const units = join(home, '.config/systemd/user')
+    mkdirSync(units, { recursive: true })
+    const unit = join(units, 'krotov-telegram.service')
+    const original = `[Service]\nWorkingDirectory="${directory}"\n`
+    writeFileSync(unit, original)
+
+    const result = command(repo, { ...env, SETUP_MANAGER_UNAVAILABLE: '1' },
+      'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+    expect(result.code, result.text).not.toBe(0)
+    expect(result.text).toContain('--service-name')
+    expect(existsSync(join(repo, 'plugin/.env'))).toBe(false)
+    expect(existsSync(join(home, 'krotov-workspace'))).toBe(false)
+    expect(existsSync(join(home, '.local/state'))).toBe(false)
+    expect(existsSync(join(units, 'krotov-telegram-failed.service'))).toBe(false)
+    expect(readFileSync(unit, 'utf8')).toBe(original)
+  },
+)
+
+test('install accepts its own WorkingDirectory with %h and an escaped percent', () => {
+  const { repo, env, home } = checkout('repo with %h')
+  const units = join(home, '.config/systemd/user')
+  mkdirSync(units, { recursive: true })
+  const unit = join(units, 'krotov-telegram.service')
+  const original = '[Service]\nWorkingDirectory="%h/../repo with %%h/plugin"\n'
+  writeFileSync(unit, original)
+
+  const result = command(repo, { ...env, SETUP_MANAGER_UNAVAILABLE: '1' },
+    'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(result.code, result.text).toBe(0)
+  expect(readFileSync(unit, 'utf8')).toBe(original)
+})
+
 test('update validates upstream in isolation and leaves the checkout untouched on failing tests', () => {
   const { root, repo, env, git } = checkout()
-  const remote = join(root, 'remote.git')
+  const remote = localUpstream(root, git)
   const publisher = join(root, 'publisher')
-  git('init', '--bare', '-q', '-b', 'main', remote)
-  git('remote', 'add', 'origin', remote)
-  git('push', '-qu', 'origin', 'main')
+  git('-C', remote, 'fetch', '-q', repo, 'main:main')
   git('clone', '-q', remote, publisher)
   const old = git('rev-parse', 'HEAD')
   writeFileSync(join(repo, 'plugin/.env'), 'saved fixture\n', { mode: 0o600 })
@@ -309,14 +403,14 @@ test('update validates upstream in isolation and leaves the checkout untouched o
   writeFileSync(join(publisher, 'plugin/broken'), 'test failure')
   publish('add', '.')
   publish('commit', '-qm', 'failing release')
-  publish('push', '-q')
+  git('-C', remote, 'fetch', '-q', publisher, 'main:main')
   const failed = command(repo, env, 'bash', './update.sh')
   expect(failed.code).not.toBe(0)
   expect(git('rev-parse', 'HEAD')).toBe(old)
   expect(existsSync(join(repo, 'plugin/broken'))).toBe(false)
   publish('rm', '-q', 'plugin/broken')
   publish('commit', '-qm', 'working release')
-  publish('push', '-q')
+  git('-C', remote, 'fetch', '-q', publisher, 'main:main')
   const doctorFailure = command(repo, { ...env, FAIL_DOCTOR: '1' }, 'bash', './update.sh')
   expect(doctorFailure.code).not.toBe(0)
   expect(git('rev-parse', 'HEAD')).toBe(old)
@@ -329,11 +423,9 @@ test('update validates upstream in isolation and leaves the checkout untouched o
 
 test('update.sh refuses an upstream that starts tracking an ignored local file instead of overwriting it', () => {
   const { root, repo, env, git } = checkout()
-  const remote = join(root, 'remote.git')
+  const remote = localUpstream(root, git)
   const publisher = join(root, 'publisher')
-  git('init', '--bare', '-q', '-b', 'main', remote)
-  git('remote', 'add', 'origin', remote)
-  git('push', '-qu', 'origin', 'main')
+  git('-C', remote, 'fetch', '-q', repo, 'main:main')
   git('clone', '-q', remote, publisher)
   const old = git('rev-parse', 'HEAD')
   writeFileSync(join(repo, 'plugin/.env'), 'saved fixture\n', { mode: 0o600 })
@@ -345,7 +437,7 @@ test('update.sh refuses an upstream that starts tracking an ignored local file i
   writeFileSync(join(publisher, 'plugin/.env'), 'upstream template\n')
   publish('add', '-f', 'plugin/.env')
   publish('commit', '-qm', 'track the env file')
-  publish('push', '-q')
+  git('-C', remote, 'fetch', '-q', publisher, 'main:main')
   const result = command(repo, env, 'bash', './update.sh')
   expect(result.code, result.text).not.toBe(0)
   expect(readFileSync(join(repo, 'plugin/.env'), 'utf8')).toBe('saved fixture\n')

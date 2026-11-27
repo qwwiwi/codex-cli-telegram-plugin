@@ -117,7 +117,11 @@ export async function stageUpdate(options: StageOptions): Promise<StageResult> {
     if (unpacked.code !== 0) return failed('archive', unpacked)
     const install = await options.run(options.bun, INSTALL_ARGS, { cwd: plugin, timeoutMs: 600_000, env })
     if (install.code !== 0) return failed('install', install)
-    const tests = await options.run(options.bun, ['--no-env-file', 'test'], { cwd: plugin, timeoutMs: 1_800_000, env })
+    const configuredTimeout = process.env.KROT_UPDATE_TEST_TIMEOUT_MS ?? ''
+    const testTimeout = /^[1-9][0-9]{0,9}$/.test(configuredTimeout) && Number(configuredTimeout) <= 2_147_483_647
+      ? configuredTimeout : '60000'
+    const tests = await options.run(options.bun, ['--no-env-file', 'test', `--timeout=${testTimeout}`],
+      { cwd: plugin, timeoutMs: 1_800_000, env })
     if (tests.code !== 0) return failed('test', tests)
     // As update.sh: the bridge entry point must bundle. The bundle goes into the staged copy, not to stdout.
     const build = await options.run(options.bun, ['--no-env-file', 'build', 'src/codex/server.ts', '--target=bun', '--outdir', join(stage, 'build')],

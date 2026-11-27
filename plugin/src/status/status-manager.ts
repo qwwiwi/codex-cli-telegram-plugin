@@ -1790,6 +1790,7 @@ export class StatusManager {
     if (entry.bubbleSuppressed) return
     if (entry.disabled) return
     const messageId = entry.handle.messageId
+    if (!messageId) return
     // Preferred path: delete the bubble outright. But a tracked bubble must
     // NEVER survive complete() still reading "working" — that is the
     // frozen working bubble: the entry is gone
@@ -1872,6 +1873,7 @@ export class StatusManager {
     if (entry.bubbleSuppressed) return
     if (entry.disabled) return
     const messageId = entry.handle.messageId
+    if (!messageId) return
     const text = renderState({ kind: 'stopped', reason }, 0, this.now())
     return this.runLifecycle(chatId, async () => {
       try {
@@ -1911,7 +1913,8 @@ export class StatusManager {
     // go through ensureBubble() instead. Guard defends timer-driven ticks
     // that fire before the first non-typing transition.
     if (entry.disabled) return
-    if (entry.bubbleSuppressed || entry.handle.messageId === 0) return
+    const messageId = entry.handle.messageId
+    if (entry.bubbleSuppressed || messageId === 0) return
     // Stale-entry guard (frozen working bubble). A caller may
     // reach us across an await (streaming-thoughts transcript read, timer
     // tick) after complete()/cancel()/supersede already removed this entry
@@ -1929,13 +1932,15 @@ export class StatusManager {
     try {
       await this.telegramApi.editMessageText(
         entry.handle.chatId,
-        entry.handle.messageId,
+        messageId,
         text,
         opts as { parse_mode: 'HTML' },
       )
-      entry.lastText = text
+      if (entry.handle.messageId === messageId) entry.lastText = text
       return
     } catch (err) {
+      // A newer edit or turn teardown can retire this target while the request is in flight.
+      if (this.entries.get(entry.handle.chatId) !== entry || entry.handle.messageId !== messageId) return
       const cls = classifyEditError(err)
       switch (cls.kind) {
         case 'benign':
@@ -1971,24 +1976,12 @@ export class StatusManager {
           // drop and rely on the next tick / cancel to surface state.
           this.log.info('status edit target missing', {
             chat_id: entry.handle.chatId,
-            message_id: entry.handle.messageId,
+            message_id: messageId,
             recovery_done: entry.messageGoneRecoveryDone,
           })
           entry.handle.messageId = 0
           entry.lastText = ''
-          // A tick in flight when the turn ends learns its target is gone
-          // only AFTER the teardown that deleted it — the error is our own
-          // deleteMessage coming back to us, not the user removing the
-          // bubble. Recreating there leaves a bubble nobody will ever tear
-          // down: the turn is already over, so no complete()/cancel() will
-          // follow. A successful delete can precede a MESSAGE_ID_INVALID
-          // edit error. Avoid creating a replacement bubble in that case.
-          // Detached covers EVERY way this entry can be dead: complete() and
-          // cancel() both `entries.delete(chatId)` before the network delete,
-          // and a supersede swaps the map value for a new entry. A dead
-          // entry has no owner left to tear down whatever it recreates.
-          const detached = this.entries.get(entry.handle.chatId) !== entry
-          if (!entry.messageGoneRecoveryDone && !detached) {
+          if (!entry.messageGoneRecoveryDone) {
             entry.messageGoneRecoveryDone = true
             entry.bubbleSuppressed = true
             // ensureBubble bails on suppressBubble && state.kind ===
@@ -2012,11 +2005,11 @@ export class StatusManager {
             try {
               await this.telegramApi.editMessageText(
                 entry.handle.chatId,
-                entry.handle.messageId,
+                messageId,
                 text,
                 {} as { parse_mode: 'HTML' },
               )
-              entry.lastText = text
+              if (entry.handle.messageId === messageId) entry.lastText = text
               return
             } catch (err2) {
               this.log.warn('status edit parse retry failed (ignored)', {

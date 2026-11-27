@@ -87,7 +87,7 @@ Manual setup on Ubuntu or Debian: [plugin/docs/quickstart.md](plugin/docs/quicks
 - Text, voice (transcribed), photos, documents, albums, forwards and replies with quoted context.
 - A live status message while Codex works, moved below new messages so it stays visible.
 - What the agent is thinking: the status message streams the latest line of Codex's reasoning summary instead of a static `reasoning...` (on for a new install; `TELEGRAM_STATUS_THOUGHTS=0` turns it off).
-- `/mirror on` shows a compact live feed of commands Codex runs.
+- `/mirror on` shows one line per recent command and collapses to a summary when the turn ends.
 - Approval cards for commands, file changes and MCP tool calls; question cards when Codex asks you to choose.
 - `/goal` for long tasks with a completion criterion; unfinished tasks continue in the next turn.
 - Optional pinned HUD: context window use, model, plan, autonomy mandate, Codex limits; moves to the bottom after each turn.

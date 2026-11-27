@@ -1,16 +1,17 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Message } from 'grammy/types'
 
-import { frameAgentMessage } from '../../src/codex/agent-webhook.js'
+import { agentOwnerNoticeMode, frameAgentMessage, routeAgentMessage, type AgentDelivery } from '../../src/codex/agent-webhook.js'
 import { CodexInbox } from '../../src/codex/inbox.js'
 import {
   agentProvenance, agentReplyText, agentTurnInstructions, ownerProvenance, turnIntent, type Provenance,
 } from '../../src/codex/provenance.js'
-import { sideInstructions } from '../../src/codex/parallel.js'
-import { classifyTurn } from '../../src/codex/turn-origin.js'
+import { parallelSettings, queuedNotice, sideInstructions } from '../../src/codex/parallel.js'
+import { classifyTurn, ownerOrigin, parseTurnOrigin } from '../../src/codex/turn-origin.js'
 
 const OWNER = 42
 const dirs: string[] = []
@@ -189,6 +190,69 @@ function asAgent(provenance: Provenance): { agent: string; verified?: boolean } 
   if (provenance.origin !== 'agent') throw new Error('expected an agent provenance')
   return provenance
 }
+
+test.each(['off', 'brief'])('webhook owner notice mode %s queues behind an owner turn with parallel off', mode => {
+  const inbox = new CodexInbox(room(), OWNER)
+  inbox.receive(ownerMessage('Owner task'), ownerProvenance)
+  inbox.take()
+  const source = readFileSync(join(import.meta.dir, '../../src/codex/server.ts'), 'utf8')
+  const section = (from: string, to: string) => {
+    const start = source.indexOf(from)
+    const end = source.indexOf(to, start)
+    if (start < 0 || end < 0) throw new Error('Could not locate inbox callbacks')
+    return source.slice(start, end)
+  }
+  const sent: string[] = []
+  let startCalls = 0
+  // Bind the server callbacks without starting a webhook listener or Telegram poller.
+  const deliver: unknown = new Function('dependencies', new Bun.Transpiler({ loader: 'ts' }).transformSync(`
+    const { inbox, ownerChat, parallel, agentNoticesEnabled, startNext, send,
+      createHash, agentProvenance, routeAgentMessage, queuedNotice } = dependencies
+    const stopping = false, task = Promise.resolve(), goalActive = false, externalQuestion = false
+    const hudReady = false, sides = undefined
+    const mainSummary = () => ({ title: 'Owner task' })
+    ${section('    function resumeInbox(', '    function bufferAlbum(')}
+    ${section('    function deliverAgentMessage(', '    const agentWebhookConfig =')}
+    return deliverAgentMessage
+  `))({ inbox, ownerChat: String(OWNER), parallel: parallelSettings({ KROT_CODEX_PARALLEL: '0' }),
+    agentNoticesEnabled: agentOwnerNoticeMode(mode) !== 'off',
+    startNext: () => { startCalls += 1 }, send: async (text: string) => { sent.push(text) },
+    createHash, agentProvenance, routeAgentMessage, queuedNotice })
+  if (typeof deliver !== 'function') throw new Error('Could not bind agent delivery')
+  const delivery: AgentDelivery = { input: frameAgentMessage('Agent task', 'swarm'),
+    deliveryId: 'agent-queue-fixture', agentId: 'swarm', senderVerified: true }
+  expect(deliver(delivery)).toBe('accepted')
+  expect(startCalls).toBe(1)
+  expect(inbox.active?.messages[0]?.message_id).toBe(7)
+  inbox.finish(7)
+  expect(inbox.take()?.[0]?.text).toBe(delivery.input)
+  expect(sent).toEqual(mode === 'off' ? [] : [queuedNotice('Owner task')])
+})
+
+test('off mode settles an agent reply recovered from the inbox without echoing it', async () => {
+  const provenance = agentProvenance('swarm')
+  const text = agentReplyText(asAgent(provenance), 'Готово.')
+  const inbox = savedActive(room(), {
+    messages: [agentMessage('Verify the summary.')], outcome: { stage: 'ready', reply: { text, files: [] } },
+  }, { '-7': provenance })
+  const source = readFileSync(join(import.meta.dir, '../../src/codex/server.ts'), 'utf8')
+  const start = source.indexOf('    async function finishOrdinaryReply(')
+  const end = source.indexOf('    function startNext()', start)
+  if (start < 0 || end < 0) throw new Error('Could not locate the reply callback')
+  const echoed: string[] = []
+  const finish: unknown = new Function('inbox', 'parseTurnOrigin', 'ownerOrigin', 'deliverReply',
+    new Bun.Transpiler({ loader: 'ts' }).transformSync(`
+      const agentNoticesEnabled = false, selfRestartEnabled = false, stopping = false
+      let deliveryRetryAt = 0
+      const brainRecovery = async () => undefined, recordBrainDelivery = async () => {}
+      ${source.slice(start, end)}
+      return finishOrdinaryReply
+    `))(inbox, parseTurnOrigin, ownerOrigin, async (reply: { text: string }) => { echoed.push(reply.text); return true })
+  if (typeof finish !== 'function') throw new Error('Could not bind the reply callback')
+  await finish(0, true)
+  expect(echoed).toEqual([])
+  expect(inbox.active).toBeUndefined()
+})
 
 test('a sender only the message text claims stays marked unverified in the turn, side prompt and final reply', () => {
   const dir = room()

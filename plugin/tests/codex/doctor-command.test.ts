@@ -63,6 +63,13 @@ function fixture() {
 const healthy = async () => [{ status: 'ok' as const, message: 'Токен действителен и принадлежит указанному боту.' }]
 const codexVersion = async () => '0.130.0'
 
+test('/doctor shows widget availability and the restart hint after a refusal', () => {
+  expect(formatDoctorReport({ problems: [], widgetsAvailable: true })).toContain('Виджеты Telegram: доступны.')
+  const refused = formatDoctorReport({ problems: [], widgetsAvailable: false })
+  expect(refused).toContain('INPUT_MEDIA_WIDGET_NOT_ALLOWED')
+  expect(refused).toContain('перезапустите мост')
+})
+
 function gitSnapshot(dir: string, prefix = ''): string[] {
   return readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(entry => {
     const path = join(dir, entry.name)

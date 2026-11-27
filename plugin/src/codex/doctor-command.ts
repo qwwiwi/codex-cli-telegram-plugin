@@ -15,6 +15,7 @@ import type { CodexUpdateRecord } from './codex-update.js'
 import { OWNER_INSTRUCTIONS_CHECK_PREFIX } from './owner-instructions-lock.js'
 import type { RenderDiff } from './render-eyes.js'
 import { formatSelfTests, type SelfTestResult } from './self-test.js'
+import { DEFAULT_BRIDGE_UNIT_NAME } from './unit-contract.js'
 
 // The /doctor Telegram command: the doctor script's self-check plus a comparison of the installed
 // bridge with its GitHub repository and the recent entries of the bridge's error journal.
@@ -36,6 +37,7 @@ export interface DoctorReport {
   cache?: string
   /** R42: the last render diffs, what the owner saw against what the model wrote, newest first. */
   renders?: string
+  widgetsAvailable?: boolean
   /** A fact line: the Codex version the last /update codex replaced, kept for /update codex rollback. */
   codexPrevious?: string
   /** A fact line from <state>/boot-ledger.json: boots, unhealthy chain, last exit code, safe-mode flag (S11). */
@@ -302,6 +304,7 @@ export interface DoctorOptions {
   cache?: () => { thread?: CacheShare | undefined; day?: CacheShare | undefined }
   /** The last render diffs, newest first (RenderEyes.recent); reading it must not throw. */
   renders?: () => readonly RenderDiff[]
+  widgetsAvailable?: () => boolean
   /** The /update trial record (S9); reading it must not throw. */
   pendingUpdate?: () => Promise<PendingUpdate | undefined>
   /** The /update codex record (<state>/codex-update.json); reading it must not throw. */
@@ -483,6 +486,7 @@ export async function collectDoctorReport(options: DoctorOptions): Promise<Docto
   const lowCache = cacheDoctorProblem(cache?.day)
   if (lowCache) report.problems.push(lowCache)
   if (options.renders) report.renders = renderDiffLines(options.renders().slice(0, 5))
+  if (options.widgetsAvailable) report.widgetsAvailable = options.widgetsAvailable()
   return report
 }
 
@@ -548,6 +552,8 @@ export function formatDoctorReport(report: DoctorReport, maxChars = Number.POSIT
     report.errorJournal ?? '',
     report.cache ?? '',
     report.renders ?? '',
+    report.widgetsAvailable === undefined ? '' : report.widgetsAvailable ? 'Виджеты Telegram: доступны.' :
+      'Виджеты Telegram: отключены (INPUT_MEDIA_WIDGET_NOT_ALLOWED). Чтобы проверить доступность снова, перезапустите мост.',
     report.codexPrevious ?? '',
     report.boot ?? '',
     report.fatal ?? '',
@@ -576,7 +582,7 @@ function redactReport(report: DoctorReport, secrets: readonly string[]): DoctorR
 }
 
 /** The owner turn /doctor fix hands to Codex. */
-export function doctorFixTurn(report: DoctorReport, repo: string, selfRestart: boolean): string {
+export function doctorFixTurn(report: DoctorReport, repo: string, selfRestart: boolean, unitName = DEFAULT_BRIDGE_UNIT_NAME): string {
   return [
     'Владелец отправил /doctor fix. Ниже отчёт самопроверки Telegram-моста.',
     formatDoctorReport(report),
@@ -588,7 +594,7 @@ export function doctorFixTurn(report: DoctorReport, repo: string, selfRestart: b
       'Не перезапускай мост и его службу в этом ходе: перезапуск оборвёт текущий ход, и ответ не дойдёт.',
       selfRestart
         ? 'Если после исправлений нужен перезапуск, в конце ответа попроси владельца отправить отдельным сообщением «Перезапусти мост»: мост доставит ответ и перезапустится, когда очередь освободится.'
-        : 'Если после исправлений нужен перезапуск, в конце ответа попроси владельца, когда бот свободен, выполнить на сервере systemctl --user restart krotov-telegram.service.',
+        : `Если после исправлений нужен перезапуск, в конце ответа попроси владельца, когда бот свободен, выполнить на сервере systemctl --user restart ${unitName}.`,
       'В ответе перечисли, что исправлено, что осталось и что должен сделать владелец.',
     ].join(' '),
   ].join('\n\n')
@@ -601,6 +607,7 @@ interface DoctorCommandHooks {
   repo: string
   /** KROT_CODEX_SELF_RESTART: the owner can ask the bridge to restart after the reply. */
   selfRestart: boolean
+  unitName?: string
   /** Configured secret values, masked in the chat report and in the turn handed to Codex. */
   secrets: readonly string[]
   /** R38: the `/doctor tests` smoke set (self-test.ts). */
@@ -655,7 +662,7 @@ export class DoctorCommand {
       // The repair turn does not depend on the chat report: a refused report still hands the full list to Codex.
       await this.hooks.send(chat('\n\nПередаю отчёт агенту для исправления.')).catch(() => undefined)
       try {
-        await enqueueTurn(redactSecrets(doctorFixTurn(safe, this.hooks.repo, this.hooks.selfRestart), this.hooks.secrets))
+        await enqueueTurn(redactSecrets(doctorFixTurn(safe, this.hooks.repo, this.hooks.selfRestart, this.hooks.unitName), this.hooks.secrets))
       } catch {
         await this.hooks.send('Не удалось передать отчёт агенту. Отправьте /doctor fix ещё раз.')
       }

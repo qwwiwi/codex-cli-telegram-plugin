@@ -66,6 +66,7 @@ function fixture(rpc: HeldRpc, options: {
   chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) =>
     Promise<{ contentItems: [{ type: 'inputText'; text: string }]; success: boolean }>
   sandbox?: 'workspace-write' | 'danger-full-access'
+  widgetsAvailable?: () => boolean
 } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-untrusted-'))
   dirs.push(cwd)
@@ -74,6 +75,7 @@ function fixture(rpc: HeldRpc, options: {
     command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), 'chatgpt'],
     ...(options.approve ? { approve: options.approve } : {}),
     ...(options.chatAction ? { chatAction: options.chatAction } : {}),
+    ...(options.widgetsAvailable ? { widgetsAvailable: options.widgetsAvailable } : {}),
   }, () => {})
   sessions.push(session)
   const internals = session as unknown as SessionInternals
@@ -243,4 +245,27 @@ test('[R12][R13] a trusted Codex thread is offered the component tools and their
   expect(routed).toEqual([['component_schema', { component: 'kpi' }]])
   complete(threadId, 'turn-1')
   expect((await run).status).toBe('completed')
+})
+
+test('new owner and side threads omit send_component when widgets are unavailable', async () => {
+  const rpc = new HeldRpc()
+  const { session, complete } = fixture(rpc, {
+    chatAction: async () => ({ contentItems: [{ type: 'inputText', text: 'ok' }], success: true }),
+    widgetsAvailable: () => false,
+  })
+  const owner = session.run('owner input')
+  await until(() => turnStarts(rpc).length === 1)
+  complete(String(turnStarts(rpc)[0]!.threadId), 'turn-1')
+  await owner
+  const side = session.runSide('side input')
+  await until(() => turnStarts(rpc).length === 2)
+  complete(String(turnStarts(rpc)[1]!.threadId), 'turn-2')
+  await side
+  const starts = rpc.calls.filter(call => call.method === 'thread/start')
+  expect(starts).toHaveLength(2)
+  for (const start of starts) {
+    const tools = object(start.params).dynamicTools
+    expect(Array.isArray(tools) ? tools.map(tool => object(tool).name) : tools)
+      .toEqual(['telegram_action', 'update_component', 'component_schema', 'render_preview'])
+  }
 })

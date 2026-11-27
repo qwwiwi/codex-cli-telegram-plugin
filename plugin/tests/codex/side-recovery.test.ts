@@ -86,6 +86,17 @@ test('F3: crash after turn/start – the side job survives the restart and is se
   expect(inbox.take()?.[0]?.message_id).toBe(9)
 })
 
+test('off mode retains the lost agent message without sending a recovery notice', async () => {
+  const { inbox } = crashedInbox(inbox => {
+    inbox.beginFollowUp(message(-5, frameAgentMessage('Verify the summary.', 'swarm')), agentProvenance('swarm'))
+  })
+  const { deps, notices, letters } = failingDeps()
+  await recoverInterruptedWork(inbox, { ...deps, notifyAgent: false })
+  expect(notices).toEqual([])
+  expect(letters.map(letter => letter.messageId)).toEqual([-5])
+  expect(inbox.uncertainFollowUp).toBeUndefined()
+})
+
 test('F3: an owner side job is quoted, and a finished side job leaves no record', async () => {
   const { inbox } = crashedInbox(inbox => {
     inbox.beginFollowUp(message(11, 'Отдельный вопрос'), ownerProvenance)
