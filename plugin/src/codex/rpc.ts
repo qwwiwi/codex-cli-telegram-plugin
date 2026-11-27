@@ -74,11 +74,11 @@ export class CodexRpc {
     })
   }
 
-  async initialize(): Promise<void> {
+  async initialize(timeoutMs?: number): Promise<void> {
     await this.request('initialize', {
       clientInfo: { name: 'krot_telegram', version: '0.1.0' },
       capabilities: { experimentalApi: true, requestAttestation: false },
-    })
+    }, timeoutMs)
     this.write({ method: 'initialized' })
   }
 
