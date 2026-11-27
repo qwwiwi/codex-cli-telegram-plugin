@@ -84,6 +84,16 @@ export async function probeProxy(workspace: string, env: NodeJS.ProcessEnv, comm
   } finally { clearTimeout(timer); rpc.close() }
 }
 
+/** R38 (/doctor tests): starts a separate App Server, completes its initialize handshake and closes it. */
+export async function codexHandshake(env: NodeJS.ProcessEnv, workspace: string,
+  command: readonly [string, ...string[]] = ['codex', 'app-server', '--listen', 'stdio://']): Promise<void> {
+  const rpc = new CodexRpc(workspace, codexEnv(env), () => undefined, () => undefined, command)
+  const timer = setTimeout(() => rpc.close(), 8000)
+  try {
+    await rpc.initialize()
+  } finally { clearTimeout(timer); rpc.close() }
+}
+
 export async function listHooksViaAppServer(env: NodeJS.ProcessEnv, workspace: string): Promise<ListedHook[]> {
   const rpc = new CodexRpc(workspace, codexEnv(env), () => undefined, () => undefined)
   const timer = setTimeout(() => rpc.close(), 8000)

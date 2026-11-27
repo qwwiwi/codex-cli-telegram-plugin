@@ -78,7 +78,7 @@ export class CodexRpc {
 
   async initialize(timeoutMs?: number): Promise<void> {
     await this.request('initialize', {
-      clientInfo: { name: 'krot_telegram', version: '0.4.0' },
+      clientInfo: { name: 'krot_telegram', version: '0.5.0' },
       capabilities: { experimentalApi: true, requestAttestation: false },
     }, timeoutMs)
     this.write({ method: 'initialized' })

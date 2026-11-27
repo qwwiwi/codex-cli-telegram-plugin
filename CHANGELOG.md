@@ -3,6 +3,52 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
+## v0.5.0 – 2026-11-27
+
+[Release notes in English and Russian](docs/releases/v0.5.0.md).
+
+### Added
+
+- Multi-user roles and chats behind `KROT_MULTIUSER=1`, off by default. The owner
+  stays the only person with full access; members and guests are added with
+  `/users` (list, add, remove, role, one-time invite code) or `KROT_MEMBER_USER_IDS`,
+  and groups are approved with `/chats`. Member and guest messages run in their
+  own Codex app-server per role, with a clean settings folder, an allowlist of
+  skills and URL-only MCP servers (`public-access.toml`), and a permission hook
+  (`--thread-role`) that denies every tool call from their threads. The bridge
+  refuses to start in this mode until the hook, the policy token and
+  `KROT_PUBLIC_WORKSPACE_ROOT` are set and each role passes a live hook check.
+  Their exchanges are journalled in Brain as foreign and never enter owner memory.
+  [Setup](plugin/docs/claude-compatibility.md)
+- Render "eyes": after every reply the bridge compares what Telegram shows with
+  the model's text (raw markup, broken HTML, a reply sent as a file, a block split
+  across messages). The next turn gets one short note, the `render_preview` tool
+  shows a Telegram-like picture of a reply or a draft, and `/doctor` lists the last
+  render diffs. The history file keeps metadata only, never reply text.
+- `/doctor tests`: a short smoke set (settings parse, Telegram `getMe` for the
+  expected bot, Codex App Server handshake, hooks pack, writable state directory)
+  with pass or fail per check; secrets are masked.
+- Install by link: [AGENT_INSTALL.md](AGENT_INSTALL.md) walks a Codex agent from the
+  repository link to a tested install and a report to the owner. Both READMEs link it.
+- Automatic self-update, off by default (`KROT_AUTO_UPDATE=1`, every
+  `KROT_AUTO_UPDATE_HOURS`, default 6), and the owner command `/cc update`. A new
+  fast-forward commit is checked in a staged copy (tests and doctor) and applied
+  only while the bridge is idle. After its health mark it stays on probation for
+  10 minutes; a third crash rolls it back, and a rolled-back commit is never
+  installed automatically again. `/doctor` shows the setting, the last attempt and
+  the bad commits. [Automatic update](plugin/docs/install.md#automatic-update)
+- `/status` and `/doctor` show the prompt-cache share of Codex input.
+
+### Fixed
+
+- Brain: foreign text (forwards, replies to another person's message) stays out of
+  owner side threads, and a side reply target is judged by the same provenance rule
+  as an incoming message. Member and guest exchanges stay out of the owner's recent
+  window and of the handoff scan.
+- Compaction and side turns wait while a restart or an update is in progress.
+- Multi-user configuration errors stop the bridge with the fatal exit code (78) and
+  are printed.
+
 ## v0.4.0 – 2026-11-27
 
 [Release notes in English and Russian](docs/releases/v0.4.0.md).

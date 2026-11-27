@@ -10,13 +10,19 @@ import {
   authGate, readBodyWithCap, reply,
 } from '../webhook/http.js'
 import { object } from './rpc.js'
-import type { ApprovalDecision, ApprovalRequest, PolicyApprovalRequest } from './session.js'
+import type { ApprovalDecision, ApprovalRequest, PolicyApprovalRequest, ThreadRole } from './session.js'
+import { THREAD_ROLE_PATH, threadToolAccess } from './thread-role.js'
 
 type Queue = (request: string, id: number) => 'accepted' | 'duplicate' | 'full' | 'stopping'
 type PolicyApproval = {
   token: string
   request: (approval: PolicyApprovalRequest) => Promise<ApprovalDecision>
   legacy?: { timeoutMs: number; request: (approval: ApprovalRequest, signal: AbortSignal) => Promise<ApprovalDecision> }
+  /** POST /hooks/thread-role for the permission hook's --thread-role check (S4). */
+  threadRole?: (threadId: string) => ThreadRole | Promise<ThreadRole>
+  multiuser?: boolean
+  /** Called with the thread of every thread-role answer that denies (the startup hook proof watches it). */
+  onDenied?: (threadId: string) => void
 }
 type QuestionInput = {
   id: string; question: string; isOther: true; multiSelect: boolean
@@ -115,6 +121,23 @@ export async function startExternalTasks(port: number, token: string, chatId: st
       const path = req.url?.split('?', 1)[0]
       if (req.method === 'GET' && (path === '/health' || path === '/healthz')) {
         return reply(res, 200, { status: 'ok' })
+      }
+      const roleRoute = path === THREAD_ROLE_PATH ? dedicatedPolicy : undefined
+      if (req.method === 'POST' && roleRoute?.threadRole) {
+        if (!authGate(req, res, roleRoute.token)) return
+        if (Number(req.headers['content-length']) > 1024) return reply(res, 413, { error: 'payload too large' })
+        const body = await readBodyWithCap(req, 1024)
+        if (body.tooLarge) return reply(res, 413, { error: 'payload too large' })
+        let raw: unknown
+        try { raw = JSON.parse(body.buf.toString('utf8')) } catch { return reply(res, 400, { error: 'invalid json' }) }
+        const threadId = object(raw).thread_id
+        if (typeof threadId !== 'string' || !/^[\w:-]{1,128}$/u.test(threadId)) return reply(res, 400, { allow: false })
+        // A failed lookup is an unknown thread: denied with multi-user on.
+        const lookup = roleRoute.threadRole
+        const role = await Promise.resolve().then(() => lookup(threadId)).catch((): ThreadRole => 'unknown')
+        const allow = threadToolAccess(role, roleRoute.multiuser === true)
+        if (!allow) roleRoute.onDenied?.(threadId)
+        return reply(res, 200, { role, allow })
       }
       const approvalRoute = path === approvalPath ? dedicatedPolicy : undefined
       if (req.method !== 'POST' || (path !== '/hooks/agent' && !approvalRoute &&

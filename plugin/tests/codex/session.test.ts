@@ -255,6 +255,26 @@ test('relays a verified subagent approval and rejects a different child turn', a
   expect(seen[0]).toMatchObject({ kind: 'command', target: 'printf test' })
 })
 
+test('R3 thread role: an owner subagent asked about before its turn/started is registered resolves to owner, verified by thread/read', async () => {
+  const roles: Array<[string, string]> = []
+  const holder: { session?: CodexSession } = {}
+  holder.session = fixture('chatgpt', async () => {
+    const session = holder.session!
+    // The hook of the child's first tool call can arrive before the child's turn/started: not yet in turn.children.
+    roles.push(['registered', session.threadRole('early-child')])
+    roles.push(['resolved', await session.resolveThreadRole('early-child')])
+    // thread/read names another thread: never vouched for.
+    roles.push(['mismatch', await session.resolveThreadRole('wrong-thread')])
+    return 'accept'
+  }).create()
+  const session = holder.session
+  await session.initialize()
+  expect((await session.run('approval:valid')).text).toBe('accept')
+  expect(roles).toEqual([['registered', 'unknown'], ['resolved', 'owner'], ['mismatch', 'unknown']])
+  // With no owner turn running, an unknown thread stays unknown (denied with multi-user on).
+  expect(await session.resolveThreadRole('early-child')).toBe('unknown')
+})
+
 test('asks once for the exact local network destination without allowing persistent, remote or unseen actions', async () => {
   const seen: ApprovalRequest[] = []
   const session = fixture('chatgpt', async approval => {

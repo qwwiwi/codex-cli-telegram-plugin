@@ -4,9 +4,12 @@ import { resolve as resolvePath } from 'node:path'
 import { CodexRpc, object, type CodexEvent, type CodexServerRequest } from './rpc.js'
 import { sameFilePatch, type NativeFileChange } from './file-approval.js'
 import { agentTools, type AgentChatActions } from './chat-actions.js'
+import type { PreviewToolResult } from './render-preview.js'
 import { isRoutineServerCommand } from './server-approval-policy.js'
 import { parseMcpApproval } from './mcp-approval.js'
 import { parseRateLimits, type CodexLimitWindow } from '../status/codex-limits.js'
+import { publicThreadParams, publicTurnParams, type PublicWebSearch } from './public-profile.js'
+import { publicSkillsProblem, type PublicAllow } from './multiuser-readiness.js'
 
 export type ApprovalDecision = 'accept' | 'decline' | 'cancel'
 
@@ -56,6 +59,38 @@ export interface CodexModel {
 }
 
 const effortName = /^[a-z]{1,16}$/
+// A member or guest thread: its own folder, the role instructions, and the
+// thread ID saved for that chat key (undefined starts a fresh thread).
+export interface PublicTurnProfile {
+  cwd: string
+  instructions: string
+  threadId?: string
+  // The role whose public app-server runs this turn (the router needs it; a session ignores it).
+  role?: 'member' | 'guest'
+  // Called once the thread is open, before the turn starts (a timeout can then interrupt it).
+  onThread?: (threadId: string) => void
+  // Asked right before turn/start: true (access revoked, lane stopped) ends it interrupted without a turn.
+  cancelled?: () => boolean
+}
+
+/** What the startup probe read from a fresh public thread. */
+export interface PublicProbe {
+  reply: Record<string, unknown>
+  /** mcpServerStatus/list, every nextCursor page joined; {} when Codex refused a page (fails the check). */
+  mcp: Record<string, unknown>
+  /** skills/list; absent when Codex refused it (fails the check). */
+  skills?: Record<string, unknown>
+  /** app/list; absent when Codex refused it (fails the check). */
+  apps?: Record<string, unknown>
+  /** config/read of the public home (effective features); absent when Codex refused it (fails the check). */
+  config?: Record<string, unknown>
+}
+
+/** Who a Codex thread belongs to, as the permission hook asks it. */
+export type ThreadRole = 'owner' | 'agent' | 'public' | 'unknown'
+
+// Item types that are conversation, not a tool call.
+const conversationItems = new Set(['userMessage', 'agentMessage', 'reasoning', 'plan', 'contextCompaction'])
 
 export type PolicyApprovalRequest = ApprovalRequest & {
   kind: 'command' | 'file'
@@ -82,10 +117,13 @@ type Settings = {
   riskyApprovals?: boolean
   sandbox?: CodexSandboxMode
   ask?: (questions: unknown, signal?: AbortSignal) => Promise<Record<string, { answers: string[] }>>
-  // `tool` is one of agentTools: telegram_action or a component tool.
-  chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) => ReturnType<AgentChatActions['call']>
+  // `tool` is one of agentTools: telegram_action, a component tool or render_preview (text and one PNG).
+  chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) =>
+    Promise<Awaited<ReturnType<AgentChatActions['call']>> | PreviewToolResult>
   // Operational notes without user content, e.g. a fallback the bridge took.
   onWarning?: (message: string) => void
+  // Every thread/tokenUsage/updated of any thread (main, side, subagent): the prompt-cache counters.
+  onTokenUsage?: (threadId: string, tokenUsage: unknown) => void
   /**
    * Called for the thread the session adopts as its main conversation; idempotent; may throw. Resolves
    * false when nothing could be registered yet (e.g. memory is off): the next turn tries again.
@@ -93,7 +131,23 @@ type Settings = {
   onMain?: (threadId: string) => Promise<boolean>
   /** Wraps the thread/start, thread/resume or thread/fork that opens the main conversation. */
   aroundMainOpen?: <T>(open: () => Promise<T>) => Promise<T>
+  // Public app-server only: `web_search` of its threads (default disabled; live for members that have it).
+  publicWebSearch?: PublicWebSearch
+  // Public app-server only: the role's allowlist; every newly opened public thread must see exactly
+  // these skills (from `home`) in its own folder before its first turn.
+  publicAllow?: PublicAllow
 }
+
+/** A public thread whose folder or skills are outside its role's allowlist; it never gets a turn. */
+class PublicThreadRefused extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PublicThreadRefused'
+  }
+}
+
+// Upper bound of mcpServerStatus/list pages the probe follows; more fails the check.
+const MCP_STATUS_PAGES = 20
 
 type Result = { status: 'completed' | 'interrupted' | 'failed'; text: string }
 type SessionStatus = {
@@ -112,11 +166,23 @@ type Execution = {
 type Turn = Execution & {
   stop: boolean
   untrusted?: true
+  // Tool items (commands, patches, MCP calls...) a public turn started; it should have none.
+  toolItems: number
   lastText: string
   finalText?: string
   children: Map<string, Execution>
   approvedPolicy: Map<string, { kind: PolicyApprovalRequest['kind']; target: string; cwd: string; until: number }>
   finish: (result: Result) => void
+  // Hook proof turns: called for every command item Codex may have executed (not declined before it ran).
+  onCommandRan?: () => void
+}
+
+// A command item that may have executed: any numeric exit code (0 or not, a process ran), and any
+// result other than declined without an exit code is ambiguous, so it counts as executed (fail closed).
+function commandRan(item: Record<string, unknown>): boolean {
+  if (item.type !== 'commandExecution') return false
+  if (typeof item.exitCode === 'number') return true
+  return item.status !== 'declined'
 }
 
 function recordFileChange(execution: Execution, item: Record<string, unknown>): void {
@@ -195,6 +261,12 @@ export class CodexSession {
   private readonly startingSides = new Set<{ stop: boolean }>()
   // Threads whose last turn ran restricted; Codex keeps turn overrides for later turns.
   private readonly restrictedThreads = new Set<string>()
+  // Member and guest threads (public lane). They never fork, never become the
+  // main thread, and every request from them is declined.
+  private readonly publicThreads = new Set<string>()
+  private readonly publicTurns = new Map<string, Turn>()
+  // Hook proof threads (runHookProof): public too, but never resumed or reused for a chat.
+  private readonly proofThreads = new Set<string>()
 
   constructor(private readonly settings: Settings, onClose: () => void) {
     this.threadId = readSavedMainThread(settings.stateFile)
@@ -203,6 +275,7 @@ export class CodexSession {
     this.rpc = new CodexRpc(settings.cwd, settings.env, event => this.receive(event), () => {
       this.active?.finish({ status: 'failed', text: '' })
       for (const side of this.sides.values()) side.finish({ status: 'failed', text: '' })
+      for (const turn of this.publicTurns.values()) turn.finish({ status: 'failed', text: '' })
       onClose()
     }, settings.command, request => this.requestApproval(request))
   }
@@ -478,7 +551,7 @@ export class CodexSession {
     let finish!: Turn['finish']
     const completed = new Promise<Result>(resolve => { finish = resolve })
     const turn: Turn = {
-      threadId, stop: false, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
+      threadId, stop: false, toolItems: 0, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
       ...(options.untrusted ? { untrusted: true as const } : {}),
     }
     this.sides.set(threadId, turn)
@@ -505,6 +578,198 @@ export class CodexSession {
     }
   }
 
+  /**
+   * Runs one member or guest turn on its own thread with the public profile
+   * (read-only, no approvals, no shell, no MCP, no dynamic tools, own folder).
+   * A saved thread is resumed with the same profile; one Codex lost starts fresh.
+   */
+  async runPublic(text: string, profile: PublicTurnProfile):
+    Promise<Result & { threadId: string; toolItems: number }> {
+    const threadId = await this.openPublicThread(profile)
+    return this.runPublicTurn(threadId, text, profile.cwd, profile.onThread, undefined, profile.cancelled)
+  }
+
+  /**
+   * The startup hook proof (multiuser-readiness.ts proveHookDenial): one turn on a fresh ephemeral
+   * thread of this public home with the public profile but the shell tool on, read-only and without
+   * approvals, so the model can make the one harmless call the permission hook must deny. The thread
+   * is never resumed or reused for a chat. `onCommandRan` hears of every command item that may have executed.
+   */
+  async runHookProof(cwd: string, prompt: string, onThread: (threadId: string) => void, onCommandRan: () => void):
+    Promise<Result & { threadId: string; toolItems: number }> {
+    const params = publicThreadParams(cwd, 'Ты проверочный поток: проверяется, что хук запрещает вызов инструмента.', 'disabled')
+    const reply = await this.rpc.request('thread/start', {
+      ...params, config: { ...object(params.config), 'features.shell_tool': true }, ephemeral: true,
+    })
+    const id = object(reply.thread).id
+    if (typeof id !== 'string' || !id || id === this.threadId || this.sideThreads.has(id) || this.publicThreads.has(id)) {
+      throw new Error('Codex did not return a hook proof thread ID')
+    }
+    this.proofThreads.add(id)
+    this.publicThreads.add(id)
+    return this.runPublicTurn(id, prompt, cwd, onThread, onCommandRan)
+  }
+
+  private async runPublicTurn(threadId: string, text: string, cwd: string, onThread?: (threadId: string) => void,
+    onCommandRan?: () => void, cancelled?: () => boolean): Promise<Result & { threadId: string; toolItems: number }> {
+    if (this.publicTurns.has(threadId)) throw new Error('This public thread is busy')
+    let finish!: Turn['finish']
+    const completed = new Promise<Result>(resolve => { finish = resolve })
+    const turn: Turn = {
+      threadId, stop: false, untrusted: true, toolItems: 0, lastText: '',
+      fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
+      ...(onCommandRan ? { onCommandRan } : {}),
+    }
+    this.publicTurns.set(threadId, turn)
+    onThread?.(threadId)
+    try {
+      // Stopped or cancelled while the thread opened: no turn starts at all.
+      if (turn.stop || cancelled?.()) return { status: 'interrupted', text: '', threadId, toolItems: 0 }
+      const response = await this.rpc.request('turn/start', {
+        threadId,
+        ...publicTurnParams(cwd),
+        input: [{ type: 'text', text, text_elements: [] }],
+      })
+      const id = object(response.turn).id
+      if (typeof id !== 'string') throw new Error('Codex did not return a public turn ID')
+      if (!turn.id) this.setTurnId(turn, id)
+      const result = await completed
+      return { ...result, threadId, toolItems: turn.toolItems }
+    } finally {
+      if (this.publicTurns.get(threadId) === turn) this.publicTurns.delete(threadId)
+    }
+  }
+
+  /** Interrupts the running public turn of this thread; true when there was one. */
+  async stopPublic(threadId: string): Promise<boolean> {
+    const turn = this.publicTurns.get(threadId)
+    if (!turn || turn.stop) return false
+    turn.stop = true
+    if (turn.id) await this.rpc.request('turn/interrupt', { threadId, turnId: turn.id })
+    return true
+  }
+
+  /** The role of a thread for the permission hook; only the bridge's own threads are known. */
+  threadRole(threadId: string): ThreadRole {
+    if (this.publicThreads.has(threadId)) return 'public'
+    if (threadId === this.threadId) return 'owner'
+    const side = this.sides.get(threadId)
+    if (side) return side.untrusted ? 'agent' : 'owner'
+    if (this.sideThreads.has(threadId)) return 'owner'
+    for (const turn of this.runningTurns()) {
+      if (turn.children.has(threadId)) return turn.untrusted ? 'agent' : 'owner'
+    }
+    return 'unknown'
+  }
+
+  /**
+   * threadRole for the permission hook, plus the subagent race: a subagent's first tool call can reach
+   * the hook before its turn/started put it in turn.children. Such a thread counts only when thread/read
+   * on this (the owner's) app-server shows a subagent spawned under exactly one running turn of this
+   * session, in its folder; it then takes that turn's role. A public thread lives on its own
+   * app-server and is never vouched for here.
+   */
+  async resolveThreadRole(threadId: string): Promise<ThreadRole> {
+    const known = this.threadRole(threadId)
+    if (known !== 'unknown') return known
+    if (!this.runningTurns().length) return 'unknown'
+    const read = await this.rpc.request('thread/read', { threadId, includeTurns: false }).catch(() => undefined)
+    // Rechecked after the await: the thread may have been registered or become public meanwhile.
+    const now = this.threadRole(threadId)
+    if (now !== 'unknown') return now
+    const thread = object(read?.thread)
+    const spawn = object(object(object(thread.source).subAgent).thread_spawn)
+    if (thread.id !== threadId || thread.cwd !== this.settings.cwd || typeof thread.parentThreadId !== 'string' ||
+        spawn.parent_thread_id !== thread.parentThreadId || typeof spawn.depth !== 'number' ||
+        !Number.isSafeInteger(spawn.depth) || spawn.depth < 1) return 'unknown'
+    const parents = this.runningTurns().filter(turn => turn.threadId === thread.sessionId &&
+      (spawn.depth !== 1 || turn.threadId === thread.parentThreadId))
+    if (parents.length !== 1) return 'unknown'
+    return parents[0]!.untrusted ? 'agent' : 'owner'
+  }
+
+  /**
+   * Startup and /doctor check: opens an ephemeral public thread and returns
+   * Codex's reply (sandbox, approvalPolicy, cwd) and what that thread can
+   * reach: MCP servers, skills and apps (connectors). A list RPC this Codex
+   * refuses comes back undefined; publicCapabilitiesProblem fails it closed.
+   */
+  async probePublicProfile(cwd: string): Promise<PublicProbe> {
+    const reply = await this.rpc.request('thread/start', {
+      ...publicThreadParams(cwd, 'Проверка профиля.', this.settings.publicWebSearch), ephemeral: true,
+    })
+    const id = object(reply.thread).id
+    if (typeof id !== 'string' || !id) return { reply, mcp: {} }
+    this.publicThreads.add(id)
+    const optional = (method: string, params: Record<string, unknown>) =>
+      this.rpc.request(method, params, 10_000).catch(() => undefined)
+    const [mcp, skills, apps, config] = await Promise.all([
+      this.mcpServerStatus(id),
+      optional('skills/list', { cwds: [cwd], forceReload: true }),
+      optional('app/list', { threadId: id }),
+      optional('config/read', { cwd, includeLayers: false }),
+    ])
+    return { reply, mcp, ...(skills ? { skills } : {}), ...(apps ? { apps } : {}), ...(config ? { config } : {}) }
+  }
+
+  // mcpServerStatus/list with every nextCursor page joined; {} on a refused page, a non-null
+  // nextCursor when there are more than MCP_STATUS_PAGES pages (both fail the check).
+  private async mcpServerStatus(threadId: string): Promise<Record<string, unknown>> {
+    const data: unknown[] = []
+    let cursor: unknown = null
+    for (let page = 0; page < MCP_STATUS_PAGES; page++) {
+      const params = typeof cursor === 'string' ? { threadId, cursor } : { threadId }
+      const reply = await this.rpc.request('mcpServerStatus/list', params, 10_000).catch(() => undefined)
+      if (!reply || !Array.isArray(reply.data)) return {}
+      data.push(...reply.data)
+      cursor = reply.nextCursor
+      if (cursor == null) return { data, nextCursor: null }
+      if (typeof cursor !== 'string' || !cursor) return {}
+    }
+    return { data, nextCursor: cursor }
+  }
+
+  private async openPublicThread(profile: PublicTurnProfile): Promise<string> {
+    const params = publicThreadParams(profile.cwd, profile.instructions, this.settings.publicWebSearch)
+    const saved = profile.threadId
+    if (saved && saved !== this.threadId && !this.sideThreads.has(saved) && !this.proofThreads.has(saved)) {
+      if (this.publicThreads.has(saved)) return saved
+      try {
+        const reply = await this.rpc.request('thread/resume', { ...params, threadId: saved, excludeTurns: true })
+        if (object(reply.thread).id === saved) {
+          await this.checkPublicThread(profile.cwd)
+          this.publicThreads.add(saved)
+          return saved
+        }
+      } catch (error) {
+        if (error instanceof PublicThreadRefused) throw error
+        this.settings.onWarning?.('Could not resume a public thread; it starts fresh')
+      }
+    }
+    const reply = await this.rpc.request('thread/start', params)
+    const id = object(reply.thread).id
+    if (typeof id !== 'string' || !id || id === this.threadId || this.sideThreads.has(id)) {
+      throw new Error('Codex did not return a public thread ID')
+    }
+    if (typeof reply.cwd === 'string' && reply.cwd !== profile.cwd) throw new PublicThreadRefused('Codex opened a public thread in another folder')
+    await this.checkPublicThread(profile.cwd)
+    this.publicThreads.add(id)
+    return id
+  }
+
+  // Before the first turn of a newly opened public thread: the skills Codex loads for its own
+  // folder must be exactly the role's allowlisted copies (a chat folder cannot bring its own).
+  private async checkPublicThread(cwd: string): Promise<void> {
+    const allow = this.settings.publicAllow
+    if (!allow) return
+    const skills = await this.rpc.request('skills/list', { cwds: [cwd], forceReload: true }, 10_000).catch(() => undefined)
+    const problem = publicSkillsProblem(skills, allow)
+    if (problem) {
+      this.settings.onWarning?.('A public thread was refused before its first turn: ' + problem)
+      throw new PublicThreadRefused(problem)
+    }
+  }
+
   // Interrupts every running side turn; true when there was one.
   async stopSide(): Promise<boolean> {
     const starting = [...this.startingSides].filter(side => !side.stop)
@@ -523,7 +788,9 @@ export class CodexSession {
       cwd: this.settings.cwd,
       ...this.permissions(),
       ...(model ? { model } : {}),
-      ...(this.settings.chatAction ? { dynamicTools: agentTools } : {}),
+      // A guest (untrusted) thread gets no client tool catalog: it could never call them (requestApproval refuses
+      // untrusted turns), and a tool it is not offered is a tool it cannot even try.
+      ...(this.settings.chatAction && !untrusted ? { dynamicTools: agentTools } : {}),
     })
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || id === this.threadId) throw new Error('Codex did not return a side thread ID')
@@ -596,7 +863,7 @@ export class CodexSession {
       let finish!: Turn['finish']
       const completed = new Promise<Result>(resolve => { finish = resolve })
       const turn: Turn = {
-        threadId, stop: false, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
+        threadId, stop: false, toolItems: 0, lastText: '', fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(), finish,
       }
       this.active = turn
       await start(threadId, turn)
@@ -726,12 +993,25 @@ export class CodexSession {
         }
       }
     }
+    // Public threads never reach the owner's progress, HUD or mirror, nor become subagents of an owner turn.
+    if (typeof event.params.threadId === 'string' && this.publicThreads.has(event.params.threadId)) {
+      const turn = this.publicTurns.get(event.params.threadId)
+      if (turn) this.receiveTurnEvent(turn, event.method, event.params, false)
+      return
+    }
     this.settings.onActivity?.(event, this.threadId)
     const { method, params } = event
     if (typeof params.threadId === 'string' && method !== 'thread/status/changed' &&
         (params.threadId === this.active?.threadId || params.threadId === this.goalTurn?.threadId ||
          method === 'turn/started' && params.threadId === this.threadId && this.settings.mayRunGoal?.(params.threadId))) {
       this.lastActivity = Date.now()
+    }
+    if (method === 'thread/tokenUsage/updated' && typeof params.threadId === 'string') {
+      try {
+        this.settings.onTokenUsage?.(params.threadId, params.tokenUsage)
+      } catch {
+        // Statistics only: a failing counter never affects the turn.
+      }
     }
     if (method === 'thread/tokenUsage/updated' && params.threadId === this.threadId) {
       const usage = object(params.tokenUsage)
@@ -760,7 +1040,7 @@ export class CodexSession {
       const threadId = params.threadId
       if (this.goalTurn?.id !== observedId) {
         this.goalTurn = {
-          threadId, id: observedId, lastText: '', stop: false,
+          threadId, id: observedId, lastText: '', stop: false, toolItems: 0,
           fileChanges: new Map(), children: new Map(), approvedPolicy: new Map(),
           finish: result => {
             if (this.goalTurn?.id === observedId) this.goalTurn = undefined
@@ -794,10 +1074,12 @@ export class CodexSession {
       if (active.id && params.turnId !== active.id) return
       const item = object(params.item)
       if (progress && typeof item.type === 'string') this.settings.onProgress?.(item.type)
+      if (typeof item.type === 'string' && !conversationItems.has(item.type)) active.toolItems++
       recordFileChange(active, item)
     } else if (method === 'item/completed') {
       if (active.id && params.turnId !== active.id) return
       const item = object(params.item)
+      if (commandRan(item)) active.onCommandRan?.()
       if (item.type !== 'agentMessage' || item.delivery === 'async' || typeof item.text !== 'string') return
       if (item.phase === 'final_answer') active.finalText = item.text
       else if (item.phase !== 'commentary') active.lastText = item.text
@@ -817,7 +1099,7 @@ export class CodexSession {
   }
 
   private runningTurns(): Turn[] {
-    return [this.active, this.goalTurn, ...this.sides.values()].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
+    return [this.active, this.goalTurn, ...this.sides.values(), ...this.publicTurns.values()].filter((turn): turn is Turn => !!turn?.id && !turn.stop)
   }
 
   private async approveInTurn(
@@ -849,6 +1131,8 @@ export class CodexSession {
   async requestPolicyApproval({ operation, ...request }: PolicyApprovalRequest): Promise<ApprovalDecision> {
     const approve = this.settings.approve
     if (!approve) return 'decline'
+    // A member or guest thread never reaches owner approval cards, running or not.
+    if (operation && this.publicThreads.has(operation.threadId)) return 'decline'
     if (!operation || !request.cwd) return approve(request)
     const matches = this.runningTurns().filter(turn => turn.threadId === operation.threadId)
       .flatMap(owner => [owner, ...owner.children.values()].filter(execution => execution.id === operation.turnId)

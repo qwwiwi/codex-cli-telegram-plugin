@@ -8,13 +8,14 @@ import { AppConfigSchema } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
 import { redactSecrets } from '../../src/safety/redact.js'
 import { createBrainBridge } from '../../src/codex/brain-bridge.js'
-import { hasMemoryCue } from '../../src/codex/brain-origin.js'
-import { sideOwnerTurn } from '../../src/codex/format-reminder.js'
+import { foreignProvenance, hasForeignReply, hasMemoryCue } from '../../src/codex/brain-origin.js'
+import { formatReminder, sideOwnerTurn } from '../../src/codex/format-reminder.js'
 import { CodexInbox } from '../../src/codex/inbox.js'
 import { prepareInbound } from '../../src/codex/media.js'
 import { hideLeaseCompletions } from '../../src/codex/lease.js'
 import { SideRegistry, sideInstructions, taskTitle } from '../../src/codex/parallel.js'
 import { agentBody, ownerProvenance } from '../../src/codex/provenance.js'
+import { RenderEyes, renderNote } from '../../src/codex/render-eyes.js'
 import { object } from '../../src/codex/rpc.js'
 import { CodexSession } from '../../src/codex/session.js'
 import { SideDeliveries, sideEndNotice } from '../../src/codex/side-delivery.js'
@@ -34,12 +35,13 @@ function section(start: string, end: string): string {
 const bindSide = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(`
   const { brain, codex, inbox, ownerId, sides, sideDeliveries, telegram, classifyTurn, ownerOrigin, redactSecrets, taskTitle,
     agentBody, SideStatusCard, sideFirstStage, sideThinking, sideInstructions, sideOwnerTurn, hasMemoryCue,
-    hideLeaseCompletions, sideEndNotice, warnError, sideDone, prepareMessages, sentReplies } = deps
+    hideLeaseCompletions, sideEndNotice, warnError, sideDone, prepareMessages, sentReplies, formatReminderOn, renderEyes,
+    foreignProvenance, hasForeignReply } = deps
   const brainScope = 'test', stopEpoch = 0, stopping = false, hudReady = false, goalActive = false
   const secrets = [], mainStartedAt = Date.now() - 180_000, ownerChat = String(ownerId)
   const plans = [{ content: 'Check the migration', status: 'in_progress' }]
   const sideCards = new Map()
-  const formatReminderOn = true, agentChatInstructions = '', chatContext = () => ''
+  const agentChatInstructions = '', chatContext = () => ''
   const log = { info: () => {} }, send = async () => {}
   const sendFinalText = async (text, _origin, _files, _replyTo, _inboxId, onSent) => {
     const delivered = await telegram.sendMessage(ownerChat, text, {})
@@ -49,6 +51,7 @@ const bindSide = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).trans
   }
   const recordBrainDelivery = async (ticket, outcome) => { if (ticket) await brain.turnDelivered(ticket, outcome) }
   const startNext = () => {}, resumeInbox = () => {}
+  const admission = { blocker: () => undefined }
   ${section('    const brainKey =', '    function brainRecovery(')}
   ${section('    function mainSummary()', '    function sideDone()')}
   ${section('    function launchSide(', '    // Owner Telegram input only.')}
@@ -93,7 +96,8 @@ async function withBusyMain(check: (fixture: {
   mainThread: string | null
   brain: ReturnType<typeof createBrainBridge>
   sentReplies: readonly number[]
-}) => Promise<void>, mainMessage: Message = ownerMessage(1, mainTitle)): Promise<void> {
+  renderEyes: RenderEyes
+}) => Promise<void>, mainMessage: Message = ownerMessage(1, mainTitle), formatReminderOn = true): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'server-side-brain-'))
   const rpcLog = join(root, 'rpc.jsonl')
   const brain = createBrainBridge({ brainHome: join(root, 'brain'), scope: 'test' })
@@ -107,6 +111,8 @@ async function withBusyMain(check: (fixture: {
   const telegram = fakeTelegramChat().raw
   const sideDeliveries = new SideDeliveries()
   const sentReplies: number[] = []
+  // The server's R42 eyes: the side path takes their pending note into an owner side turn.
+  const renderEyes = new RenderEyes({ secrets: [] })
   // The production Telegram preparation: it embeds a reply target into the turn text.
   const mediaDeps = {
     botApi: { api: { getFile: async () => { throw new Error('No downloads in this test') } } },
@@ -135,6 +141,7 @@ async function withBusyMain(check: (fixture: {
           brain, codex, inbox, ownerId, sides, sideDeliveries, telegram, classifyTurn, ownerOrigin, redactSecrets,
           taskTitle, agentBody, SideStatusCard, sideFirstStage, sideThinking, sideInstructions, sideOwnerTurn,
           hasMemoryCue, hideLeaseCompletions, sideEndNotice, sideDone: done.resolve, prepareMessages, sentReplies,
+          formatReminderOn, renderEyes, foreignProvenance, hasForeignReply,
           warnError: (error: unknown, text: string) => { errors.push(`${text}: ${String(error)}`) },
         })
         if (typeof launch !== 'function') throw new Error('Could not bind the server side callback')
@@ -144,7 +151,7 @@ async function withBusyMain(check: (fixture: {
       }
       const requests = (method: string) => readFileSync(rpcLog, 'utf8').trim().split('\n')
         .map(line => object(JSON.parse(line))).filter(entry => entry.method === method).map(entry => object(entry.params))
-      await check({ side, requests, mainThread: codex.currentThread, brain, sentReplies })
+      await check({ side, requests, mainThread: codex.currentThread, brain, sentReplies, renderEyes })
     } finally {
       await codex.stop()
       await main
@@ -164,6 +171,24 @@ test('[R02] default Brain gives an owner side turn the live main task title, ste
     await side(ownerMessage(2, 'How far along is the report?'))
     expect(prompt(requests('turn/start').at(-1))).toContain(`«${mainTitle}», текущий шаг: «Check the migration», идёт 3 мин.`)
   })
+})
+
+test('Brain owner side turns start with the same static guidance when the format reminder is off', async () => {
+  const prefixes: string[] = []
+  for (const title of [mainTitle, 'Review the release notes']) {
+    await withBusyMain(async ({ side, requests }) => {
+      await side(ownerMessage(2, 'How far along is it?'))
+      const text = prompt(requests('turn/start').at(-1))
+      if (typeof text !== 'string') throw new Error('The side turn did not send a prompt')
+      expect(text).not.toContain(formatReminder)
+      const summary = `\n«${title}», текущий шаг: «Check the migration», идёт `
+      expect(text).toContain(summary)
+      prefixes.push(text.slice(0, text.indexOf(summary)))
+    }, ownerMessage(1, title), false)
+  }
+  expect(prefixes[0]).toContain('Ответь на новое сообщение владельца сам и быстро')
+  expect(prefixes[0]).toContain('Рабочая папка общая')
+  expect(prefixes[1]).toBe(prefixes[0])
 })
 
 test('[R14] default Brain opens an owner side as an ephemeral fork and reuses it for an owner reply', async () => {
@@ -349,6 +374,40 @@ test('[R14] one provenance rule isolates every foreign marker on an incoming mes
       expect([marker, requests('thread/fork').length]).toEqual([marker, 0])
       expect(requests('thread/start')).toHaveLength(2)
       expectNeutralSummary(requests('turn/start').at(-1))
+    })
+  }
+})
+
+test('[R42] an owner side turn carries the pending render note once', async () => {
+  await withBusyMain(async ({ side, requests, renderEyes }) => {
+    // A previous reply whose HTML Telegram refused: it went out as plain text.
+    renderEyes.record({ source: 'Итог **важно**', parts: [{ format: 'plain', text: 'Итог **важно**', messageId: 90 }], brokenHtml: 1 })
+    const note = renderNote([{ kind: 'broken_tags', shown: 'простой текст', expected: 'форматирования: HTML-теги не сошлись', literal: false }])
+    await side(ownerMessage(2, 'How far along is the report?'))
+    expect(prompt(requests('turn/start').at(-1))).toContain(note)
+    // Once: the side turn took the note.
+    expect(renderEyes.takeNote()).toBe('')
+  })
+})
+
+test('[R42] with Brain off a forwarded or foreign-reply side turn neither sees nor takes the owner render note', async () => {
+  const note = renderNote([{ kind: 'broken_tags', shown: 'простой текст', expected: 'форматирования: HTML-теги не сошлись', literal: false }])
+  const foreign: Message[] = [
+    forwardedMessage(2, forwardedText),
+    telegramMessage({ ...ownerMessage(3, 'What do you think about it?'), reply_to_message: forwardedMessage(1, forwardedText) }),
+  ]
+  for (const message of foreign) {
+    await withBusyMain(async ({ side, requests, brain, renderEyes }) => {
+      // Brain off: the classification never isolates, so the note must be gated on provenance alone.
+      // The owner's `/memory off`: the bridge exposes no direct switch.
+      expect((await brain.memoryCommand({ args: 'off', ownerPrivateChat: true })).text).toBe('Brain выключен.')
+      expect(brain.enabled).toBe(false)
+      renderEyes.record({ source: 'Итог **важно**', parts: [{ format: 'plain', text: 'Итог **важно**', messageId: 90 }], brokenHtml: 1 })
+      await side(message)
+      const text = prompt(requests('turn/start').at(-1))
+      expect([message.message_id, typeof text === 'string' && text.includes(note)]).toEqual([message.message_id, false])
+      // The note waits for the owner's next own turn.
+      expect([message.message_id, renderEyes.takeNote()]).toEqual([message.message_id, note])
     })
   }
 })

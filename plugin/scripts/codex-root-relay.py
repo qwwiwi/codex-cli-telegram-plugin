@@ -14,6 +14,9 @@ MAX_MESSAGE = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_SPOOL_BYTES = 128 * 1024 * 1024
 MAX_SPOOL_IMAGES = 128
+# render_preview answers with its facts and one inline PNG; the data URL is capped well under MAX_MESSAGE.
+MAX_PREVIEW_URL = 4_000_000
+PREVIEW_URL = re.compile(r"data:image/png;base64,[A-Za-z0-9+/]+={0,2}")
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 THREAD_OPEN = {"thread/start", "thread/resume", "thread/fork"}
 CHAT_TOOL_CALL = "item/tool/call"
@@ -97,8 +100,23 @@ COMPONENT_TOOLS = [
         },
     },
 ]
+# R42: a PNG of how a message looks in Telegram, for the agent only. Match render-preview.ts (renderPreviewTool).
+RENDER_PREVIEW_TOOL = {
+    "type": "function",
+    "name": "render_preview",
+    "description": "Show yourself how a message looks in the owner's Telegram, as a PNG picture with the facts: "
+                   "message_id of a reply this bridge sent in this run, or text of a draft rendered the way the bridge sends it. "
+                   "Give exactly one of them. Sends nothing to Telegram.",
+    "inputSchema": {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "message_id": {"type": "integer", "minimum": 1},
+            "text": {"type": "string", "maxLength": 3900},
+        },
+    },
+}
 # The exact dynamicTools list a trusted thread is opened with. Match chat-actions.ts (agentTools).
-CHAT_TOOLS = [CHAT_TOOL, *COMPONENT_TOOLS]
+CHAT_TOOLS = [CHAT_TOOL, *COMPONENT_TOOLS, RENDER_PREVIEW_TOOL]
 CHAT_TOOLS_BY_NAME = {tool["name"]: tool for tool in CHAT_TOOLS}
 ALLOWED = {
     "initialize": {"clientInfo", "capabilities"},
@@ -340,6 +358,12 @@ def valid_chat_call(params, opened):
     properties = tool["inputSchema"]["properties"]
     if tool is CHAT_TOOL:
         known_choice = args.get("action") in properties["action"]["enum"]
+    elif tool is RENDER_PREVIEW_TOOL:
+        message_id, text = args.get("message_id"), args.get("text")
+        known_choice = len(args) == 1 and (
+            type(message_id) is int and message_id >= 1
+            or isinstance(text, str) and len(text) <= properties["text"]["maxLength"]
+        )
     else:
         known_choice = (args.get("component") in COMPONENT_NAMES
                         and ("data" not in args or isinstance(args["data"], dict)))
@@ -356,9 +380,17 @@ def valid_chat_result(result):
     if not isinstance(result, dict) or result.keys() != {"success", "contentItems"} or type(result["success"]) is not bool:
         return False
     items = result["contentItems"]
-    return (isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict)
+    return (isinstance(items, list) and len(items) in (1, 2) and isinstance(items[0], dict)
             and items[0].keys() == {"type", "text"} and items[0]["type"] == "inputText"
-            and isinstance(items[0]["text"], str) and 0 < len(items[0]["text"]) <= 8192)
+            and isinstance(items[0]["text"], str) and 0 < len(items[0]["text"]) <= 8192
+            and (len(items) == 1 or valid_preview_image(items[1])))
+
+
+def valid_preview_image(item):
+    # Only an inline PNG (render_preview): never a URL Codex would fetch.
+    return (isinstance(item, dict) and item.keys() == {"type", "imageUrl"} and item["type"] == "inputImage"
+            and isinstance(url := item["imageUrl"], str) and len(url) <= MAX_PREVIEW_URL
+            and PREVIEW_URL.fullmatch(url) is not None)
 
 
 def valid_turn_input(inputs, telegram_inbox, max_text_length):

@@ -138,3 +138,87 @@ test('[S9] boot guard: no record, a malformed record or a HEAD moved by hand cha
   expect(box.read()).toContain('phase=trial')
   expect(box.callLog()).toBe('')
 })
+
+// R29: a commit the guard had to roll back is marked bad, so automatic updates never try it again.
+const badFile = (repo: string) => join(repo, '.git', 'krotov-update-bad')
+const badList = (repo: string) => existsSync(badFile(repo)) ? readFileSync(badFile(repo), 'utf8').split('\n').filter(Boolean) : []
+
+test('[R29] boot guard: a failed trial is rolled back and its commit is marked bad once; an interrupted apply is not', () => {
+  const box = checkout()
+  box.write('trial', 1, 'outcome=crash\n')
+  expect(box.run().exitCode).toBe(0)
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.from)
+  expect(badList(box.repo)).toEqual([box.to])
+  // The same commit failing again is not listed twice.
+  git(box.repo, 'reset', '-q', '--hard', box.to)
+  box.write('trial', 1, 'outcome=watchdog\n')
+  expect(box.run().exitCode).toBe(0)
+  expect(badList(box.repo)).toEqual([box.to])
+
+  // A kill in the middle of /update is not the new commit's fault.
+  const applying = checkout()
+  applying.write('applying', 0)
+  expect(applying.run().exitCode).toBe(0)
+  expect(git(applying.repo, 'rev-parse', 'HEAD')).toBe(applying.from)
+  expect(badList(applying.repo)).toEqual([])
+})
+
+// R29: after its health mark the new commit stays on probation for 10 minutes; a third crash in it rolls back.
+function probation(box: ReturnType<typeof checkout>, extra: string, until = Math.floor(Date.now() / 1000) + 600) {
+  writeFileSync(join(box.repo, '.git', 'krotov-update-probation'), `v=1\nfrom=${box.from}\nto=${box.to}\nuntil=${until}\n${extra}`)
+}
+const probationText = (repo: string) => {
+  const path = join(repo, '.git', 'krotov-update-probation')
+  return existsSync(path) ? readFileSync(path, 'utf8') : ''
+}
+
+test('[R29] boot guard: the third crash of an updated commit within 10 minutes of its health mark rolls it back and marks it bad', () => {
+  const box = checkout()
+  probation(box, 'crashes=0\noutcome=crash\n')
+  expect(box.run().exitCode).toBe(0)
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.to)
+  expect(probationText(box.repo)).toContain('crashes=1')
+  expect(probationText(box.repo)).not.toContain('outcome=')
+  // A boot killed without recording its exit counts as a crash too.
+  expect(box.run().exitCode).toBe(0)
+  expect(probationText(box.repo)).toContain('crashes=2')
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.to)
+  probation(box, 'crashes=2\noutcome=watchdog\n')
+  const third = box.run()
+  expect(third.exitCode, third.stderr.toString()).toBe(0)
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.from)
+  expect(box.callLog()).toContain('install --frozen-lockfile --ignore-scripts')
+  expect(badList(box.repo)).toEqual([box.to])
+  // The old version tells the owner once, through the same record as a failed trial.
+  expect(box.read()).toContain('phase=rolled_back')
+  expect(box.read()).toContain(`to=${box.to}`)
+  expect(probationText(box.repo)).toBe('')
+})
+
+test('[R29] boot guard: clean stops and planned restarts on probation do not count; an expired probation is dropped', () => {
+  const box = checkout()
+  probation(box, 'crashes=2\noutcome=stop\n')
+  expect(box.run().exitCode).toBe(0)
+  probation(box, 'crashes=2\noutcome=planned\n')
+  expect(box.run().exitCode).toBe(0)
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.to)
+  expect(probationText(box.repo)).toContain('crashes=2')
+  probation(box, 'crashes=2\noutcome=crash\n', Math.floor(Date.now() / 1000) - 1)
+  expect(box.run().exitCode).toBe(0)
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.to)
+  expect(probationText(box.repo)).toBe('')
+  expect(badList(box.repo)).toEqual([])
+})
+
+test('[R29] boot guard: a probation rollback records itself before the reset, so a kill in the middle is finished on the next start', () => {
+  const box = checkout()
+  const root = resolve(box.repo, '..')
+  const seen = join(root, 'seen')
+  // A bun that shows what the pending record says while the rollback installs.
+  writeFileSync(join(root, 'bin', 'bun'), `#!/usr/bin/env bash\ncat "${join(box.repo, '.git', 'krotov-update-pending')}" >> "${seen}"\nexit 0\n`, { mode: 0o700 })
+  probation(box, 'crashes=2\noutcome=crash\n')
+  expect(box.run().exitCode).toBe(0)
+  expect(readFileSync(seen, 'utf8')).toContain('phase=applying')
+  expect(box.read()).toContain('phase=rolled_back')
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.from)
+})

@@ -1,7 +1,9 @@
 // Level 1 (spec §9, A2): `recent.md` holds the newest whole exchanges of the journal within a
 // byte budget; exchanges that no longer fit are evicted oldest first and queued in
 // `state/evicted.jsonl` for the rolling summary (S4). Nothing leaves `recent.md` without a
-// pending mark, and nothing is ever cut inside an entry.
+// pending mark, and nothing is ever cut inside an entry. Public-lane exchanges (members and
+// guests, `isPublicExchange`) stay in the journal as foreign but are neither held nor queued:
+// the window and its budget are the owner's alone.
 //
 // The window is computed from structured journal data, not by cutting rendered text: message
 // text may contain lines that look like entry headers (`### ...`), so a text-level trim could
@@ -21,7 +23,7 @@ import { z } from 'zod'
 import { Mutex, lockFor } from '../../../plugin/src/memory/_mutex.js'
 import {
   type Clock, type EvictedLine, EvictedLineSchema, type Exchange, formatRecentEntry, type JournalRef,
-  JournalRefSchema, parseJournalRef, type RecentReader,
+  JournalRefSchema, parseJournalRef, type RecentReader, TRUSTED_ORIGINS,
 } from '../contract.js'
 import { appendLine, writeFileAtomic } from '../store/atomic.js'
 import { utf8Bytes } from '../store/estimate.js'
@@ -32,6 +34,21 @@ import { renderRecent } from './render.js'
 
 /** Default byte budget of `recent.md`. */
 export const RECENT_MAX_BYTES = 16 * 1024
+
+/**
+ * The key segment of a public-lane exchange (a member or guest turn, KROT_MULTIUSER=1):
+ * `<scope>:public:<chat>:<message id>`. The bridge builds those keys with it (public-intake.ts).
+ */
+export const PUBLIC_KEY_SEGMENT = ':public:'
+
+/**
+ * A public-lane exchange: an untrusted origin under the public key segment. It stays in the journal
+ * as foreign, but never enters the owner's recent window or its eviction queue, so textless public
+ * metadata can never push owner exchanges out of the owner context. A trusted origin never counts.
+ */
+export function isPublicExchange(exchange: Pick<Exchange, 'key' | 'origin'>): boolean {
+  return exchange.key.includes(PUBLIC_KEY_SEGMENT) && !TRUSTED_ORIGINS.includes(exchange.origin)
+}
 
 const RecentStateSchema = z.object({ version: z.literal(1), after: JournalRefSchema.nullable() }).strict()
 
@@ -89,6 +106,7 @@ export function planRecent(paths: ScopePaths, maxBytes: number): RecentPlan {
   for (const day of journalDays(paths)) {
     if (markDay !== null && day < markDay) continue
     for (const exchange of foldDay(paths, day)) {
+      if (isPublicExchange(exchange)) continue
       if (mark === null || compareRefs(exchange.ref, mark) > 0) candidates.push(exchange)
     }
   }

@@ -1,7 +1,8 @@
 // Guards for the operator documentation: each test checks that a documented
 // behaviour, entry point or setting is described and matches the code.
 import { expect, test } from 'bun:test'
-import { existsSync, readFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { formatCodexLimitsLine } from '../src/status/codex-limits.js'
@@ -205,4 +206,56 @@ test('[S9] the architecture map names the self-update modules and the boot guard
   for (const name of ['restart-intent.ts', 'self-update.ts', 'codex-update.ts', 'update-commands.ts', 'watchdogs.ts', 'boot-guard.sh']) {
     expect(doc).toContain(name)
   }
+})
+
+test('[R38] AGENT_INSTALL.md walks a Codex agent from a repo link to a tested install, and both READMEs link it', () => {
+  const guide = read('AGENT_INSTALL.md')
+  for (const step of ['git clone', './install.sh', 'bun test', '/doctor tests', 'codex login status', 'bun --version']) {
+    expect(guide).toContain(step)
+  }
+  // A visible placeholder instead of a token: the agent never asks for the secret in chat.
+  expect(guide).toContain('<BOT_TOKEN_FROM_BOTFATHER>')
+  expect(guide).toMatch(/## \d+\. Report back to your owner/)
+  expect(guide).not.toMatch(/\d{6,}:[A-Za-z0-9_-]{30,}/)
+  expect(read('README.md')).toContain('](AGENT_INSTALL.md)')
+  expect(read('README.ru.md')).toContain('](AGENT_INSTALL.md)')
+})
+
+test('[R29] the automatic update settings are documented with their defaults', () => {
+  const install = read('plugin/docs/install.md')
+  expect(install).toContain('KROT_AUTO_UPDATE=1')
+  expect(install).toContain('KROT_AUTO_UPDATE_HOURS')
+  expect(install).toContain('/cc update')
+  expect(install).toContain('krotov-update-bad')
+})
+
+test('[R38] AGENT_INSTALL.md saves the token from a hidden prompt into a fresh private file, never into an existing one', () => {
+  const guide = read('AGENT_INSTALL.md')
+  const snippet = /```bash\n([^`]*read -rs[^`]*)```/.exec(guide)?.[1]
+  if (!snippet) throw new Error('no token snippet in AGENT_INSTALL.md')
+  const home = mkdtempSync(join(tmpdir(), 'krot-token-'))
+  try {
+    // A ~/bot-token from an earlier attempt, readable by everyone.
+    const existing = join(home, 'bot-token')
+    writeFileSync(existing, 'old\n')
+    chmodSync(existing, 0o644)
+    const result = Bun.spawnSync(['bash', '-c', snippet + 'printf "TOKEN_FILE=%s\\n" "$TOKEN_FILE"\n'], {
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home },
+      stdin: Buffer.from('123:secret\n'), stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(0)
+    // The snippet never writes into a file that already exists.
+    expect(readFileSync(existing, 'utf8')).toBe('old\n')
+    const path = /TOKEN_FILE=(.+)\n/.exec(result.stdout.toString())?.[1] ?? ''
+    expect(path.startsWith(join(home, 'bot-token.'))).toBe(true)
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+    expect(readFileSync(path, 'utf8')).toBe('123:secret\n')
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+  // The token is typed where neither history nor ps sees it; the installer gets the path, then the file goes.
+  expect(guide).not.toMatch(/(?:printf|echo)[^\n]*<BOT_TOKEN_FROM_BOTFATHER>/)
+  const install = guide.indexOf('--token-file <TOKEN_FILE>')
+  expect(install).toBeGreaterThan(-1)
+  expect(guide.indexOf('rm -f -- <TOKEN_FILE>')).toBeGreaterThan(install)
 })

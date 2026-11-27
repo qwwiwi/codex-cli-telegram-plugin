@@ -32,6 +32,8 @@
 
 The installer targets Linux with systemd. Run every step as the ordinary (non-root) user that will own the bot.
 
+**Install with an agent.** Give Codex the repository link and ask it to follow [AGENT_INSTALL.md](AGENT_INSTALL.md): it checks the prerequisites, clones, runs `./install.sh`, runs `bun test` and `/doctor tests`, and reports back. Russian: отправьте агенту ссылку на репозиторий и попросите выполнить [AGENT_INSTALL.md](AGENT_INSTALL.md).
+
 **1. Prepare the tools.** Install `git`, `curl`, `jq`, then [Bun](https://bun.com/docs/installation) and [Codex CLI](https://developers.openai.com/codex/cli). Check `bun --version` and `codex --version`.
 
 **2. Sign in to Codex** with your ChatGPT account (device code flow, works on a server without a browser):
@@ -107,7 +109,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 | Command | What it does |
 |---|---|
 | `/help` | list of commands |
-| `/status` | session state, current step, model, context use, queue, mirror and approval state |
+| `/status` | session state, current step, model, context use, prompt-cache share of input (`Кеш: 93% входа`, this thread and the last 24 hours), queue, mirror and approval state |
 | `/stop` | interrupt the current turn (and parallel side turns) |
 | `/new` | start a new Codex conversation; stops a running task first |
 | `/reset force` | start a new conversation when nothing runs (`/reset` alone asks for `force`) |
@@ -123,7 +125,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 | `/edit <text>` | replace the text of a bot message you reply to |
 | `/get` | hand an attachment from the quoted message to Codex |
 | `/usage [1\|7\|30]` | Token usage and UTC daily trends from local Codex logs. Defaults to seven days. See [usage analytics](docs/usage-analytics.md). |
-| `/doctor` | self-check: runs `doctor`, fetches the GitHub repository (`KROT_UPDATE_REMOTE`, default `public` if present else `origin`; `KROT_UPDATE_BRANCH`, default `main`) and reports commits behind/ahead, local edits (file names only), `bun.lock` vs `node_modules` drift, the Codex CLI version and the [error journal](#error-journal) (errors of the last 24 hours and 7 days, the last 5); `/doctor fix` hands the report to Codex to fix what is safe, without restarting the bridge mid-turn |
+| `/doctor` | self-check: runs `doctor`, fetches the GitHub repository (`KROT_UPDATE_REMOTE`, default `public` if present else `origin`; `KROT_UPDATE_BRANCH`, default `main`) and reports commits behind/ahead, local edits (file names only), `bun.lock` vs `node_modules` drift, the Codex CLI version, the [error journal](#error-journal) (errors of the last 24 hours and 7 days, the last 5) and the prompt-cache share (a problem when under 70% of at least 200k input tokens of the last 24 hours came from the cache); `/doctor fix` hands the report to Codex to fix what is safe, without restarting the bridge mid-turn; `/doctor tests` runs a short smoke set (settings parse, Telegram `getMe` for the expected bot, Codex App Server handshake, hooks pack, writable state directory) and prints pass or fail per check |
 
 `/help`, `/status`, `/stop`, `/reset` and `/new` can be switched off in `config.json` (`commands` block). Unknown `/cc <name>` commands are read from `KROT_CODEX_COMMANDS_DIR` when it is set.
 

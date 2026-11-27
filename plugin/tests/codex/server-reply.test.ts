@@ -1,12 +1,16 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, unlinkSync } from 'node:fs'
 import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Writable } from 'node:stream'
 
 import type { SendDocumentOpts, SendMessageOpts, TelegramApi } from '../../src/channel/tools.js'
 import { normalizeChatReply } from '../../src/codex/continuation.js'
+import { ErrorJournal } from '../../src/codex/error-log.js'
+import { ownerTurn, stableTurnPrefix } from '../../src/codex/format-reminder.js'
 import { CodexInbox } from '../../src/codex/inbox.js'
+import { RenderEyes } from '../../src/codex/render-eyes.js'
 import type { PartStatus } from '../../src/codex/reply-delivery.js'
 import { bridgeOrigin, mainOrigin, storedOrigin, type TurnOrigin } from '../../src/codex/turn-origin.js'
 import * as chunk from '../../src/format/chunk.js'
@@ -16,11 +20,12 @@ import { splitLongBlock, splitLongBlockLegacy } from '../../src/format/paragraph
 import { createLogger } from '../../src/log.js'
 import { validateTelegramHtml } from '../../src/safety/html-validator.js'
 import { detectOpenQuestion } from '../../src/safety/open-question.js'
-import { Outbox } from '../../src/safety/outbox.js'
+import { Outbox, type OutboxItem } from '../../src/safety/outbox.js'
 import { parse429 } from '../../src/safety/rate-limited-telegram-api.js'
 import { redactSecrets } from '../../src/safety/redact.js'
 import { classifySendError } from '../../src/safety/reliable-telegram-api.js'
-import { redactOutboundText } from '../../src/safety/safe-telegram-api.js'
+import { createSafeTelegramApi, redactOutboundText } from '../../src/safety/safe-telegram-api.js'
+import { fakeTelegramChat } from './fake-telegram-chat.js'
 
 const owner = 42
 const id = 7
@@ -64,7 +69,7 @@ const bindReplies = new Function('dependencies', new Bun.Transpiler({ loader: 't
     isTelegramHtmlParseError, normalizeChatReply, validateTelegramHtml, splitLongBlock, splitLongBlockLegacy,
     splitMessageLegacy, splitMessage, splitMessageFrom, splitPlainFallback, plainTextWithLinks,
     redactedRenderOffset, resumeMessagePlan, protectPlainFallbackCuts, TELEGRAM_MAX_MESSAGE, PreformattedDocumentError,
-    join, tmpdir, mkdtemp, writeFile, unlink, rmdir, ownerChat, outbox, parse429, detectOpenQuestion
+    join, tmpdir, mkdtemp, writeFile, unlink, rmdir, ownerChat, outbox, parse429, detectOpenQuestion, renderEyes
   } = dependencies
   const sendsAsRich = () => false
   const config = { richMessages: { enabled: false } }
@@ -80,7 +85,15 @@ const bindReplies = new Function('dependencies', new Bun.Transpiler({ loader: 't
   const { sendReply } = {
     ${section(server, '      sendReply: (source, target)', '      autonomy:')}
   }
-  return { sendFinalText, sendReply, sendTextDocument }
+  // The outbox's delivery callback, with its Brain, status and question effects stubbed.
+  const brain = { recover: async () => null }
+  const recordBrainDelivery = async () => {}
+  const warnError = () => {}
+  const work = { repost: () => {} }
+  const parseTurnOrigin = () => undefined
+  let onDeferredDelivery
+  ${section(server, '    onDeferredDelivery = (item, id) => {', '    function chatContext(')}
+  return { sendFinalText, sendReply, sendTextDocument, onDeferredDelivery }
 `))
 
 interface ReplyCallbacks {
@@ -88,21 +101,23 @@ interface ReplyCallbacks {
     onSent?: (id: number) => void, brainKey?: string): Promise<boolean>
   sendReply(source: string, target?: number): Promise<{ messageId: number }>
   sendTextDocument(api: Pick<TelegramApi, 'sendDocument'>, chat: string, body: string, target?: number): Promise<unknown>
+  onDeferredDelivery(item: Readonly<OutboxItem>, messageId: number): void
 }
 
 function hasReplyCallbacks(value: unknown): value is ReplyCallbacks {
   return typeof value === 'object' && value !== null &&
     'sendFinalText' in value && typeof value.sendFinalText === 'function' &&
     'sendReply' in value && typeof value.sendReply === 'function' &&
-    'sendTextDocument' in value && typeof value.sendTextDocument === 'function'
+    'sendTextDocument' in value && typeof value.sendTextDocument === 'function' &&
+    'onDeferredDelivery' in value && typeof value.onDeferredDelivery === 'function'
 }
 
 function delivery(inbox: CodexInbox, secrets: readonly string[], telegram: Partial<TelegramApi>,
-  warn: (message: string) => void = () => {}, outbox?: Outbox): ReplyCallbacks {
+  warn: (message: string) => void = () => {}, outbox?: Outbox, renderEyes = new RenderEyes({ secrets })): ReplyCallbacks {
   const replies: unknown = bindReplies({ inbox, secrets, telegram, log: { warn }, ownerChat: String(owner), ...chunk,
     classifySendError, redactOutboundText, redactSecrets, markdownToTelegramHtml, isTelegramHtmlParseError,
     normalizeChatReply, validateTelegramHtml, splitLongBlock, splitLongBlockLegacy, splitMessageLegacy,
-    join, tmpdir, mkdtemp, writeFile, unlink, rmdir, outbox, parse429, detectOpenQuestion })
+    join, tmpdir, mkdtemp, writeFile, unlink, rmdir, outbox, parse429, detectOpenQuestion, renderEyes })
   if (!hasReplyCallbacks(replies)) throw new Error('Could not bind reply callbacks')
   return replies
 }
@@ -326,4 +341,125 @@ test('a reply document forwards the owner reply flag even without a quote', asyn
     return { message_id: 51 }
   } }, String(owner), 'text')
   expect(uploads).toEqual([{ filename: 'reply.txt', ownerReply: true }])
+})
+
+// R42 «eyes»: what the owner saw after a send, diffed against the model's text.
+function eyesFixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'krot-render-eyes-test-'))
+  const journal = new ErrorJournal({ dir })
+  const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
+  const log = createLogger('render', { stream: quiet,
+    sink: (level, name, message, context) => journal.record(level, name, message, context) })
+  const history = join(dir, 'render-diffs.json')
+  const eyes = new RenderEyes({ log, secrets: [], file: history })
+  const journaled = (): unknown[] => readdirSync(dir).filter(name => name.startsWith('errors-'))
+    .flatMap(name => readFileSync(join(dir, name), 'utf8').split('\n').filter(Boolean))
+    .map((line): unknown => JSON.parse(line))
+  return { eyes, journaled, history, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+}
+// The eyes write their journal lines and history after the send path returned (one macrotask later).
+const diagnosticsWritten = (): Promise<void> => new Promise(resolve => setImmediate(resolve))
+
+test('[R42] a degraded final reply is journaled as a warn and noted once in the next owner turn', async () => {
+  const { eyes, journaled, cleanup } = eyesFixture()
+  try {
+    // The renderer escapes `&amp;` and leaves a bold span across lines unconverted: the owner sees both raw.
+    const source = 'Итог: Tom &amp; Jerry.\n\nЭто **важно\nочень** сейчас.'
+    const { inbox } = readyReply(source, {})
+    const sent: string[] = []
+    await delivery(inbox, [], { async sendMessage(_chat, text) {
+      sent.push(text)
+      return { message_id: 100 }
+    } }, undefined, undefined, eyes).sendFinalText(source, origin, false, id, id)
+    expect(sent).toHaveLength(1)
+    await diagnosticsWritten()
+    expect(journaled()).toEqual([expect.objectContaining({ level: 'warn', area: 'render', status: 'raw_markup', messageId: 100 })])
+    const note = eyes.takeNote()
+    expect(note).toContain('в прошлом ответе Telegram показал «&amp;» вместо «&»')
+    // Two raw spans of one kind: the note names the kind once.
+    expect(note.match(/вместо/g)).toHaveLength(1)
+    // The note goes after the stable cache prefix, into the volatile part of the next turn.
+    const turn = ownerTurn(true, [note, 'Следующий вопрос'])
+    expect(turn.startsWith(stableTurnPrefix(true, '') + '\n\n' + note)).toBe(true)
+    // Once per degradation: the turn after that carries no note.
+    expect(eyes.takeNote()).toBe('')
+  } finally { cleanup() }
+})
+
+test('[R42] a clean final reply leaves no note and no render warning', async () => {
+  const { eyes, journaled, cleanup } = eyesFixture()
+  try {
+    const source = 'Обычный **жирный** текст.\n\nВторой абзац с `<b>` в коде.'
+    const { inbox } = readyReply(source, {})
+    await delivery(inbox, [], { async sendMessage() { return { message_id: 101 } } }, undefined, undefined, eyes)
+      .sendFinalText(source, origin, false, id, id)
+    await diagnosticsWritten()
+    expect(journaled()).toEqual([])
+    expect(eyes.takeNote()).toBe('')
+    expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [101], formats: ['HTML'], degradations: [] })])
+  } finally { cleanup() }
+})
+
+test('[R42] an interim reply is recorded in the format and text the outbound sanitizer delivered', async () => {
+  const eyes = new RenderEyes({ secrets: [] })
+  const source = '<b class="demo">Example</b>'
+  // The premise: the rendered HTML fails the pre-send validator, so the safe wrapper sends it without parse_mode.
+  expect(validateTelegramHtml(markdownToTelegramHtml(source)).downgraded).toBe(true)
+  const { inbox } = readyReply(source, {})
+  const chat = fakeTelegramChat()
+  const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
+  const safe = createSafeTelegramApi(chat.raw, createLogger('test', { stream: quiet }), [])
+  const { messageId } = await delivery(inbox, [], safe, undefined, undefined, eyes).sendReply(source)
+  expect(chat.texts()).toEqual(['Example'])
+  // Recorded as what the owner got: plain «Example», a refused HTML part, not the HTML the wrapper was handed.
+  expect(eyes.shown(messageId)).toEqual({ format: 'plain', text: 'Example', messageId })
+  expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [messageId], formats: ['plain'],
+    degradations: [{ kind: 'broken_tags', code: 'html_refused' }] })])
+})
+
+test('[R42] a reply deferred by a flood wait is recorded when the outbox delivers it, with its message ID', async () => {
+  const eyes = new RenderEyes({ secrets: [] })
+  const source = 'Итог: **готово**.'
+  const { dir, inbox } = readyReply(source, {})
+  const flushed: string[] = []
+  let replies: ReplyCallbacks | undefined
+  const outbox = new Outbox({ stateDir: dir, log: createLogger('test'), now: () => 0,
+    sendFn: async (_chat, text) => { flushed.push(text); return { message_id: 77 } },
+    // The production wiring: Outbox.onDelivered -> onDeferredDelivery.
+    onDelivered: (item, messageId) => replies?.onDeferredDelivery(item, messageId) })
+  replies = delivery(inbox, [], { async sendMessage() { throw { error_code: 429, parameters: { retry_after: 5 } } } },
+    undefined, outbox, eyes)
+  expect(await replies.sendFinalText(source, origin, false, id)).toBe(true)
+  // Queued, not shown: nothing is recorded before Telegram took the reply.
+  expect(eyes.recent()).toEqual([])
+  await outbox.flushDue(5_000)
+  expect(flushed).toHaveLength(1)
+  expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [77], formats: ['HTML'], degradations: [] })])
+  const [sentText] = flushed
+  if (typeof sentText !== 'string') throw new Error('The outbox did not send the deferred reply')
+  expect(eyes.shown(77)).toEqual({ format: 'HTML', text: sentText, messageId: 77 })
+})
+
+test('[R42] a transport rejection reaches the caller before the eyes write their journal line and history', async () => {
+  const { eyes, journaled, history, cleanup } = eyesFixture()
+  try {
+    const source = 'Итог **важно**'
+    const { inbox } = readyReply(source, {})
+    const reply = delivery(inbox, [], { async sendMessage(_chat, _text, options) {
+      // Telegram refuses the HTML, then the plain fallback hits a transport failure.
+      if (options.parse_mode === 'HTML') throw new Error("can't parse entities")
+      throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' })
+    } }, undefined, undefined, eyes)
+    let atCaller: { error: string; journal: number; history: boolean } | undefined
+    await reply.sendFinalText(source, origin, false, id).catch((error: unknown) => {
+      atCaller = { error: String(error), journal: journaled().length, history: existsSync(history) }
+    })
+    // No fsync of the journal or the history ran between the failure and its caller.
+    expect(atCaller).toEqual({ error: 'Error: offline', journal: 0, history: false })
+    // The diff itself is in memory at once (the next turn's note does not wait for the disk).
+    expect(eyes.recent()).toEqual([expect.objectContaining({ degradations: [{ kind: 'broken_tags', code: 'html_refused' }] })])
+    await diagnosticsWritten()
+    expect(journaled()).toEqual([expect.objectContaining({ level: 'warn', area: 'render', status: 'broken_tags' })])
+    expect(existsSync(history)).toBe(true)
+  } finally { cleanup() }
 })

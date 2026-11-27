@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -183,4 +183,64 @@ test('[R72] a model switch saves the model and its effort in one write, so a fai
   expect([saved.model, saved.effort]).toEqual(['gpt-mini', undefined])
   expect([controls.model, controls.effort]).toEqual(['gpt-mini', undefined])
   expect(writes).toEqual([])
+})
+
+test('the model/list result is cached for at most 10 minutes and refreshed when the model menu is opened', async () => {
+  const { messages, tap } = fixture()
+  let now = Date.UTC(2026, 10, 26, 10)
+  let calls = 0
+  const root = mkdtempSync(join(tmpdir(), 'krot-model-cache-'))
+  dirs.push(root)
+  const telegram = {
+    async sendMessage(_chat: string, text: string, options: SendMessageOpts) {
+      messages.push({ id: messages.length + 1, text, keyboard: options.reply_markup })
+      return { message_id: messages.length }
+    },
+    async editMessageText() {},
+  }
+  const menu = new ModelMenu({
+    ownerId: OWNER, chat: String(OWNER), telegram, controls: new ControlState(root, false), efforts: true,
+    models: async () => { calls++; return models }, now: () => now,
+  })
+  await menu.choose('gpt-mini')
+  await menu.choose('gpt-main')
+  expect(calls).toBe(1)
+  now += 9 * 60_000
+  await menu.choose('gpt-mini')
+  expect(calls).toBe(1)
+  now += 60_000
+  await menu.choose('gpt-mini')
+  expect(calls).toBe(2)
+  // A tap on /cc → «Модель» always asks the App Server again, and the buttons reuse that fresh list.
+  await menu.open()
+  expect(calls).toBe(3)
+  const message = messages.at(-1)
+  if (!message) throw new Error('model menu did not send a message')
+  expect(await tap(menu, message, 'gpt-plain')).toBe('Модель: gpt-plain')
+  expect(calls).toBe(3)
+})
+
+test('a wall-clock rollback does not extend the model/list cache lifetime', async () => {
+  const { controls } = fixture()
+  const telegram = { async sendMessage() { return { message_id: 1 } }, async editMessageText() {} }
+  let calls = 0
+  const menu = new ModelMenu({
+    ownerId: OWNER, chat: String(OWNER), telegram, controls, efforts: true,
+    models: async () => { calls++; return models },
+  })
+  const wallClock = spyOn(Date, 'now').mockReturnValue(1_800_000_000_000)
+  const monotonicClock = spyOn(performance, 'now').mockReturnValue(1000)
+  try {
+    await menu.choose('gpt-mini')
+    wallClock.mockReturnValue(1_799_999_000_000)
+    monotonicClock.mockReturnValue(1000 + 10 * 60_000 - 1)
+    await menu.choose('gpt-mini')
+    expect(calls).toBe(1)
+    monotonicClock.mockReturnValue(1000 + 10 * 60_000)
+    await menu.choose('gpt-mini')
+    expect(calls).toBe(2)
+  } finally {
+    monotonicClock.mockRestore()
+    wallClock.mockRestore()
+  }
 })

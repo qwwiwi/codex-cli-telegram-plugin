@@ -235,3 +235,55 @@ test('[S9] a committed restart command restarts even when Telegram never answers
     expect(acks).toHaveLength(1)
   }
 })
+
+test('[R29] an automatic update never applies while a turn, a queue or another command runs', async () => {
+  for (const overrides of [{ busy: () => true }, { turnActive: () => true }, { trialPending: () => true }]) {
+    const h = harness(overrides)
+    expect(await h.commands.applyWhenIdle(plan)).toEqual({ kind: 'busy' })
+    expect(h.events).toEqual([])
+    expect(h.commands.maintenance()).toBe(false)
+  }
+  let release: () => void = () => undefined
+  const h = harness({ selfUpdate: { ...harness().commands.deps.selfUpdate,
+    check: () => new Promise(resolve => { release = () => resolve(plan) }) } })
+  const manual = h.commands.handle('update', 'check', 1)
+  expect(await h.commands.applyWhenIdle(plan)).toEqual({ kind: 'busy' })
+  release()
+  await manual
+})
+
+test('[R29] an idle automatic update applies, records the attempt, tells the owner and restarts without an owner message', async () => {
+  const attempts: unknown[] = []
+  const h = harness({ recordAttempt: attempt => { attempts.push(attempt) } })
+  expect(await h.commands.applyWhenIdle(plan)).toEqual({ kind: 'restarting' })
+  expect(h.events).toEqual(['apply', 'send', 'restart:update:-'])
+  expect(h.sent.at(-1)).toContain('Автообновление')
+  expect(attempts).toEqual([{ trigger: 'auto', result: 'applied', from: plan.from, to: plan.to }])
+  // The admitted restart keeps the reservation: no owner turn starts before the process exits.
+  expect(h.commands.maintenance()).toBe(true)
+})
+
+test('[R29] a failed automatic apply releases the reservation and records why', async () => {
+  const attempts: unknown[] = []
+  const h = harness({
+    recordAttempt: attempt => { attempts.push(attempt) },
+    selfUpdate: { ...harness().commands.deps.selfUpdate,
+      apply: async () => ({ ok: false, stage: 'tsc', detail: 'error TS2322', restored: true }) },
+  })
+  expect(await h.commands.applyWhenIdle(plan)).toEqual({ kind: 'failed', detail: 'проверка типов (tsc): error TS2322', restored: true })
+  expect(h.commands.maintenance()).toBe(false)
+  expect(attempts).toEqual([{ trigger: 'auto', result: 'apply_failed', from: plan.from, to: plan.to, detail: 'проверка типов (tsc): error TS2322' }])
+})
+
+test('[R29] a manual /update is recorded as the last update attempt for /doctor', async () => {
+  const attempts: unknown[] = []
+  const h = harness({ recordAttempt: attempt => { attempts.push(attempt) } })
+  await h.commands.handle('update', '', 7)
+  expect(attempts).toEqual([{ trigger: 'manual', result: 'applied', from: plan.from, to: plan.to }])
+})
+
+test('[R29] an applied automatic update whose restart is refused reports it installed, not failed', async () => {
+  const h = harness({ restart: () => ({ ok: false, reason: 'loop' }) })
+  expect(await h.commands.applyWhenIdle(plan)).toEqual({ kind: 'installed' })
+  expect(h.commands.maintenance()).toBe(false)
+})

@@ -9,7 +9,8 @@ import { FileJournalWriter, type JournalWriterOptions } from './writer.js'
 
 export { compareRefs, FileJournalReader, foldDay, foldLines, journalDays, parseJournalText, readDayLines } from './fold.js'
 export {
-  evictionMark, FileRecent, planRecent, readEvicted, RECENT_MAX_BYTES, type RecentOptions, type RecentPlan,
+  evictionMark, FileRecent, isPublicExchange, planRecent, PUBLIC_KEY_SEGMENT, readEvicted, RECENT_MAX_BYTES,
+  type RecentOptions, type RecentPlan,
   recentStatePath, refreshRecentLocked,
 } from './recent.js'
 export { renderExchange, renderRecent } from './render.js'

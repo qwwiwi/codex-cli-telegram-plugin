@@ -50,9 +50,11 @@ The live product. `rpc.ts` starts app-server and speaks JSON-RPC. `session.ts` m
 - `side-delivery.ts`: what a side turn delivered through its tools, counted per turn ID; a turn that answered that way and ends without text gets no "no answer" notice
 - `side-status.ts`: the status card of an owner side turn: a silent reply to the message sent the moment it is routed («Параллельно: слушаю голосовое…» while a voice is transcribed, then «Параллельно: думаю…»), edited with the side thread's progress at most every 3 s and deleted once the side turn ended; a queued message gets «В очереди: возьму после «<title>»» as a silent reply
 - `error-log.ts`: `errorDetail` (name, code and a description with credential headers, key=value pairs, JSON credential fields, URL queries and long opaque tokens masked) and the daily error journal `<state dir>/errors-YYYY-MM-DD.jsonl` (`KROT_ERROR_LOG_DAYS`), read by `/doctor`
+- `cache-stats.ts`: prompt-cache share of Codex input per thread and for 24 hours from `thread/tokenUsage/updated` (`<state dir>/codex-cache-stats.json`), shown by `/status` and `/doctor`
 - `work-status.ts`, `mirror.ts`: the status bubble and the optional live mirror
 - `commands.ts`, `chat-actions.ts`, `lease.ts`, `learning.ts`: commands and their helpers
 - `components.ts`: widget components for the model (`send_component`, `update_component`, `component_schema`), see [Widget components](#widget-components)
+- `render-eyes.ts`, `render-preview.ts`: what the owner saw after each send against the model's text, the next-turn note and the `render_preview` tool, see [Render eyes](#render-eyes-r42)
 - `restart-bridge.ts`, `restart-handoff.ts`, `continuation.ts`: self-restart and continuation of unfinished tasks
 - `exit-codes.ts`: exit-code contract with the unit (0 stop, 1 crash, 75 planned restart, 78 fatal config, no restart; `<state dir>/fatal.json`)
 - `boot-ledger.ts`: `<state dir>/boot-ledger.json`, one record per start; restart chain, startup backoff, health mark (first `getUpdates`, Codex handshake, 120 s uptime)
@@ -61,7 +63,8 @@ The live product. `rpc.ts` starts app-server and speaks JSON-RPC. `session.ts` m
 - `restart-intent.ts`: `<state dir>/restart-intent.json`, written before every planned restart (exit 75); an owner message restarts the bridge once, and the third restart without a new owner message within 300 s is refused
 - `update-commands.ts`: `/restart` (reply, then exit 75) and `/update` [`check` | `rollback` | `codex`], plus the plain phrase «обнови кодекс»
 - `self-update.ts`: `/update` in-process: fetch the upstream branch (or `KROT_UPDATE_BRANCH`), refuse a dirty tree, fast-forward only, `bun install --frozen-lockfile`, `tsc`, then exit 75. The trial record `<git dir>/krotov-update-pending` (key=value) is completed at the health mark. No cgroup escape is needed: every step finishes before the bridge exits on its own, and the bridge never calls `systemctl restart` on its unit
-- `plugin/scripts/boot-guard.sh`: `ExecStartPre=-` of the unit, bash only; the boot after a trial that never reached the health mark (or after an interrupted `/update`) runs `git reset --keep <from>` and `bun install --frozen-lockfile`, and the old version tells the owner
+- `plugin/scripts/boot-guard.sh`: `ExecStartPre=-` of the unit, bash only; the boot after a trial that never reached the health mark (or after an interrupted `/update`) runs `git reset --keep <from>` and `bun install --frozen-lockfile`, and the old version tells the owner. After the health mark the commit stays on probation for 10 minutes (`<git dir>/krotov-update-probation`): its third crash rolls it back as well. A commit rolled back for its own failed boots goes to `<git dir>/krotov-update-bad`
+- `auto-update.ts`: opt-in automatic update (`KROT_AUTO_UPDATE=1`, every `KROT_AUTO_UPDATE_HOURS`, default 6) and `/cc update`: fetch, skip a bad commit, check the new commit in `<state dir>/update-stage` (locked install, `bun test`, build, doctor), then `UpdateCommands.applyWhenIdle` applies and restarts only while no turn runs. The last attempt is kept in `<state dir>/update-attempt.json` for `/doctor`
 - `codex-update.ts`: `/update codex`: `codex --version` vs `npm view @openai/codex version`, the changelog from developers.openai.com (then GitHub release notes), `npm install -g --prefix <home prefix>`, an App Server handshake plus `model/list`, the previous version back on failure; then exit 75 so `/cc` → Модель lists the new models
 - `watchdogs.ts`: a shutdown that hangs exits after 45 s with its exit code; a boot that is not ready within 180 s exits 75
 - `pin-service.ts`: deletes the bot's own "pinned a message" service messages
@@ -103,6 +106,7 @@ Markdown to Telegram HTML, message splitting and Rich Message payloads. Used dir
 - `chunk.ts`: `splitMessage`
 - `paragraphs.ts`: `splitLongBlock`, the paragraph safety net for a long final answer without blank lines
 - `rich.ts`: `contentFitsRichLimits` (32768 UTF-8 bytes), `buildRichMessagePayload`
+- `render-png.ts`: `renderTelegramPng`, the Telegram-like PNG behind `render_preview` (bitmap font, no image dependency)
 
 ### `hooks/`
 
@@ -369,6 +373,17 @@ A sent component becomes a known message for `telegram_action`, so the model can
 
 **Root relay.** `plugin/scripts/codex-root-relay.py` admits exactly this tool list (`CHAT_TOOLS`) on `thread/start` and checks each call's arguments against it. When the tools change, update both catalogs; a test compares them.
 
+## Render eyes (R42)
+
+After every send to the owner (final, side and interim replies) the bridge records what Telegram shows and diffs it against the model's text (`codex/render-eyes.ts`): the parts with their format (`HTML`, `plain`, `document`, `rich`) and message IDs, blank-line separators that vanished, and at most one degradation per kind: `raw_markup` (an escaped entity, a tag, `**`, `~~` or a Markdown escape shown as characters outside code), `broken_tags` (an HTML part refused by the validator or by Telegram, sent as plain text), `dropped_markup` (a reply sent as a `.txt` file, or formatted text sent plain) and `split_mid_block` (a code block, quote or line cut between two messages).
+
+- Each degradation is a `warn` in area `render` (kind and message ID only, no text), so it lands in the error journal. The journal line and the history file are written one macrotask after the send path returned (`setImmediate`), so their fsync never delays a delivery result or a transport rejection; a write failure is itself a `render` warn.
+- A reply whose parts the outbox queued after a flood wait is recorded when the outbox delivered its last queued part (`onDeferredDelivery` → `RenderEyes.delivered`), with the message IDs Telegram gave them; a part queued by an earlier bridge run is not recorded.
+- The next owner or side turn gets one short note, «в прошлом ответе Telegram показал X вместо Y», once per kind, after the stable prefix (so the prompt-cache prefix stays byte-identical). Guest-isolated turns get none.
+- `/doctor` lists the last 5 diffs; `<state dir>/render-diffs.json` keeps the last 20 as metadata only: formats, message IDs, collapsed blank lines and per degradation its kind and a fixed code from a closed list (`tag:b`, `entity:amp`, `bold`, `split:code`, an unknown tag as bare `tag`), never the reply's text. The offending markup (at most 24 characters, masked like the journal) stays in memory for the next-turn note; sent parts stay in memory for `render_preview`. Neither is written to disk.
+
+`render_preview` (`codex/render-preview.ts`) is a fourth client-owned tool of trusted threads: with `message_id` (a reply this bridge run sent) or `text` (a draft, rendered through the same renderer, chunker and validator as a final reply) it returns the facts as JSON plus a Telegram-like PNG (`format/render-png.ts`: a 5×7 bitmap font for ASCII and Cyrillic, any other character drawn as a box, a PNG written with `node:zlib`; no image dependency). It sends nothing to Telegram. The root relay admits its result only as text plus one `data:image/png;base64` URL.
+
 ## Parallel threads
 
 Off by default; on with `KROT_CODEX_PARALLEL=1` (`codex/parallel.ts`). While the main turn, a goal or a Codex turn runs, `routeWhileBusy` sorts each new owner message:
@@ -497,6 +512,8 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_CODEX_COMMANDS_DIR` | `codex/server.ts` | folder with custom prompt commands for `/cc <name>` |
 | `KROT_UPDATE_REMOTE` | `codex/doctor-command.ts` | Git remote where `/doctor` looks up the branch ref with `git ls-remote` to compare it with the installed commit; default `public` if present, else `origin` |
 | `KROT_UPDATE_BRANCH` | `codex/doctor-command.ts` | branch of that remote `/doctor` compares with; default `main` |
+| `KROT_AUTO_UPDATE` | `codex/auto-update.ts` | `1` arms the automatic update timer; any other value or unset leaves it off (`/cc update` still checks on demand) |
+| `KROT_AUTO_UPDATE_HOURS` | `codex/auto-update.ts` | hours between automatic update checks; default 6, at least 1 |
 | `KROT_CODEX_LEARNING` | `codex/server.ts` | `1` turns on learning memory and `/memory` ([plugin/docs/learning.md](../plugin/docs/learning.md)) |
 | `KROT_CODEX_LEARNING_INTERVAL` | `codex/server.ts` | turns between background reviews (1 to 30, default 10) |
 | `KROT_CODEX_LEARNING_AUTO_SAVE` | `codex/server.ts` | `1` saves learning suggestions as approved without waiting for `/memory approve` |

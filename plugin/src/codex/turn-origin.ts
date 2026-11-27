@@ -123,6 +123,16 @@ export function classifyTurn(messages: readonly Message[], ownerId: number, send
   return owner(fields)
 }
 
+/**
+ * A member or guest message (KROT_MULTIUSER=1): always a guest's and isolated, whether Brain is on or not.
+ * classifyTurn is the owner inbox's classifier; a public-lane input never goes through it, so it can never
+ * become an OwnerTurnOrigin, write owner memory or fork the owner's main thread.
+ */
+export function userTurnOrigin(message: Message, ownerId: number, key: string): ForeignTurnOrigin {
+  const item = classifyBrainOrigin(message, ownerId, { guest: true })
+  return foreign({ key, messageId: message.message_id, origin: item.origin, inputKind: item.inputKind }, 'guest', true)
+}
+
 /** The owner's own words of a turn for the journal: a confirmed transcript, or the joined texts and captions. */
 export function ownerWords(messages: readonly Message[], confirmedVoice?: string): string | undefined {
   if (confirmedVoice?.trim()) return confirmedVoice
