@@ -25,6 +25,8 @@ export async function reviewLearning(
 export async function requestStructured(
   cwd: string, env: NodeJS.ProcessEnv, prompt: string, schema: Record<string, unknown>, signal: AbortSignal,
   model?: string, command?: readonly [string, ...string[]],
+  // Reasoning effort of the turn (turn/start `effort`); undefined: the model default.
+  effort?: string,
 ): Promise<string> {
   const completed = Promise.withResolvers<string | undefined>()
   let threadId: string | undefined
@@ -84,6 +86,7 @@ export async function requestStructured(
     threadId = thread.id
     const result = await rpc.request('turn/start', {
       threadId, input: [{ type: 'text', text: prompt, text_elements: [] }], outputSchema: schema,
+      ...(effort ? { effort } : {}),
     })
     const turn = object(result.turn)
     if (typeof turn.id !== 'string') throw new Error('Review turn was not started')

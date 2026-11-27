@@ -19,7 +19,7 @@ usage() {
   cat <<'HELP'
 Использование
   ./install.sh [--start] [--agent-name NAME] [--workspace PATH] [--state-dir PATH]
-               [--approval-mode never|standard|risky] [--no-memories]
+               [--approval-mode never|standard|risky] [--hooks | --no-hooks] [--no-memories]
   ./install.sh --non-interactive --token-file PATH [--owner-id ID | --pair-code CODE] [--start]
   ./install.sh --dry-run
 
@@ -30,7 +30,12 @@ usage() {
 --approval-mode never (по умолчанию для новой установки): агент работает автономно, без карточек подтверждения.
 --approval-mode standard включает карточки Codex для действий за пределами песочницы.
 --approval-mode risky пропускает обычную диагностику и оставляет карточки для действий с риском.
---no-memories отключает настройку памяти Codex по умолчанию для новой установки.
+--no-memories отключает настройку встроенной памяти Codex по умолчанию для новой установки.
+--hooks ставит пакет хуков Codex: защита от опасных команд, удаление только с бэкапом, git-гейт,
+  контроль хода и поддержка памяти. Ставится по умолчанию при любой установке; --no-hooks отключает.
+Режим never получает полный доступ (KROT_CODEX_SANDBOX=danger-full-access) только после того,
+  как защита установлена от root: установщик печатает одну строку sudo install, выполни её и
+  запусти ./install.sh --hooks ещё раз. Запускай мост под отдельным пользователем без sudo.
 --start включает пользовательскую службу и автозапуск. Нужен вход в Codex через ChatGPT.
 HELP
 }
@@ -42,6 +47,8 @@ token_file=''
 pair_code=''
 approval_mode=''
 memories_default=1
+hooks=''
+fresh=0
 while (( $# )); do
   case $1 in
     --owner-id|--token-file|--workspace|--state-dir|--agent-name|--pair-code|--approval-mode)
@@ -62,6 +69,8 @@ while (( $# )); do
       shift 2 ;;
     --start) start=1; shift ;;
     --no-memories) memories_default=0; shift ;;
+    --hooks) hooks=1; shift ;;
+    --no-hooks) hooks=0; shift ;;
     --dry-run) dry_run=1; shift ;;
     --non-interactive) non_interactive=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -74,10 +83,12 @@ if (( dry_run )); then
   if [[ -n $approval_mode ]]; then printf 'Режим подтверждений: %s\n' "$approval_mode"
   else printf '%s\n' 'Режим подтверждений новой установки: never.'; fi
   if (( memories_default )); then
-    printf '%s\n' 'Память Codex для новой установки: включена при отсутствии явной настройки.'
+    printf '%s\n' 'Встроенная память Codex: при выключенном Brain и отсутствии явной настройки память включена.'
   else
-    printf '%s\n' 'Память Codex для новой установки: используется настройка самого Codex.'
+    printf '%s\n' 'Встроенная память Codex: используется настройка самого Codex.'
   fi
+  if [[ $hooks == 1 ]]; then printf '%s\n' 'Хуки Codex будут установлены.'
+  elif [[ -z $hooks ]]; then printf '%s\n' 'Хуки Codex ставятся по умолчанию (--no-hooks отключает).'; fi
   if (( start )); then printf '%s\n' 'После успешного doctor служба будет включена.'; fi
   exit 0
 fi
@@ -89,6 +100,7 @@ env_file=$plugin_dir/.env
 unit_name=krotov-telegram.service
 unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 unit_file=$unit_dir/$unit_name
+failed_unit_name=krotov-telegram-failed.service
 
 private_dir() {
   local path=$1
@@ -105,9 +117,11 @@ telegram_api() {
 
 tmp_env=''
 tmp_unit=''
+tmp_failed_unit=''
 cleanup() {
   if [[ -n $tmp_env ]]; then rm -f -- "$tmp_env"; fi
   if [[ -n $tmp_unit ]]; then rm -f -- "$tmp_unit"; fi
+  if [[ -n $tmp_failed_unit ]]; then rm -f -- "$tmp_failed_unit"; fi
 }
 trap cleanup EXIT
 
@@ -125,6 +139,7 @@ if [[ -e $env_file || -L $env_file ]]; then
     printf 'Режим подтверждений: %s\n' "$approval_mode"
   fi
 else
+  fresh=1
   workspace=$(private_dir "$workspace")
   state=$(private_dir "$state")
   [[ $workspace != / && $state != / && $state != "$workspace" && $state != "$workspace/"* ]] ||
@@ -190,6 +205,8 @@ else
     # An autonomous agent by default: no approval cards. KROT_CODEX_APPROVALS=1 stays,
     # so switching to standard or risky is one line.
     printf 'KROT_CODEX_APPROVALS=1\nKROT_CODEX_APPROVAL_MODE=%s\n' "${approval_mode:-never}"
+    # Full access (never mode) is written later by the hooks installer, and only once it sees the
+    # managed guards active: never before the protection runs.
     # The working bubble streams the agent's redacted reasoning summaries; 0 turns it off.
     printf 'TELEGRAM_STATUS_THOUGHTS=1\n'
     printf 'KROT_CODEX_MEMORIES_DEFAULT=%s\n' "$memories_default"
@@ -223,6 +240,35 @@ fi
 
 cd "$plugin_dir"
 setup_install_deps
+
+# Codex hooks pack: on by default for every install (the guards protect the autonomous agent);
+# --no-hooks skips it.
+if [[ -z $hooks ]]; then hooks=1; fi
+if [[ $hooks == 1 ]]; then
+  printf '%s\n' 'Устанавливаю хуки Codex.'
+  hooks_args=(--env-file "$env_file")
+  full_access=0
+  if [[ $approval_mode == never ]]; then
+    full_access=1
+  elif [[ -z $approval_mode ]]; then
+    full_access=$("$setup_bun" --no-env-file --env-file="$env_file" -e '
+      const { KROT_CODEX_APPROVAL_MODE: mode, KROT_CODEX_SANDBOX: sandbox } = process.env;
+      if (mode === "never" && (sandbox === undefined || sandbox === "danger-full-access")) process.stdout.write("1");
+    ')
+  fi
+  if [[ $full_access == 1 ]]; then hooks_args+=(--full-access); fi
+  "$setup_bun" --no-env-file run "$setup_repo/codex-hooks/src/install.ts" "${hooks_args[@]}" ||
+    setup_fail 'Не удалось записать хуки Codex. Проверь права на ~/.codex.'
+  if ! grep -qx 'KROT_CODEX_HOOKS=1' "$env_file"; then
+    # A fresh install leaves tmp_env as a hard link of plugin/.env: drop it before reusing the name.
+    if [[ -n $tmp_env ]]; then rm -f -- "$tmp_env"; fi
+    tmp_env=$(mktemp "$plugin_dir/.env.XXXXXXXX")
+    awk '!/^[[:space:]]*(export[[:space:]]+)?KROT_CODEX_HOOKS[[:space:]]*=/' "$env_file" > "$tmp_env"
+    printf 'KROT_CODEX_HOOKS=1\n' >> "$tmp_env"
+    mv -fT -- "$tmp_env" "$env_file"
+    tmp_env=''
+  fi
+fi
 "$setup_bun" --no-env-file build src/codex/server.ts --target=bun >/dev/null ||
   setup_fail 'Не удалось собрать мост. Проверь полноту клона и зависимости.'
 "$setup_bun" run doctor || setup_fail 'Исправь замечания doctor и повтори установку. Настройки уже сохранены.'
@@ -235,19 +281,80 @@ unit_escape() {
   printf '%s' "${text//\"/\\\"}"
 }
 
+# The unit runs a copy of the boot guard kept outside the checkout, so an update that deletes or
+# breaks plugin/scripts/boot-guard.sh can still be rolled back; the bridge refreshes it after a healthy update.
+# The bridge reads its state directory from plugin/.env; on a rerun that is the one to use.
+env_state=$(sed -n 's/^TELEGRAM_STATE_DIR="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$env_file" | tail -n 1)
+if [[ -n $env_state ]]; then state=$env_state; fi
+[[ -d $state ]] || setup_fail "Нет папки состояния $state из plugin/.env."
+guard_copy=$state/boot-guard.sh
+install -m 600 -- "$plugin_dir/scripts/boot-guard.sh" "$guard_copy.tmp"
+mv -f -- "$guard_copy.tmp" "$guard_copy"
+echo "Скопировал проверку запуска в $guard_copy."
+
+# The units earlier installers generated for this same checkout: such a unit is ours and is replaced
+# by the current contract; any other existing unit is the owner's and stays untouched.
+write_legacy_units() {
+  local path_line exec_line
+  path_line=$(printf 'Environment="PATH=%s"' "$(unit_escape "$(dirname -- "$setup_bun"):$(dirname -- "$(command -v codex)"):/usr/local/bin:/usr/bin:/bin")")
+  exec_line=$(printf 'ExecStart="%s" run start' "$(unit_escape "$setup_bun")")
+  # Before v0.3.2: no restart contract at all.
+  printf '%s\n' '[Unit]' 'Description=Krotov Plugin Telegram bridge for Codex' '[Service]' 'Type=simple' \
+    "WorkingDirectory=${plugin_dir//%/%%}" "$path_line" "$exec_line" \
+    'Restart=on-failure' 'RestartSec=10s' 'UMask=0077' '[Install]' 'WantedBy=default.target' > "$1"
+  # v0.3.2 before this change: the guard ran from inside the checkout.
+  printf '%s\n' '[Unit]' 'Description=Krotov Plugin Telegram bridge for Codex' \
+    'StartLimitIntervalSec=300' 'StartLimitBurst=6' "OnFailure=$failed_unit_name" '[Service]' 'Type=simple' \
+    "WorkingDirectory=${plugin_dir//%/%%}" "$path_line" \
+    "$(printf 'ExecStartPre=-/bin/bash "%s"' "$(unit_escape "$plugin_dir/scripts/boot-guard.sh")")" \
+    'TimeoutStartSec=300' "$exec_line" \
+    'Restart=on-failure' 'RestartSec=10s' 'RestartForceExitStatus=75' 'SuccessExitStatus=75' \
+    'RestartPreventExitStatus=78' 'TimeoutStopSec=90' 'UMask=0077' '[Install]' 'WantedBy=default.target' > "$2"
+}
+
 # Keep the user service on the exact checkout, including paths with spaces.
 install -d -- "$unit_dir"
 tmp_unit=$(mktemp "$unit_dir/.krotov-telegram.XXXXXXXX")
 {
-  printf '%s\n' '[Unit]' 'Description=Krotov Plugin Telegram bridge for Codex' '[Service]' 'Type=simple'
+  # Exit codes (plugin/src/codex/exit-codes.ts): 75 planned restart, 78 fatal config (no restart).
+  # 6 starts in 300 s stop a crash loop; the failed unit then tells the owner once.
+  printf '%s\n' '[Unit]' 'Description=Krotov Plugin Telegram bridge for Codex' \
+    'StartLimitIntervalSec=300' 'StartLimitBurst=6' "OnFailure=$failed_unit_name" '[Service]' 'Type=simple'
   printf 'WorkingDirectory=%s\n' "${plugin_dir//%/%%}"
   printf 'Environment="PATH=%s"\n' "$(unit_escape "$(dirname -- "$setup_bun"):$(dirname -- "$(command -v codex)"):/usr/local/bin:/usr/bin:/bin")"
+  # Rolls back a /update whose trial boot never became healthy (plugin/scripts/boot-guard.sh).
+  printf 'ExecStartPre=-/bin/bash "%s"\n' "$(unit_escape "$guard_copy")"
+  # The guard's rollback runs bun install inside the start; the default 90 s can cut it off.
+  printf '%s\n' 'TimeoutStartSec=300'
   printf 'ExecStart="%s" run start\n' "$(unit_escape "$setup_bun")"
-  printf '%s\n' 'Restart=on-failure' 'RestartSec=10s' 'UMask=0077' '[Install]' 'WantedBy=default.target'
+  printf '%s\n' 'Restart=on-failure' 'RestartSec=10s' 'RestartForceExitStatus=75' 'SuccessExitStatus=75' \
+    'RestartPreventExitStatus=78' 'TimeoutStopSec=90' 'UMask=0077' '[Install]' 'WantedBy=default.target'
 } > "$tmp_unit"
+# The failure notifier is ours alone, so it is always rewritten to match this checkout.
+tmp_failed_unit=$(mktemp "$unit_dir/.krotov-telegram-failed.XXXXXXXX")
+{
+  printf '%s\n' '[Unit]' 'Description=Tell the Krotov bridge owner that the service stopped restarting' '[Service]' 'Type=oneshot'
+  printf 'ExecStart=/bin/bash "%s" "%s"\n' "$(unit_escape "$plugin_dir/scripts/notify-failed.sh")" "$(unit_escape "$plugin_dir/.env")"
+} > "$tmp_failed_unit"
+chmod 644 -- "$tmp_failed_unit"
+mv -f -- "$tmp_failed_unit" "$unit_dir/$failed_unit_name"
+tmp_failed_unit=''
 chmod 644 -- "$tmp_unit"
+legacy_old=$(mktemp "$unit_dir/.krotov-telegram-legacy.XXXXXXXX")
+legacy_guard=$(mktemp "$unit_dir/.krotov-telegram-legacy.XXXXXXXX")
+write_legacy_units "$legacy_old" "$legacy_guard"
+legacy=0
+if [[ -f $unit_file && ! -L $unit_file ]] && { cmp -s -- "$legacy_old" "$unit_file" || cmp -s -- "$legacy_guard" "$unit_file"; }; then
+  legacy=1
+fi
+rm -f -- "$legacy_old" "$legacy_guard"
 if [[ ! -e $unit_file && ! -L $unit_file ]]; then
   ln -- "$tmp_unit" "$unit_file" || setup_fail 'Не удалось создать файл службы.'
+elif (( legacy )); then
+  cp -f -- "$unit_file" "$unit_file.bak"
+  mv -f -- "$tmp_unit" "$unit_file"
+  tmp_unit=''
+  printf 'Обновил файл службы %s до нового порядка перезапусков (прежний сохранён в %s.bak).\n' "$unit_file" "$unit_file"
 elif [[ -L $unit_file ]] || ! cmp -s -- "$tmp_unit" "$unit_file"; then
   printf 'Сохранил существующий файл службы %s.\n' "$unit_file"
   (( ! start )) || setup_fail 'Для автозапуска сначала проверь существующий файл службы и путь к этой копии.'

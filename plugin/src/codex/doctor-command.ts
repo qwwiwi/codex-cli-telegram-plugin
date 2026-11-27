@@ -2,19 +2,59 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
 
+import type { BrainStatus } from '../../../codex-brain/src/contract.js'
+import { checkHooksPack, HOOKS_CHECK_PREFIX, managedListing, managedSourcePath, packCommand, type ListedHook, type PackPaths } from '../../../codex-hooks/src/install.js'
 import { redactSecrets } from '../safety/redact.js'
+import { readBootSummary, type BootSummary } from './boot-ledger.js'
 import { type ErrorEntry, type ErrorSummary, repeatedWarnLimit } from './error-log.js'
+import { readFatal, type FatalFile } from './exit-codes.js'
+import type { PendingUpdate } from './self-update.js'
+import type { CodexUpdateRecord } from './codex-update.js'
+import { OWNER_INSTRUCTIONS_CHECK_PREFIX } from './owner-instructions-lock.js'
 
 // The /doctor Telegram command: the doctor script's self-check plus a comparison of the installed
-// bridge with its GitHub repository and the recent entries of the bridge's error journal. Read-only:
-// it never edits files, it only fetches the remote.
+// bridge with its GitHub repository and the recent entries of the bridge's error journal.
 
-export interface DoctorCheck { status: 'ok' | 'warning' | 'error'; message: string }
+export interface DoctorCheck { status: 'ok' | 'info' | 'warning' | 'error'; message: string }
 export interface DoctorProblem { text: string; fix?: string }
 export interface DoctorReport {
   problems: DoctorProblem[]; commit?: string; upstream?: string; codexVersion?: string
+  upstreamInfo?: string
+  localStatusInfo?: string
+  /** Passed and informational Codex hook checks, shown as fact lines. */
+  hooks?: string
+  brain?: string
+  /** Owner instruction lock facts, including when the check does not apply. */
+  ownerInstructions?: string[]
   /** A fact line with the error journal's counts when none of its entries counts as a problem. */
   errorJournal?: string
+  /** A fact line: the Codex version the last /update codex replaced, kept for /update codex rollback. */
+  codexPrevious?: string
+  /** A fact line from <state>/boot-ledger.json: boots, unhealthy chain, last exit code, safe-mode flag (S11). */
+  boot?: string
+  /** A fact line about <state>/fatal.json, the record of the last stop on a configuration error (S11). */
+  fatal?: string
+}
+
+// A time a state file holds as an invalid date or one out of the Date range is shown as unavailable, not thrown.
+function utcMinute(at: number | string): string {
+  const date = new Date(at)
+  if (Number.isNaN(date.getTime())) return 'время недоступно'
+  return date.toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
+}
+
+/** The boot ledger as a /doctor fact line. */
+export function bootLine(summary: BootSummary): string {
+  const exit = summary.lastExit ? `код ${summary.lastExit.code} (${utcMinute(summary.lastExit.at)})` : 'не записан'
+  return `Журнал запусков: ${summary.boots}, неудачных подряд: ${summary.chain}; последний выход: ${exit}; ` +
+    `безопасный режим: ${summary.safe ? 'да' : 'нет'}.`
+}
+
+/** <state>/fatal.json as a /doctor fact line. */
+export function fatalLine(fatal: FatalFile | 'missing' | 'unreadable'): string {
+  if (fatal === 'missing') return 'fatal.json нет: остановок из-за ошибки настройки не записано.'
+  if (fatal === 'unreadable') return 'fatal.json есть, но не читается.'
+  return `fatal.json: последняя остановка из-за ошибки настройки ${utcMinute(fatal.at)}: ${fatal.reason}.`
 }
 
 const journalTextMax = 200
@@ -56,7 +96,7 @@ export function errorJournalProblem(summary: ErrorSummary): DoctorProblem {
 // so the default compares nothing; a caller passes one once the docs name it.
 const documentedMinimumCodexVersion: string | undefined = undefined
 
-const doctorLabels: Record<string, DoctorCheck['status']> = { OK: 'ok', 'ВНИМАНИЕ': 'warning', 'ОШИБКА': 'error' }
+const doctorLabels: Record<string, DoctorCheck['status']> = { OK: 'ok', 'ИНФО': 'info', 'ВНИМАНИЕ': 'warning', 'ОШИБКА': 'error' }
 const refName = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/
 const secretSegment = /^(?:\.?secrets?|\.env.*|.*\.env|.*\.(?:key|pem|p12|pfx)|credentials.*|id_(?:rsa|ed25519|ecdsa|dsa).*)$/i
 const listedFiles = 10
@@ -164,7 +204,7 @@ export function dependencyDrift(plugin: string): DoctorProblem | undefined {
   return { text: `Установленные зависимости не совпадают с plugin/bun.lock: ${names}.`, fix }
 }
 
-function localEdits(porcelain: string): DoctorProblem | undefined {
+function localEdits(porcelain: string, secrets: readonly string[]): DoctorProblem | undefined {
   const entries = porcelain.split('\0')
   const names: string[] = []
   let hidden = 0
@@ -175,7 +215,9 @@ function localEdits(porcelain: string): DoctorProblem | undefined {
     const path = entry.slice(3)
     if (path.split('/').filter(Boolean).some(segment => secretSegment.test(segment))) hidden++
     // Quoted as data: a file name may carry newlines or text that reads like an instruction.
-    else names.push(JSON.stringify(path))
+    // Redacted before quoting: JSON escapes a quote or backslash inside a secret, and the escaped
+    // form no longer matches the exact value the report redactor looks for.
+    else names.push(JSON.stringify(redactSecrets(path, secrets)))
   }
   if (!names.length && !hidden) return undefined
   const shown = names.slice(0, listedFiles)
@@ -195,15 +237,52 @@ export interface DoctorOptions {
   env: Record<string, string | undefined>
   doctor: () => Promise<DoctorCheck[]>
   codexVersion?: () => Promise<string | undefined>
+  brain?: () => Promise<BrainStatus>
   minimumCodexVersion?: string
+  /** Configured secret values, masked in local file names before the names are quoted. */
+  secrets?: readonly string[]
   /** The error journal's recent entries; reading it must not throw. */
   errors?: () => ErrorSummary
+  /** The /update trial record (S9); reading it must not throw. */
+  pendingUpdate?: () => Promise<PendingUpdate | undefined>
+  /** The /update codex record (<state>/codex-update.json); reading it must not throw. */
+  codexUpdate?: () => CodexUpdateRecord | undefined
+  /** The bridge state directory: boot-ledger.json and fatal.json are read from it. */
+  stateDir?: string
 }
 
-async function compareWithGitHub(repo: string, env: DoctorOptions['env'], report: DoctorReport): Promise<void> {
-  const gitEnv = safeEnv({ GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' })
-  const git = (args: string[], timeout = 15_000) => run(['git', ...args], repo, timeout, gitEnv)
-  const head = await git(['rev-parse', '--short', 'HEAD'])
+/** The /update codex record as a /doctor fact (finished) or problem (cut off and not repaired). */
+export function codexUpdateLine(record: CodexUpdateRecord): { fact: string } | { problem: DoctorProblem } {
+  if (record.phase === 'done') {
+    return { fact: `Прежняя версия Codex ${record.previous} сохранена после /update codex (сейчас ${record.target}); вернуть: /update codex rollback.` }
+  }
+  return { problem: {
+    text: `Обновление Codex ${record.previous} → ${record.target} прервалось (этап ${record.phase}).`,
+    fix: 'Перезапустите мост (/restart): при запуске он вернёт целую версию. Если не поможет, на сервере: npm install -g @openai/codex@' + record.previous,
+  } }
+}
+
+/** An unfinished or failed /update as a /doctor problem (S11). */
+export function pendingUpdateProblem(pending: PendingUpdate): DoctorProblem {
+  const range = pending.from.slice(0, 12) + ' → ' + pending.to.slice(0, 12)
+  if (pending.phase === 'rollback_failed') {
+    return {
+      text: `Обновление ${range} не заработало, и автоматический откат не завершился.`,
+      fix: 'На сервере в папке моста проверьте git status, затем git reset --keep ' + pending.from.slice(0, 12) +
+        ' и (cd plugin && bun install --frozen-lockfile), потом перезапустите службу.',
+    }
+  }
+  return {
+    text: `Обновление ${range} ещё проверяется (этап ${pending.phase}).`,
+    fix: 'Подождите пару минут: если новая версия не заработает, мост сам вернёт прежнюю. Откат вручную: /update rollback.',
+  }
+}
+
+async function compareWithGitHub(repo: string, env: DoctorOptions['env'], report: DoctorReport,
+  secrets: readonly string[]): Promise<void> {
+  const gitEnv = safeEnv({ GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', LC_ALL: 'C' })
+  const git = (args: string[], timeout = 15_000) => run(['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', ...args], repo, timeout, gitEnv)
+  const head = await git(['rev-parse', 'HEAD'])
   if (head.code !== 0) {
     report.problems.push({
       text: 'Папка моста не является git-копией, сравнить её с GitHub нельзя.',
@@ -211,17 +290,26 @@ async function compareWithGitHub(repo: string, env: DoctorOptions['env'], report
     })
     return
   }
-  report.commit = head.stdout.trim()
-  await compareRemote(git, env, report)
+  const headId = head.stdout.trim()
+  const short = await git(['rev-parse', '--short', headId])
+  report.commit = short.code === 0 ? short.stdout.trim() : headId
+  const partial = await git(['config', '--get-regexp', '^(extensions\\.partialclone|remote\\..*\\.promisor)$'])
+  const fullClone = partial.code === 1
+  await compareRemote(git, env, report, headId, fullClone)
+  // The equivalent global option is a capability check for Git versions that honor GIT_NO_LAZY_FETCH.
+  if (!fullClone && (await git(['--no-lazy-fetch', '--version'])).code !== 0) {
+    report.localStatusInfo = 'Проверка локальных изменений пропущена: эта версия Git не отключает ленивую загрузку объектов в частичном клоне.'
+    return
+  }
   // Local edits are checked even when the remote cannot be reached or is misconfigured.
   const status = await git(['status', '--porcelain=v1', '-z', '--untracked-files=normal'])
-  const edits = status.code === 0 ? localEdits(status.stdout) : undefined
+  const edits = status.code === 0 ? localEdits(status.stdout, secrets) : undefined
   if (edits) report.problems.push(edits)
 }
 
 type Git = (args: string[], timeout?: number) => Promise<{ code: number; stdout: string }>
 
-async function compareRemote(git: Git, env: DoctorOptions['env'], report: DoctorReport): Promise<void> {
+async function compareRemote(git: Git, env: DoctorOptions['env'], report: DoctorReport, headId: string, fullClone: boolean): Promise<void> {
   const remotes = (await git(['remote'])).stdout.split('\n').map(line => line.trim())
   const remote = env.KROT_UPDATE_REMOTE?.trim() || (remotes.includes('public') ? 'public' : 'origin')
   const branch = env.KROT_UPDATE_BRANCH?.trim() || 'main'
@@ -233,23 +321,31 @@ async function compareRemote(git: Git, env: DoctorOptions['env'], report: Doctor
     return
   }
   const source = `${remote}/${branch}`
-  const fetched = await git(['fetch', '--quiet', '--no-tags', '--', remote, branch], 30_000)
-  const counts = fetched.code === 0 ? await git(['rev-list', '--left-right', '--count', 'HEAD...FETCH_HEAD']) : undefined
-  const match = counts?.code === 0 ? /^(\d+)\s+(\d+)$/.exec(counts.stdout.trim()) : null
-  if (!match) {
+  const ref = `refs/heads/${branch}`
+  const remoteHead = await git(['ls-remote', '--exit-code', '--refs', '--', remote, ref], 30_000)
+  // ls-remote can also match refs that end with the requested ref.
+  const remoteId = remoteHead.stdout.split('\n').map(row => row.split('\t'))
+    .find(([id, name]) => name === ref && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id ?? ''))?.[0]
+  if (remoteHead.code !== 0 || !remoteId) {
     // The remote URL may carry credentials: name the remote, never its URL or git's message.
-    report.problems.push({
-      text: `Не удалось получить версию моста с GitHub (${source}).`,
-      fix: 'Проверьте интернет и доступ к репозиторию, затем повторите /doctor. Источник задают KROT_UPDATE_REMOTE и KROT_UPDATE_BRANCH.',
-    })
+    report.upstreamInfo = `Не удалось получить версию моста с GitHub (${source}). Сравнение пропущено.`
     return
   }
   report.upstream = source
+  if (headId === remoteId) return
+  // A history walk in a partial clone can lazily fetch missing objects, including on older Git.
+  const counts = fullClone ? await git(['rev-list', '--left-right', '--count', `${headId}...${remoteId}`]) : undefined
+  const match = counts?.code === 0 ? /^(\d+)\s+(\d+)$/.exec(counts.stdout.trim()) : null
+  const update = 'В папке моста выполните ./update.sh --dry-run, затем ./update.sh. Перезапустите мост, когда бот свободен.'
+  if (!match) {
+    report.problems.push({ text: `Версия моста отличается от GitHub (${source}).`, fix: update })
+    return
+  }
   const [ahead, behind] = [Number(match[1]), Number(match[2])]
   if (behind > 0) {
     report.problems.push({
       text: `Мост отстаёт от GitHub на ${commits(behind)} (${source}).`,
-      fix: 'В папке моста выполните ./update.sh --dry-run, затем ./update.sh. Перезапустите мост, когда бот свободен.',
+      fix: update,
     })
   }
   if (ahead > 0) {
@@ -263,10 +359,23 @@ async function compareRemote(git: Git, env: DoctorOptions['env'], report: Doctor
 /** Collects the doctor checks and the GitHub comparison. Never throws on a failed probe. */
 export async function collectDoctorReport(options: DoctorOptions): Promise<DoctorReport> {
   const report: DoctorReport = { problems: [] }
+  const hooks: string[] = []
   for (const check of await options.doctor()) {
-    if (check.status !== 'ok') report.problems.push({ text: check.message })
+    if (check.status === 'warning' || check.status === 'error') report.problems.push({ text: check.message })
+    else if (check.message.startsWith(HOOKS_CHECK_PREFIX)) hooks.push(check.message)
+    else if (check.message.startsWith(OWNER_INSTRUCTIONS_CHECK_PREFIX)) (report.ownerInstructions ??= []).push(check.message)
   }
-  await compareWithGitHub(options.repo, options.env, report)
+  if (hooks.length) report.hooks = hooks.join('\n')
+  if (options.brain) {
+    const brain = await options.brain().catch(() => undefined)
+    report.brain = brain === undefined ? 'Brain: хранилище недоступно.' : [
+      'Brain: ' + (brain.enabled ? 'включён' : 'выключен'),
+      'записи ' + brain.facts,
+      brain.hooks,
+      brain.degraded ? 'degraded: no handoff inside a turn' : '',
+    ].filter(Boolean).join(' · ')
+  }
+  await compareWithGitHub(options.repo, options.env, report, options.secrets ?? [])
   const drift = dependencyDrift(join(options.repo, 'plugin'))
   if (drift) report.problems.push(drift)
   const version = await (options.codexVersion ?? localCodexVersion)().catch(() => undefined)
@@ -277,6 +386,26 @@ export async function collectDoctorReport(options: DoctorOptions): Promise<Docto
       text: `Codex CLI ${version} старее минимальной версии ${minimum}.`,
       fix: 'Обновите Codex CLI по официальной инструкции от пользователя службы и проверьте codex --version.',
     })
+  }
+  const pending = await options.pendingUpdate?.().catch(() => undefined)
+  if (pending && pending.phase !== 'rolled_back') report.problems.push(pendingUpdateProblem(pending))
+  let codexRecord: CodexUpdateRecord | undefined
+  try { codexRecord = options.codexUpdate?.() } catch { codexRecord = undefined }
+  if (codexRecord) {
+    const line = codexUpdateLine(codexRecord)
+    if ('fact' in line) report.codexPrevious = line.fact
+    else report.problems.push(line.problem)
+  }
+  if (options.stateDir) {
+    const boot = readBootSummary(options.stateDir)
+    report.boot = bootLine(boot)
+    if (boot.safe) {
+      report.problems.push({
+        text: `Мост работает в безопасном режиме: неудачных запусков подряд ${boot.chain}.`,
+        fix: 'Посмотрите причину в журнале ошибок и в fatal.json ниже, исправьте её и отправьте /restart.',
+      })
+    }
+    report.fatal = fatalLine(readFatal(options.stateDir))
   }
   const errors = options.errors?.()
   // Only errors and a warning that keeps repeating are problems; other warnings are an info line with the counts.
@@ -319,8 +448,16 @@ function fitProblems(items: readonly string[], budget: number): string[] {
 export function formatDoctorReport(report: DoctorReport, maxChars = Number.POSITIVE_INFINITY): string {
   const facts = [
     report.commit ? `Версия моста: ${report.commit}` + (report.upstream ? ` (сравнение с ${report.upstream}).` : '.') : '',
+    report.upstreamInfo ?? '',
+    report.localStatusInfo ?? '',
     report.codexVersion ? `Codex CLI: ${report.codexVersion}.` : '',
+    report.hooks ?? '',
+    report.brain ?? '',
+    ...(report.ownerInstructions ?? []),
     report.errorJournal ?? '',
+    report.codexPrevious ?? '',
+    report.boot ?? '',
+    report.fatal ?? '',
   ].filter(Boolean)
   if (!report.problems.length) return ['🩺 Доктор: всё в порядке.', ...facts].join('\n')
   const head = [`🩺 Доктор нашёл проблемы: ${report.problems.length}.`, '']
@@ -334,6 +471,8 @@ export function formatDoctorReport(report: DoctorReport, maxChars = Number.POSIT
 function redactReport(report: DoctorReport, secrets: readonly string[]): DoctorReport {
   return {
     ...report,
+    ...(report.upstreamInfo ? { upstreamInfo: redactSecrets(report.upstreamInfo, secrets) } : {}),
+    ...(report.ownerInstructions ? { ownerInstructions: report.ownerInstructions.map(line => redactSecrets(line, secrets)) } : {}),
     problems: report.problems.map(problem => ({
       text: redactSecrets(problem.text, secrets),
       ...(problem.fix === undefined ? {} : { fix: redactSecrets(problem.fix, secrets) }),
@@ -420,4 +559,27 @@ export class DoctorCommand {
       this.running = false
     }
   }
+}
+
+export async function brainHookStatus(paths: PackPaths, list: () => Promise<ListedHook[]>):
+  Promise<Pick<BrainStatus, 'hooks' | 'precompact'>> {
+  const listing = list()
+  const checks = await checkHooksPack(paths, () => listing)
+  const hooks = await listing.catch((): ListedHook[] => [])
+  const state = managedListing(hooks).ok ? 'managed' : checks.some(check => check.status === 'error') ? 'none'
+    : checks.some(check => check.status === 'warning') ? 'user-needs-review' : 'user-trusted'
+  const event = (hook: ListedHook) => String(hook.eventName).replace(/[^a-z]/gi, '').toLowerCase()
+  const userSource = join(paths.codexHome, 'hooks.json')
+  const startup = state === 'managed'
+    ? hooks.find(hook => event(hook) === 'sessionstart' && managedSourcePath(hook.sourcePath) &&
+      hook.trustStatus === 'managed' && hook.isManaged === true && typeof hook.command === 'string' && hook.command.endsWith("/run' SessionStart"))
+    : undefined
+  const command = (typeof startup?.command === 'string' ? startup.command : packCommand(paths, 'SessionStart'))
+    .replace(/ SessionStart$/u, ' PreCompact')
+  const installed = (state === 'managed' || state === 'user-trusted') && hooks.some(hook =>
+    event(hook) === 'precompact' && hook.command === command && hook.enabled !== false &&
+    (state === 'managed' ? managedSourcePath(hook.sourcePath) && hook.trustStatus === 'managed' &&
+      hook.isManaged === true && hook.enabled === true && hook.handlerType === 'command'
+      : hook.sourcePath === userSource && hook.trustStatus === 'trusted'))
+  return { hooks: state, precompact: installed ? 'installed' : 'not-installed' }
 }

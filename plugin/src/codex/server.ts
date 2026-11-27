@@ -1,24 +1,30 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdirSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, realpathSync, statSync } from 'node:fs'
+import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { Bot } from 'grammy'
 import type { Message } from 'grammy/types'
 import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
-import { createTelegramApi, type TelegramApi } from '../channel/tools.js'
+import type { SendMessageOpts, TelegramApi } from '../channel/tools.js'
 import { getStatePaths, loadConfig, resolveAskGuardMode, resolveHudEnabled, resolveOutboxEnabled, RuntimeEnvSchema } from '../config.js'
-import { plainTextWithLinks, splitMessage } from '../format/chunk.js'
-import { splitLongBlock } from '../format/paragraphs.js'
+import {
+  plainTextWithLinks, PreformattedDocumentError, protectPlainFallbackCuts, redactedRenderOffset, resumeMessagePlan,
+  splitMessage, splitMessageFrom, splitPlainFallback, TELEGRAM_MAX_MESSAGE,
+} from '../format/chunk.js'
+import { splitMessageLegacy } from '../format/chunk-legacy.js'
+import { splitLongBlock, splitLongBlockLegacy } from '../format/paragraphs.js'
 import { isTelegramHtmlParseError, markdownToTelegramHtml } from '../format/html.js'
 import { createLogger } from '../log.js'
 import { MemoryWriter } from '../memory/writer.js'
 import { Outbox, type OutboxOptions } from '../safety/outbox.js'
+import { validateTelegramHtml } from '../safety/html-validator.js'
 import { detectOpenQuestion } from '../safety/open-question.js'
 import { createOpenQuestionTick } from '../safety/open-question-sweep.js'
-import { createRateLimitedTelegramApi, parse429 } from '../safety/rate-limited-telegram-api.js'
-import { classifySendError, createReliableTelegramApi } from '../safety/reliable-telegram-api.js'
+import { parse429 } from '../safety/rate-limited-telegram-api.js'
+import { classifySendError } from '../safety/reliable-telegram-api.js'
 import { redactSecrets } from '../safety/redact.js'
-import { createSafeTelegramApi, redactOutboundText } from '../safety/safe-telegram-api.js'
-import { createRichLatch } from '../safety/rich-latch.js'
+import { redactOutboundText } from '../safety/safe-telegram-api.js'
 import { ensureStateDirs, writeDeadLetter } from '../state/store.js'
 import { OpenQuestionStore } from '../state/open-question-store.js'
 import { CodexLimitsCache } from '../status/codex-limits.js'
@@ -28,29 +34,33 @@ import { StatusManager } from '../status/status-manager.js'
 import { registerOwnerScopedCommands } from '../telegram/command-scope.js'
 import { AlbumBuffer } from '../telegram/album-buffer.js'
 import { hasRichBody, unhandledContentKeys } from '../telegram/handlers.js'
+import type { WebAppHandover } from '../telegram/handover-seal.js'
 import { gateTelegramMessage } from '../telegram/gate.js'
-import { TelegramPoller, tokenLock } from '../telegram/poller.js'
+import { PollerFatalError, TelegramPoller, tokenLock } from '../telegram/poller.js'
 import { richInboundMiddleware } from '../telegram/rich-inbound.js'
 import { ApprovalCards, APPROVAL_CALLBACK } from './approvals.js'
 import { resolveApprovalSetup, sessionApprovalOptions } from './approval-mode.js'
 import { removeOwnPinService } from './pin-service.js'
 import { HudAnchor } from './hud-anchor.js'
 import { CardCleanup } from './card-cleanup.js'
-import { extractAttachments, sendAttachment } from './attachments.js'
+import { sendAttachment } from './attachments.js'
 import { formatReminderEnabled, ownerTurn, questionFollowUpTurn, sideOwnerTurn } from './format-reminder.js'
 import { codexAgentName, codexCommandSet, isBuiltInCommand, isStatusQuestion, parseCodexCommand } from './commands.js'
+import { brainHookStatus, chatReportChars, collectDoctorReport, DoctorCommand, formatDoctorReport, runDoctorScript } from './doctor-command.js'
 import { collectUsage, usageCommand } from './usage-command.js'
-import { collectDoctorReport, DoctorCommand, runDoctorScript } from './doctor-command.js'
+import { startupSandbox } from './full-access.js'
+import { ETC_CODEX, defaultPaths as hookPaths, fullAccessGuards, listedHooks } from '../../../codex-hooks/src/install.js'
+import { listHooksViaAppServer } from '../../scripts/doctor.js'
 import {
-  directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply, ownerExecutionTask,
-  ownerTaskBlocked, ownerTaskWithdrawn, publicProgress,
+  directOwnerTask, followUpInstructions, hideContinuationMarker, normalizeChatReply,
+  ownerTaskWithdrawn, publicProgress,
   takeContinuation, unfinishedOwnerTask, type ContinuationContext,
 } from './continuation.js'
 import { ControlState } from './control-state.js'
 import { MODEL_MENU_CALLBACK, ModelMenu } from './model-menu.js'
 import { claudeArchiveContext, claudeArchiveDates, claudeArchiveSessions, formatConversation,
   readClaudeArchive, sendConversation } from './conversation-export.js'
-import { CodexInbox, type InboxReply } from './inbox.js'
+import { CodexInbox, recoveredTurn, type InboxReply } from './inbox.js'
 import { startExternalTasks } from './external.js'
 import { agentWebhookSettings, routeAgentMessage, startAgentWebhook, type AgentDelivery,
   type DeliverOutcome } from './agent-webhook.js'
@@ -73,11 +83,35 @@ import { ackInbound, ackReactionMode, parseReactionPalette, reactionInstructions
 import { InboundWatcher } from '../telegram/watcher.js'
 import { CodexLeases, goalLeasePrefix, hideLeaseCompletions, type LeaseTicket } from './lease.js'
 import { LearningMemory } from './learning.js'
+import { createBrainBridge } from './brain-bridge.js'
+import { BRAIN_CALLBACK, BRAIN_UNAVAILABLE, MEMORY_REFUSED, MEMORY_WRITE_REFUSED, mayRunMemoryCommand } from './brain-commands.js'
+import { classifyBrainOrigin, hasMemoryCue, isOwnerPrivateChat } from './brain-origin.js'
+import { createOwnerEffects, createUnansweredQuestionHandler, type OwnerEffects } from './owner-effects.js'
+import {
+  bridgeOrigin, classifyTurn, mainOrigin, ownerOrigin, ownerWords, parseTurnOrigin, storedOrigin, type TurnOrigin,
+} from './turn-origin.js'
+import { createBrainSummarizer, listCodexModels, structuredRequest } from './brain-summarizer.js'
+import { bridgeScope, resolveBrainHome } from '../../../codex-brain/src/store/paths.js'
+import type { MemoryReply, TurnOutcome, TurnTicket } from '../../../codex-brain/src/contract.js'
 import { requestStructured, reviewLearning } from './learning-review.js'
 import { legacyCommand } from './legacy-command.js'
 import { sideQuestion, sideReply, sideReplySchema } from './side-reply.js'
 import { SideDeliveries, sideEndNotice } from './side-delivery.js'
 import { errorDetail, ErrorJournal, errorLogDays } from './error-log.js'
+import { EXIT } from './exit-codes.js'
+import { startupFailureExit } from './startup-failure.js'
+import { TurnAdmission } from './turn-admission.js'
+import { BootLedger, HealthMark } from './boot-ledger.js'
+import { bootBridge, pollThroughConflicts, SafeMode, SafeModeInbox, safeModeStop, type SafeModeEntry } from './safe-mode.js'
+import { RestartIntents, refusedRestartText, type RestartAdmission, type RestartIntent } from './restart-intent.js'
+import { RestartNotices } from './restart-notice.js'
+import { createTelegramStack, ownerNoticeSender } from './telegram-stack.js'
+import { ownerInstructionsHome, reportOwnerInstructionsAtStartup } from './owner-instructions-lock.js'
+import { GUARD_FILE, recordTrialOutcome, runCommand, SelfUpdate, trialOutcomeFor } from './self-update.js'
+import { codexRollback, CodexUpdate, fetchTextOrUndefined, findOnPath, readCodexRecord, recoverCodexUpdate, stagedCodexProbe } from './codex-update.js'
+import { KeySpike, keyspikeUrl } from './keyspike.js'
+import { isCodexUpdateRequest, UpdateCommands } from './update-commands.js'
+import { armShutdownWatchdog, armStartupWatchdog } from './watchdogs.js'
 import {
   busyNotice, parallelSettings, queuedNotice, routeWhileBusy, SideRegistry, sideInstructions, taskTitle,
 } from './parallel.js'
@@ -86,7 +120,7 @@ import { QueueNotices } from './queue-notice.js'
 import { hasMedia, prepareInbound, type MediaInput } from './media.js'
 import { CodexMirror } from './mirror.js'
 import { codexAppServerCommand } from './native-memories.js'
-import { CodexSession } from './session.js'
+import { CodexSession, readSavedMainThread } from './session.js'
 import { hideQuestionMarker, questionFallback, QuestionCards, QUESTION_CALLBACK } from './questions.js'
 import { CodexWorkStatus } from './work-status.js'
 import { object } from './rpc.js'
@@ -101,6 +135,25 @@ const autonomyInstructions = 'Для большой задачи составь 
   'Делегируй независимые части нативным субагентам Codex, если инструменты доступны и это помогает задаче. ' +
   'Продолжай работу после промежуточных результатов до проверенного итога или реального блокера. ' +
   'Подтверждения и границы среды остаются обязательными.'
+
+// The ledger of this process, so the exit code can be recorded after main() ends.
+let activeLedger: BootLedger | undefined
+// The bridge checkout; the exit paths below read the /update trial record from it.
+const bridgeRepoRoot = join(import.meta.dir, '..', '..', '..')
+// Set when the startup watchdog ended this boot: a trial boot that hit it is rolled back at once (S9.5).
+let startupWatchdogFired = false
+
+/** Short commit of the bridge checkout, or "unknown" outside git. */
+function bridgeCommit(): string {
+  try {
+    const result = Bun.spawnSync(['git', '-C', join(import.meta.dir, '..', '..', '..'), 'rev-parse', '--short', 'HEAD'],
+      { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore', timeout: 5000 })
+    const commit = result.stdout.toString().trim()
+    return result.exitCode === 0 && /^[0-9a-f]{4,64}$/.test(commit) ? commit : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
 
 async function main(): Promise<void> {
   if (process.getuid?.() === 0) throw new Error('Run the Codex pilot as a dedicated non-root user')
@@ -120,11 +173,12 @@ async function main(): Promise<void> {
   const formatReminderOn = formatReminderEnabled(process.env.KROT_FORMAT_REMINDER)
   const agentName = codexAgentName(process.env.KROT_CODEX_AGENT_NAME, config.memory.agent_label)
   const agentTitle = agentName === 'Codex' ? agentName : agentName + ' · Codex'
-  const ownerId = config.allowed_user_ids[0]
+  const configuredOwnerId = config.allowed_user_ids[0]
   if (config.allowed_user_ids.length !== 1 || config.allowed_chat_ids.length !== 1
-      || ownerId === undefined || String(config.allowed_chat_ids[0]) !== String(ownerId)) {
+      || configuredOwnerId === undefined || String(config.allowed_chat_ids[0]) !== String(configuredOwnerId)) {
     throw new Error('The pilot requires exactly one owner and that owner’s private chat')
   }
+  const ownerId = configuredOwnerId
   if (!env.TELEGRAM_STATE_DIR || !isAbsolute(env.TELEGRAM_STATE_DIR)
       || !config.workspace_root || !isAbsolute(config.workspace_root) || !env.TELEGRAM_EXPECTED_BOT_ID) {
     throw new Error('Set absolute TELEGRAM_STATE_DIR and TELEGRAM_WORKSPACE_ROOT and set TELEGRAM_EXPECTED_BOT_ID')
@@ -152,20 +206,38 @@ async function main(): Promise<void> {
   // A caught error logged at warn with its name, code and redacted description.
   const warnError = (error: unknown, message: string, context: Record<string, unknown> = {}): void =>
     log.warn(message, { ...context, error: errorDetail(error, secrets) })
+  const brainHome = resolveBrainHome(process.env)
+  const brainScope = bridgeScope(String(env.TELEGRAM_EXPECTED_BOT_ID), String(ownerId))
+  const brain = createBrainBridge({
+    brainHome, scope: brainScope,
+    // issuedKeys is the same array: every redactSecrets(…, secrets) call also scrubs live turn keys.
+    legacyRoot: join(paths.root, 'learning'), secrets, issuedKeys: secrets, warn: text => log.warn(text),
+    summarizer: (prompt, schema, signal) => summarizeBrain(prompt, schema, signal),
+  })
+  let summarizeBrain: ReturnType<typeof createBrainSummarizer>
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
   bot.use(richInboundMiddleware(undefined, () => log.warn('Could not normalize Telegram rich content')))
-  const safeTelegram = createSafeTelegramApi(
-    createRateLimitedTelegramApi(createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN), log),
-    log,
-    secrets,
-    createRichLatch(),
-  )
-  const reliableTelegram = createReliableTelegramApi(safeTelegram, log, {
+  const { safeTelegram, reliableTelegram } = createTelegramStack({
+    bot, token: env.TELEGRAM_BOT_TOKEN, log, secrets,
     deadLetter: record => writeDeadLetter(paths, 'outbound', { ...record, error: redactSecrets(record.error, secrets) }),
   })
+  async function sendTextDocument(api: Pick<TelegramApi, 'sendDocument'>, chat: string, body: string, id?: number) {
+    const dir = await mkdtemp(join(tmpdir(), 'krot-codex-reply-'))
+    const file = join(dir, 'reply.txt')
+    try {
+      await writeFile(file, redactSecrets(body, secrets), { flag: 'wx', mode: 0o600 })
+      const options = { filename: 'reply.txt', ownerReply: true,
+        ...(id === undefined ? {} : { reply_to_message_id: id }) }
+      return await api.sendDocument(chat, file, options)
+    } finally {
+      await unlink(file).catch(() => undefined)
+      await rmdir(dir).catch(() => undefined)
+    }
+  }
   let onDeferredDelivery: OutboxOptions['onDelivered']
   const outbox = resolveOutboxEnabled(config)
     ? new Outbox({ stateDir: paths.root, sendFn: (id, text, opts) => safeTelegram.sendMessage(id, text, opts),
+      sendDocument: (id, text, opts) => sendTextDocument(safeTelegram, id, text, opts.reply_to_message_id),
       onDelivered: (item, messageId) => onDeferredDelivery?.(item, messageId), log,
       // A legacy reply saved part by part is redacted as a whole on load (a secret may be cut across its parts).
       redact: (text, parseMode) => redactOutboundText(text, parseMode, secrets) })
@@ -186,7 +258,209 @@ async function main(): Promise<void> {
     bufferTtlMs: config.memory.buffer_ttl_ms,
     bufferMaxEntries: config.memory.buffer_max_entries,
   }, log) : undefined
-  const poller = new TelegramPoller({ bot, config, statePaths: paths, log, onUpdate: update => bot.handleUpdate(update) })
+  // Boot ledger (S3-S5): counted after the token lock, so a lock conflict (exit 75) is bounded by systemd alone.
+  const ledger = new BootLedger(paths.root, {
+    onError: (error, action) => warnError(error, 'Boot ledger ' + action + ' failed; restart-loop protection runs blind'),
+  })
+  activeLedger = ledger
+  // Assigned after the backoff sleep, so the 120 s of uptime count from the real start.
+  let healthMark: HealthMark | undefined
+  // Owner restart notices: the "back" notice goes out after the first successful poll (bot verified).
+  let restartNotices: RestartNotices | undefined
+  // S0 phone spike of the secret hand-over (off unless KROT_KEYSPIKE_URL is set): owner-only /keytest
+  // and the sealed web_app_data consumer. Fixed texts without user content, so bot.api is used directly.
+  const keyspikePage = keyspikeUrl(process.env.KROT_KEYSPIKE_URL)
+  const keyspike = keyspikePage === undefined ? undefined : new KeySpike({
+    url: keyspikePage, ownerId, log,
+    api: {
+      sendMessage: (chatId, text, markup) => bot.api.sendMessage(chatId, text, { reply_markup: markup }),
+      deleteMessage: async (chatId, messageId) => { await bot.api.deleteMessage(chatId, messageId) },
+    },
+  })
+  const poller = new TelegramPoller({ bot, config, statePaths: paths, log, onUpdate: update => bot.handleUpdate(update),
+    onPollSuccess: () => {
+      healthMark?.polled()
+      void restartNotices?.back()
+    },
+    ...(keyspike ? { onHandover: (handover: WebAppHandover) => keyspike.handover(handover) } : {}) })
+  const safeEntry = await bootBridge<SafeModeEntry | undefined>({
+    ledger, boot: { commit: bridgeCommit(), invocation: process.env.INVOCATION_ID || randomUUID() },
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    onBackoff: (ms, chain) => log.warn('Too many bridge starts in a row; waiting before connecting', { delay_ms: ms, chain }),
+    normal: async () => undefined,
+    safe: async entry => entry,
+  })
+  const bridgeRepo = join(import.meta.dir, '..', '..', '..')
+  const sendOwner = (text: string) => reliableTelegram.sendMessage(String(ownerId), redactSecrets(text, secrets), {})
+  const proxy = process.env.KROT_CODEX_PROXY
+  if (!proxy) {
+    void reportOwnerInstructionsAtStartup(ownerInstructionsHome(process.env, workspace), text => log.warn(text), sendOwner)
+      .catch((error: unknown) => warnError(error, 'Could not send the owner instructions protection notice'))
+  }
+  restartNotices = new RestartNotices({
+    stateDir: paths.root,
+    send: ownerNoticeSender(reliableTelegram, String(ownerId), secrets),
+    onError: (error, action) => warnError(error, 'Restart notice ' + action + ' failed'),
+  })
+  restartNotices.boot({ crashed: ledger.previousCrashed(), safe: safeEntry !== undefined })
+  const notices = restartNotices
+  // S9: /update, /update rollback and the trial-boot record shared with plugin/scripts/boot-guard.sh.
+  const guardCopy = join(paths.root, GUARD_FILE)
+  const selfUpdate = new SelfUpdate({
+    repo: bridgeRepo, run: runCommand, bun: process.execPath, stateDir: paths.root,
+    ...(process.env.KROT_UPDATE_BRANCH ? { branch: process.env.KROT_UPDATE_BRANCH } : {}),
+    // The unit must run the guard copy outside the checkout: an update cannot delete or break that one.
+    guardInstalled: async () => {
+      const unit = await runCommand('systemctl', ['--user', 'show', '--property=ExecStartPre', '--value', 'krotov-telegram.service'],
+        { cwd: bridgeRepo, timeoutMs: 10_000 })
+      return unit.code === 0 && unit.stdout.includes(guardCopy) && existsSync(guardCopy)
+    },
+  })
+  const headCommit = (await runCommand('git', ['rev-parse', 'HEAD'], { cwd: bridgeRepo, timeoutMs: 10_000 })).stdout.trim()
+  // S6: every planned restart is recorded before exit 75; a stale or looping one is refused.
+  const intents = new RestartIntents(paths.root)
+  function admitRestart(kind: RestartIntent['kind'], ownerMessageId: number | undefined, toCommit?: string): RestartAdmission {
+    try {
+      return intents.admit({ kind, invocation: process.env.INVOCATION_ID ?? '', fromCommit: headCommit,
+        ...(ownerMessageId !== undefined ? { ownerMessageId } : {}), ...(toCommit ? { toCommit } : {}) })
+    } catch (error) {
+      // Fails open like the boot ledger: the restart still happens, only the record is missing.
+      warnError(error, 'Could not record the restart intent')
+      return { ok: true }
+    }
+  }
+  // S7: not ready within 180 s → exit 75 (counts in the boot chain; a failed /update trial is rolled back next start).
+  const startup = safeEntry ? undefined : armStartupWatchdog({ onTimeout: () => {
+    log.warn('Bridge not ready within the startup limit; restarting')
+    startupWatchdogFired = true
+    process.exitCode = EXIT.restart
+    // Startup may still be before the shutdown state exists; then end the process directly.
+    try { shutdown() } catch {
+      recordTrialOutcome(bridgeRepoRoot, 'watchdog')
+      process.exit(EXIT.restart)
+    }
+  } })
+  // The boot after /update until its health mark: a /restart now would make the boot guard roll it back.
+  let trialPending = false
+  const health = new HealthMark(() => {
+    ledger.markHealthy()
+    startup?.ready()
+    log.info('Bridge boot marked healthy')
+    trialPending = false
+    void selfUpdate.markHealthy(headCommit).then(done => done && sendOwner('✅ Обновление работает: ' +
+      done.from.slice(0, 12) + ' → ' + done.to.slice(0, 12) + '. Откатить можно командой /update rollback.'))
+      .catch((error: unknown) => warnError(error, 'Could not complete the update trial'))
+  }, Date.now())
+  healthMark = health
+  try {
+    const report = await selfUpdate.bootReport(headCommit)
+    // Not awaited: a slow Telegram must not delay polling and the health mark.
+    const notify = (text: string) => { void sendOwner(text).catch((error: unknown) => warnError(error, 'Could not send the update notice')) }
+    if (report?.kind === 'rolled_back') {
+      notify('⚠️ Обновление до ' + report.to.slice(0, 12) + ' не заработало нормально, поэтому я вернул прежнюю версию ' +
+        report.from.slice(0, 12) + '. Бот работает как раньше. Причину видно на сервере: journalctl --user -u krotov-telegram.service -n 80')
+    } else if (report?.kind === 'rollback_failed') {
+      notify('⚠️ Обновление до ' + report.to.slice(0, 12) + ' не заработало, и вернуть версию ' + report.from.slice(0, 12) +
+        ' автоматически не удалось. Проверь на сервере git status и bun install.')
+    } else if (report?.kind === 'trial') {
+      trialPending = true
+      log.info('Trial boot of an update', { from: report.from, to: report.to })
+    }
+  } catch (error) { warnError(error, 'Could not read the update record') }
+  // An /update codex cut off by a kill: finish it before anything runs Codex (normal and safe mode).
+  const codexRecovery = recoverCodexUpdate(paths.root)
+  if (codexRecovery) {
+    log.warn('Finished an interrupted Codex update', { result: codexRecovery })
+    if (codexRecovery !== 'cleaned') {
+      void sendOwner(codexRecovery === 'restored'
+        ? '⚠️ Обновление Codex прервалось, я вернул прежнюю версию Codex. Бот работает как раньше.'
+        : '⚠️ Обновление Codex прервалось, и вернуть прежнюю версию не удалось. На сервере: npm install -g @openai/codex@latest')
+        .catch((error: unknown) => warnError(error, 'Could not send the Codex update notice'))
+    }
+  }
+  if (safeEntry) {
+    try {
+      await runSafeMode(safeEntry)
+    } finally {
+      await poller.stop()
+      tokenLock.release(paths)
+    }
+    return
+  }
+
+  function collectBridgeDoctorReport(sandboxFallback?: string) {
+    const doctorEnv = { ...process.env, KROT_CODEX_SANDBOX_FALLBACK: sandboxFallback }
+    return collectDoctorReport({
+      repo: bridgeRepo, env: process.env, secrets,
+      doctor: () => runDoctorScript(join(import.meta.dir, '..', '..', 'scripts', 'doctor.ts'), doctorEnv),
+      errors: () => errorJournal.recent(),
+      pendingUpdate: () => selfUpdate.pending(),
+      codexUpdate: () => readCodexRecord(paths.root),
+      stateDir: paths.root, brain: () => brain.status(),
+    })
+  }
+
+  // Poller and owner commands only: no Codex, no inbox recovery, no handoff verification, no goals.
+  async function runSafeMode(entry: SafeModeEntry): Promise<void> {
+    const ownerChat = String(ownerId)
+    log.warn('Starting in safe mode', { reason: entry.reason, chain: entry.chain })
+    // Ends safe mode: stops the poller and any back-off between polling attempts. S7: the shutdown
+    // watchdog bounds the exit here too (a poller stop waiting on a hanging handler).
+    const safeStop = new AbortController()
+    const stopSafe = safeModeStop({
+      armWatchdog: () => {
+        armShutdownWatchdog({
+          exit: code => process.exit(code),
+          exitCode: () => typeof process.exitCode === 'number' ? process.exitCode : undefined,
+        })
+      },
+      abort: () => safeStop.abort(),
+      stopPoller: () => { void poller.stop() },
+    })
+    const send = sendOwner
+    const safe = new SafeMode({
+      ledger, entry, send,
+      acknowledge: text => notices.acknowledge(text),
+      rollback: async () => {
+        const result = await selfUpdate.rollback()
+        if (!result.ok) return { ok: false, text: result.text }
+        admitRestart('rollback', undefined, result.to)
+        return { ok: true, text: 'Вернул версию ' + result.to.slice(0, 12) + ' (была ' + result.from.slice(0, 12) + ').' }
+      },
+      restart: () => {
+        log.info('Owner asked to leave safe mode; restarting for a trial boot')
+        process.exitCode = EXIT.restart
+        stopSafe()
+      },
+      doctor: async () => formatDoctorReport(await collectBridgeDoctorReport(), chatReportChars),
+      codexRollback: () => {
+        const result = codexRollback(paths.root)
+        return result.ok ? { ok: true, text: 'Вернул Codex ' + result.to + ' (был ' + result.from + ').' } : result
+      },
+      inbox: new SafeModeInbox(paths.root),
+    })
+    bot.on('message', async ctx => {
+      if (String(ctx.chat.id) !== ownerChat || String(ctx.from?.id) !== ownerChat || ctx.message.forward_origin) return
+      const text = ctx.message.text ?? ctx.message.caption ?? ''
+      try {
+        await safe.handle({ text, messageId: ctx.message.message_id })
+      } catch (error) { warnError(error, 'Could not answer the owner in safe mode') }
+    })
+    process.once('SIGINT', stopSafe)
+    process.once('SIGTERM', stopSafe)
+    await safe.announce().catch((error: unknown) => warnError(error, 'Could not send the safe-mode notice'))
+    await pollThroughConflicts({
+      start: () => poller.start(),
+      signal: safeStop.signal,
+      sleep: (ms, signal) => new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, ms)
+        signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+      }),
+      isConflict: error => error instanceof PollerFatalError && error.kind === 'conflict',
+      onConflict: (delayMs, attempt) => log.warn('Safe mode: another poller holds the token; polling again later',
+        { delay_ms: delayMs, attempt }),
+    })
+  }
   const statusApi = {
     sendMessage: reliableTelegram.sendMessage,
     editMessageText: reliableTelegram.editMessageText,
@@ -231,17 +505,15 @@ async function main(): Promise<void> {
     : undefined
   const leases = new CodexLeases(paths, String(ownerId), log)
   const questionStore = new OpenQuestionStore(paths.openQuestions, log)
+  const threadStateFile = join(paths.root, 'codex-thread.json')
+  // The only route to owner memory and owner work (see owner-effects.ts); set once the control state exists.
+  let effects: OwnerEffects | undefined
   const questions = new QuestionCards(String(ownerId), telegram, secrets, {
     timeoutMs: config.ask_user_question.timeout_ms, previewChars: config.ask_user_question.max_preview_chars,
-    persistence: { root: paths.root, log },
-    async onUnanswered({ messageId, askedAtMs, snippet }) {
-      const chatId = String(ownerId)
-      const previous = questionStore.get(chatId)
-      if (previous?.messageId !== messageId && (previous?.askedAtMs ?? 0) <= askedAtMs) {
-        questionStore.set({ chatId, messageId, askedAtMs, code: 'AQ_CARD', snippet, remindersSent: 0 })
-      }
-      await leases.recordQuestion(messageId, snippet)
-    },
+    persistence: { root: paths.root, log, legacyMainThread: () => readSavedMainThread(threadStateFile) },
+    onUnanswered: createUnansweredQuestionHandler({
+      chatId: String(ownerId), questionStore, effects: () => effects, syncBrainQuestions,
+    }),
   }, cards, config.ask_user_question.enabled ? (intent, cardId, messageId) =>
     leases.grantFromQuestion(intent, cardId, messageId) : undefined)
   const questionConfig = config.open_question_reminder
@@ -252,7 +524,6 @@ async function main(): Promise<void> {
   const questionTimer = questionConfig.enabled && questionConfig.after_ms > 0
     ? setInterval(() => { void questionTick(Date.now()) }, 60_000) : undefined
   questionTimer?.unref()
-  const proxy = process.env.KROT_CODEX_PROXY
   if (proxy && (!approvals || !isAbsolute(proxy))) {
     tokenLock.release(paths)
     throw new Error('A Codex proxy requires an absolute path and Telegram approval handling')
@@ -262,9 +533,22 @@ async function main(): Promise<void> {
     tokenLock.release(paths)
     throw new Error('KROT_CODEX_SANDBOX=danger-full-access cannot be used with KROT_CODEX_PROXY')
   }
+  // Full access only behind live guards: a stale or hand-set danger-full-access falls back to
+  // workspace-write when the managed hooks are not root-owned, self-tested and listed by Codex.
+  const sandbox = await startupSandbox(env.KROT_CODEX_SANDBOX,
+    () => fullAccessGuards(ETC_CODEX, () => listHooksViaAppServer(process.env, workspace)))
+  if (sandbox.fallback) log.warn(`Full access refused at startup, Codex runs in workspace-write: ${sandbox.fallback}`)
   let stopping = false
   let session: CodexSession | undefined
   let task: Promise<void> | undefined
+  function syncBrainQuestions(): void {
+    const thread = session?.currentThread
+    if (!brain.enabled || !thread || !effects) return
+    const open = loadAutonomyState(paths, String(ownerId), log).questions.filter(question => question.status === 'open')
+      .map(question => question.summary)
+    // Only the owner's own turns feed the owner's open questions (and so his handoff on compaction).
+    effects.exportOpenQuestions(mainOrigin(thread), open)
+  }
   let externalTasks: Awaited<ReturnType<typeof startExternalTasks>> | undefined
   let agentWebhook: ReturnType<typeof startAgentWebhook> | undefined
   let externalQuestion = false
@@ -273,10 +557,20 @@ async function main(): Promise<void> {
   let cancelMedia: (() => void) | undefined
   let mirror: CodexMirror | undefined
   const learningAbort = new AbortController()
+  // The owner's "restarting" notice of a planned stop; awaited (bounded) before the process ends.
+  let stopNotice: Promise<void> | undefined
   function shutdown(): void {
     if (stopping) return
     stopping = true
+    // S7: a hanging close must not leave the bridge alive and deaf; the chosen exit code is kept.
+    armShutdownWatchdog({
+      exit: code => process.exit(code),
+      exitCode: () => typeof process.exitCode === 'number' ? process.exitCode : undefined,
+    })
+    startup?.ready()
+    health.cancel()
     learningAbort.abort()
+    brain.stop()
     albums.flushAll()
     clearInterval(outboxTimer)
     clearInterval(watchdogTimer)
@@ -292,7 +586,11 @@ async function main(): Promise<void> {
     void poller.stop()
   }
   process.once('SIGINT', shutdown)
-  process.once('SIGTERM', shutdown)
+  process.once('SIGTERM', () => {
+    // systemd's graceful stop or restart; a stop already under way (a crash) is not announced.
+    if (!stopping) stopNotice ??= notices.stopping()
+    shutdown()
+  })
 
   try {
     const ownerChat = String(ownerId)
@@ -312,8 +610,21 @@ async function main(): Promise<void> {
     let deliveryRetryAt = 0
     let recoveringGoal: string | undefined
     const controls = new ControlState(paths.root, config.tmux_mirror.enabled)
+    const ownerEffects: OwnerEffects = createOwnerEffects({
+      chatId: ownerChat, leases, brain, controls, questionStore,
+      currentThread: () => session?.currentThread ?? null,
+      onQuestionsChanged: () => syncBrainQuestions(),
+      warn: (error, message) => warnError(error, message),
+    })
+    effects = ownerEffects
     const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => codexEnvironment.test(name)))
     if (riskyApprovals) codexEnv.KROT_CODEX_APPROVAL_MODE = 'risky'
+    const modelCommand = proxy ? ['/usr/bin/sudo', '-n', '--', proxy] as const : undefined
+    summarizeBrain = createBrainSummarizer({
+      brainHome, clock: brain.clock,
+      listModels: () => listCodexModels(workspace, codexEnv, modelCommand),
+      request: structuredRequest(workspace, codexEnv, modelCommand),
+    })
     const autoSaveLearning = process.env.KROT_CODEX_LEARNING_AUTO_SAVE === '1'
     let learning: LearningMemory | undefined
     if (process.env.KROT_CODEX_LEARNING === '1') {
@@ -324,7 +635,7 @@ async function main(): Promise<void> {
         if (!Number.isInteger(interval) || interval < 1 || interval > 30) throw new Error('Invalid learning interval')
         learning = new LearningMemory(root, interval, secrets,
           prompt => reviewLearning(root, codexEnv, prompt, learningAbort.signal, process.env.KROT_CODEX_LEARNING_MODEL),
-          autoSaveLearning)
+          autoSaveLearning, () => !brain.enabled && !stopping)
       } catch (error) { warnError(error, 'Could not start Codex learning. Check the learning state directory and interval.') }
     }
     const quotedAttachments = new Map<number, Message>()
@@ -348,18 +659,40 @@ async function main(): Promise<void> {
     let lastNativePlan: { turnId: string; pending: boolean } | undefined
     const selfRestartEnabled = process.platform === 'linux' && process.env.KROT_CODEX_SELF_RESTART === '1'
     const restartHandoff = selfRestartEnabled && !proxy ? new BridgeRestartHandoff(paths.root, randomUUID(), ownerId) : undefined
+    // Bound to the /restart and /update reservation once UpdateCommands exists (startNext may run earlier).
+    let maintenanceActive: () => boolean = () => false
+    // One admission rule for inbox turns (startNext) and /goal starts: busy or under maintenance, nothing starts.
+    const admission = new TurnAdmission({
+      running: () => Boolean(task || stopping || resetting || recoveringInbox || recoveringGoal || deliveringGoal ||
+        goalActive || externalQuestion || codex.isRunning),
+      maintenance: () => maintenanceActive(),
+    })
+    const bridgeIdle = () => !stopping && !task && !work.busy && !codex.isRunning && !goalActive && !externalQuestion &&
+      !resetting && !recoveringInbox && !recoveringGoal && !deliveringGoal && !approvals?.isPending &&
+      !questions.isPending && !inbox.active && inbox.size === 0 && !inbox.uncertainFollowUp &&
+      Object.keys(inbox.recoveredAlbums).length === 0 && sides.size === 0 && !admission.claiming
+    // The owner message whose turn asked for the agent-marker restart (S6 intent).
+    let agentRestartOwnerId: number | undefined
+    function plannedRestart(kind: RestartIntent['kind'], ownerMessageId: number | undefined, toCommit?: string): RestartAdmission {
+      const admitted = admitRestart(kind, ownerMessageId, toCommit)
+      if (!admitted.ok) {
+        log.warn('Planned restart refused', { kind, reason: admitted.reason })
+        return admitted
+      }
+      log.info('Restarting bridge', { kind })
+      process.exitCode = EXIT.restart
+      if (!stopping) stopNotice ??= notices.stopping(kind)
+      shutdown()
+      return admitted
+    }
     const bridgeRestart = new BridgeRestart({
-      idle: () => !stopping && !task && !work.busy && !codex.isRunning && !goalActive && !externalQuestion &&
-        !resetting && !recoveringInbox && !recoveringGoal && !deliveringGoal && !approvals?.isPending &&
-        !questions.isPending && !inbox.active && inbox.size === 0 && !inbox.uncertainFollowUp &&
-        Object.keys(inbox.recoveredAlbums).length === 0 && sides.size === 0,
-      notify: () => telegram.sendMessage(ownerChat, 'Перезапускаюсь. Итоговый ответ доставлен.', {}),
+      // An update or /restart in progress holds the reservation: the agent's restart waits for it.
+      idle: () => bridgeIdle() && !maintenanceActive(),
+      // No separate notice: the stop notice of plannedRestart('agent') says the final answer was delivered.
       restart: () => {
-        log.info('Restarting bridge after owner notification')
-        process.exitCode = 75
-        shutdown()
+        const admitted = plannedRestart('agent', agentRestartOwnerId)
+        if (!admitted.ok) void send(refusedRestartText(admitted.reason)).catch(() => undefined)
       },
-      onNotifyError: () => log.warn('Could not notify owner about requested restart'),
     })
     const announced = new Set<string>()
     function setGoalActive(active: boolean): void {
@@ -368,12 +701,15 @@ async function main(): Promise<void> {
       statusConfig.status.interval_ms = active ? Math.max(5000, config.status.interval_ms) : config.status.interval_ms
     }
     setGoalActive(goalActive)
-    const command = proxy ? ['/usr/bin/sudo', '-n', '--', proxy] as const
-      : await codexAppServerCommand(workspace, codexEnv, process.env.KROT_CODEX_MEMORIES_DEFAULT === '1')
+    const command: readonly [string, ...string[]] = proxy ? ['/usr/bin/sudo', '-n', '--', proxy]
+      : await codexAppServerCommand(workspace, codexEnv, {
+        nativeEnabled: process.env.KROT_CODEX_MEMORIES_DEFAULT === '1',
+        brainEnabled: brain.enabled,
+      })
     if (stopping) return
-    const codex = session = new CodexSession({
+    const codex: CodexSession = session = new CodexSession({
       cwd: workspace,
-      stateFile: join(paths.root, 'codex-thread.json'),
+      stateFile: threadStateFile,
       env: codexEnv,
       ...(process.env.KROT_CODEX_MODEL ? { model: process.env.KROT_CODEX_MODEL } : {}),
       selectedModel: () => controls.model,
@@ -383,6 +719,9 @@ async function main(): Promise<void> {
       // server's own Codex config decides whether summaries stream.
       reasoningSummary: !proxy && config.status.thoughts?.enabled === true,
       onWarning: message => log.warn(message),
+      // The one registration point of the owner's main thread (A1, N2): resume, start, fork and archive.
+      onMain: id => brain.registerOwnerMain(id),
+      aroundMainOpen: open => brain.mainOpen(open),
       onThread: id => {
         try { controls.remember(id) } catch (error) { warnError(error, 'Could not remember the Codex conversation') }
       },
@@ -393,6 +732,7 @@ async function main(): Promise<void> {
         }
       },
       onActivity: (event, thread) => {
+        brain.observe(event)
         work.receive(event, thread)
         const sideThread = event.params.threadId
         const card = typeof sideThread === 'string' ? sideCards.get(sideThread) : undefined
@@ -486,7 +826,7 @@ async function main(): Promise<void> {
               plans = [...plans.slice(-9), { content, status: 'completed' }]
               void hud.updateNow(ownerChat)
             }
-            void sendFinalText(progress.text, false).catch(() => undefined)
+            void sendFinalText(progress.text, bridgeOrigin(session?.currentThread ?? null), false).catch(() => undefined)
           }
         }
       },
@@ -516,8 +856,8 @@ async function main(): Promise<void> {
         })
       },
       ...sessionApprovalOptions(approvalSetup, approvals),
-      ...(env.KROT_CODEX_SANDBOX ? { sandbox: env.KROT_CODEX_SANDBOX } : {}),
-      ask: (input, signal) => questions.ask(input, signal),
+      ...(sandbox.sandbox ? { sandbox: sandbox.sandbox } : {}),
+      ask: (input, signal) => askWithBrain(input, signal),
       chatAction: (key, args, current, tool) => {
         const epoch = stopEpoch
         const result = isComponentTool(tool)
@@ -533,12 +873,47 @@ async function main(): Promise<void> {
       if (!stopping) process.exitCode = 1
       shutdown()
     })
+    const brainRpc = brain.attach(codex)
+    async function refreshBrainHooks(): Promise<void> {
+      const current = await brainHookStatus(hookPaths(process.env),
+        async () => listedHooks(await brainRpc('hooks/list', {}, 2000)))
+      brain.setHooks(current)
+      const config = await brainRpc('config/read', { cwd: workspace, includeLayers: false }, 2000).catch(() => undefined)
+      brain.setNativeMemories(object(object(config?.config).features).memories === true)
+    }
     if (codex.currentThread) controls.remember(codex.currentThread)
     const modelMenu = new ModelMenu({
       ownerId, chat: ownerChat, telegram, controls, models: () => codex.models(), efforts: !proxy,
       ...(process.env.KROT_CODEX_MODEL ? { defaultModel: process.env.KROT_CODEX_MODEL } : {}),
     })
+    // /restart, /update (S6, S9). Behind the root relay Codex belongs to the server, so /update codex is off.
+    const updateCommands = new UpdateCommands({
+      send: text => send(text),
+      acknowledge: text => notices.acknowledge(text),
+      busy: () => !bridgeIdle(),
+      // Queued messages do not count: no turn is admitted during maintenance, they run after the restart.
+      turnActive: () => Boolean(task || work.busy || codex.isRunning || goalActive || externalQuestion || recoveringInbox ||
+        recoveringGoal || deliveringGoal || sides.size > 0 || admission.claiming),
+      sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+      onIdle: () => startNext(),
+      restart: plannedRestart,
+      trialPending: () => trialPending,
+      selfUpdate,
+      codexUpdate: proxy ? undefined : new CodexUpdate({
+        run: runCommand, fetchText: fetchTextOrUndefined, home: process.env.HOME ?? workspace, stateDir: paths.root,
+        codexPath: () => findOnPath('codex', process.env.PATH),
+        // A separate short-lived App Server of the staged binary: handshake plus model/list.
+        probe: stagedCodexProbe(workspace),
+      }),
+    })
+    maintenanceActive = () => updateCommands.maintenance()
     await codex.initialize()
+    health.handshake()
+    if (brain.enabled) {
+      await refreshBrainHooks().catch(() => log.warn('Brain hook status could not be checked'))
+      await brain.start()
+      syncBrainQuestions()
+    }
     workerStatusTimer = setInterval(() => {
       if (!stopping) {
         void work.reconcileChildren(child => codex.threadIsIdle(child))
@@ -558,7 +933,7 @@ async function main(): Promise<void> {
       log,
       deleteOnComplete: config.status.delete_on_complete,
     })
-    await memory?.snapshotStartup()
+    if (!brain.enabled) await memory?.snapshotStartup()
     if (outbox) {
       outboxTimer = setInterval(() => {
         if (!flushing) flushing = outbox.flushDue(Date.now()).finally(() => { flushing = undefined })
@@ -568,7 +943,8 @@ async function main(): Promise<void> {
 
     // Every enabled command is accepted and listed in /help; Telegram's menu
     // shows only the short list (KROT_MENU_COMMANDS or the default).
-    const commands = codexCommandSet(config, !!learning, process.env.KROT_MENU_COMMANDS, log)
+    const buildCommands = () => codexCommandSet(config, !!learning, process.env.KROT_MENU_COMMANDS, log, [], brain.enabled)
+    let commands = buildCommands()
     // Account limits for the HUD: cached for a minute and refreshed in the
     // background, so a slow or failing read never delays or breaks the HUD.
     const codexLimits = new CodexLimitsCache(() => codex.usageLimits(), {
@@ -603,6 +979,37 @@ async function main(): Promise<void> {
       await hudAnchor.settled()
       await telegram.sendMessage(ownerChat, text, {})
     }
+    async function sendMemory(reply: MemoryReply): Promise<void> {
+      if (!reply.text) return
+      await hudAnchor.settled()
+      await telegram.sendMessage(ownerChat, reply.text, reply.buttons.length ? { reply_markup: {
+        inline_keyboard: reply.buttons.map(row => row.map(button => ({ text: button.label, callback_data: button.data }))),
+      } } : {})
+    }
+
+    type BrainExecution = ReturnType<typeof brain.execution>
+    const brainKey = (message: Message) => brainScope + ':' + message.message_id
+    const brainDate = (message: Message) => new Date(message.date * 1000).toISOString()
+    // The Brain input of a turn: its key and classification come from the turn origin.
+    function brainInput(message: Message, turn: TurnOrigin, input?: string, error?: string) {
+      return {
+        origin: turn.origin, inputKind: turn.inputKind, key: turn.key, sessionId: '', tsIn: brainDate(message),
+        cue: turn.origin === 'owner-direct' && hasMemoryCue(input ?? ''),
+        ...(input === undefined ? {} : { input }), ...(error === undefined ? {} : { error }),
+      }
+    }
+    function brainRecovery(message: Message) {
+      return brain.recover(brainKey(message), brainDate(message).slice(0, 10))
+    }
+    async function recordBrainDelivery(ticket: TurnTicket | undefined, outcome: TurnOutcome,
+      execution?: BrainExecution, notify = false): Promise<void> {
+      const notice = ticket ? await brain.turnDelivered(ticket, outcome) : undefined
+      if (!notify || !brain.enabled || stopping) return
+      const warning = notice?.unavailable || execution?.unavailable || (!execution && !ticket)
+      const reply = warning ? { text: BRAIN_UNAVAILABLE, buttons: [] } : brain.notice(notice?.saved ?? [])
+      await sendMemory(reply).catch((error: unknown) => warnError(error, 'Could not send the Brain receipt'))
+    }
+
     // The «В очереди» line about one queued owner message: a silent reply to it, so it is no extra ping. Sent only if
     // the message still waits once the HUD card landed; on pickup a still-queued send is cancelled through the rate
     // limiter's signal, a sent one deleted.
@@ -616,9 +1023,9 @@ async function main(): Promise<void> {
     })
     let learningRetryAfter = 0
     function runLearning(force = false): void {
-      if (!learning || stopping || !force && Date.now() < learningRetryAfter) return
+      if (brain.enabled || !learning || stopping || !force && Date.now() < learningRetryAfter) return
       void learning.review(force).then(count => {
-        if (stopping) return undefined
+        if (brain.enabled || stopping) return undefined
         if (count && !autoSaveLearning) return send('💾 Обновление памяти · ' + count + '. /memory pending · /memory list')
         if (count && force) return send('💾 Сохранено записей · ' + count + '. /memory list')
         if (count) log.info('Codex learning saved entries', { count })
@@ -633,6 +1040,7 @@ async function main(): Promise<void> {
       }).catch((error: unknown) => warnError(error, 'Could not send learning status'))
     }
     async function recordMemory(sessionId: string | null, userText: string, agentText: string, durationMs: number): Promise<void> {
+      if (brain.enabled) return
       try {
         await memory?.recordTurn({
           sessionId, userText: redactSecrets(userText, secrets), agentText: redactSecrets(agentText, secrets), durationMs,
@@ -640,23 +1048,99 @@ async function main(): Promise<void> {
       } catch (error) { warnError(error, 'Could not write agent memory') }
     }
 
-    async function sendFinalText(text: string, containsFiles: boolean, replyTo?: number, messageId?: number,
-      onSent?: (id: number) => void): Promise<void> {
+    // True when a part went to the outbox: its later delivery, not this call, completes `brainKey`'s exchange.
+    // `origin`: the turn the text answers; a question in it is the owner's only for an owner turn.
+    async function sendFinalText(source: string, origin: TurnOrigin, containsFiles: boolean, replyTo?: number,
+      messageId?: number, onSent?: (id: number) => void, brainKey?: string): Promise<boolean> {
       // Secrets are masked in the source: HTML rendering escapes `&`, `<`, `>` and quotes past exact matching.
-      const normalized = normalizeChatReply(redactSecrets(text, secrets))
-      text = splitLongBlock(normalized)
-      if (!text) return
+      const normalized = normalizeChatReply(redactSecrets(source, secrets))
+      const text = splitLongBlock(normalized)
+      if (!text) return false
       await hudAnchor.settled()
       // ownerReply: the reply's own send queue and the reserved slots of the minute budget (rate-limited layer).
       const quote = { ownerReply: true, ...(replyTo === undefined ? {} : { reply_to_message_id: replyTo }) }
       const question = questionConfig.enabled ? detectOpenQuestion(redactSecrets(text, secrets)) : undefined
-      async function recordQuestion(messageId: number): Promise<void> {
-        if (question) {
-          questionStore.set({ chatId: ownerChat, messageId, askedAtMs: Date.now(),
-            code: question.code, snippet: question.snippet, remindersSent: 0 })
-          await leases.recordQuestion(messageId, question.snippet).catch((error: unknown) => warnError(error, 'Could not save an open question'))
+      // The same helper serves the outbox's deferred delivery, so both paths keep the turn's origin.
+      const recordQuestion = (messageId: number): Promise<void> => ownerEffects.questionSeen(origin, messageId, question)
+      // The inbox persists a string array. Keep the plain fallback pieces in a final entry
+      // with no visible text. The Markdown renderer never emits <u> tags.
+      const fallbackPlanTag = '<u data-plain-fallbacks="'
+      const fallbackPlanEnd = '"></u>'
+      let saved = messageId === undefined ? undefined : inbox.replyPlan(messageId)
+      const metadata = saved?.at(-1)
+      const plainPlans = new Map<number, string[]>()
+      if (messageId !== undefined && saved && metadata?.startsWith(fallbackPlanTag) && metadata.endsWith(fallbackPlanEnd)) {
+        saved = saved.slice(0, -1)
+        try {
+          const encoded = metadata.slice(fallbackPlanTag.length, -fallbackPlanEnd.length)
+          const parsed: unknown = JSON.parse(decodeURIComponent(encoded))
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('Invalid plain reply fallback plan')
+          }
+          const entries: [string, unknown][] = Object.entries(parsed)
+          for (const [key, pieces] of entries) {
+            if (!/^(0|[1-9]\d*)$/.test(key) || !Number.isSafeInteger(Number(key)) ||
+                !Array.isArray(pieces) || !pieces.every((piece: unknown): piece is string => typeof piece === 'string')) {
+              throw new Error('Invalid plain reply fallback plan')
+            }
+            plainPlans.set(Number(key), pieces)
+          }
+        } catch {
+          // Drop corrupt metadata before delivery so an interrupted retry does not warn again.
+          plainPlans.clear()
+          inbox.setReplyPlan(messageId, saved)
+          log.warn('Could not read saved plain reply fallback plan')
         }
-        else if (questionStore.get(ownerChat)?.code !== 'AQ_CARD') questionStore.clear(ownerChat)
+      }
+      function savePlan(id: number, parts: readonly string[]): void {
+        inbox.setReplyPlan(id, plainPlans.size === 0 ? parts :
+          [...parts, fallbackPlanTag + encodeURIComponent(JSON.stringify(Object.fromEntries(plainPlans))) + fallbackPlanEnd])
+      }
+      function planParts(id?: number): string[] {
+        if (id === undefined) return splitMessage(markdownToTelegramHtml(text))
+        const redaction = { secrets, redact: (html: string) => redactOutboundText(html, 'HTML', secrets) }
+        if (saved) {
+          let done = 0
+          while (done < saved.length && inbox.replyPart(id, 'text:' + done)) done += 1
+          const pending = resumeMessagePlan(saved, done, redaction)
+          if (!pending) return [...saved]
+          const parts = [...saved.slice(0, done).map((part, index) =>
+            inbox.replyPart(id, 'text:' + index) === 'fallback' ? redaction.redact(part) : ''), ...pending]
+          savePlan(id, parts)
+          return parts
+        }
+        if (!inbox.replyPart(id, 'text:0')) return plannedTextParts(inbox, id, normalized)
+        // Pre-plan receipts count cuts in the original stored reply. Recover those cuts before masking
+        // currently configured values, which may change the length or push a line over the old limit.
+        const original = markdownToTelegramHtml(splitLongBlockLegacy(normalizeChatReply(source)))
+        const { ends } = splitMessageLegacy(original)
+        let done = 0
+        while (done < ends.length && inbox.replyPart(id, 'text:' + done)) done += 1
+        const redacted = markdownToTelegramHtml(splitLongBlockLegacy(normalized))
+        const pending = done === ends.length ? [] : splitMessageFrom(redacted,
+          redactedRenderOffset(original, redacted, ends[done - 1] ?? 0))
+        // The earlier slots are identified by receipt alone. Never persist their unredacted text.
+        const parts = [...Array<string>(done).fill(''), ...pending]
+        savePlan(id, parts)
+        return parts
+      }
+      function textPlan(id?: number): { parts: string[]; document?: string } {
+        try {
+          return { parts: planParts(id) }
+        } catch (error) {
+          if (!(error instanceof PreformattedDocumentError)) throw error
+          return { parts: [], document: redactSecrets(plainTextWithLinks(error.html, Infinity), secrets) }
+        }
+      }
+      async function tryHtml(part: string, id?: number): Promise<{ message_id: number } | { fallback: true }> {
+        if (validateTelegramHtml(part).downgraded) return { fallback: true }
+        try {
+          return await telegram.sendMessage(ownerChat, part, { ownerReply: true, parse_mode: 'HTML',
+            ...(id === undefined ? {} : { reply_to_message_id: id }) })
+        } catch (error) {
+          if (!isTelegramHtmlParseError(error)) throw error
+          return { fallback: true }
+        }
       }
       if (messageId !== undefined) {
         const richEligible = sendsAsRich(text, ownerChat, config.richMessages, containsFiles)
@@ -670,27 +1154,65 @@ async function main(): Promise<void> {
             agentChat.remember(result.value.message_id, true, true, true)
             await recordQuestion(result.value.message_id)
           }
-          if (result.state !== 'fallback') return
+          if (result.state !== 'fallback') return false
         } else inbox.setReplyPart(messageId, 'rich', 'fallback')
-        // The saved chunk plan keeps `text:N` receipts pointing at the chunks they were counted for.
-        for (const [index, part] of plannedTextParts(inbox, messageId, normalized, source => redactSecrets(source, secrets)).entries()) {
-          const key = 'text:' + index
-          const result = await deliverReplyPart(inbox.replyPart(messageId, key),
-            state => inbox.setReplyPart(messageId, key, state),
-            () => withoutDeletedQuote(async id => {
-              const options = { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }
-              try { return await telegram.sendMessage(ownerChat, part, { ...options, parse_mode: 'HTML' }) }
-              catch (error) {
-                if (!isTelegramHtmlParseError(error)) throw error
-                return telegram.sendMessage(ownerChat, plainTextWithLinks(part), options)
-              }
-            }, index === 0 ? replyTo : undefined))
+        const replyId = messageId
+        const deliver = <T>(key: string, sendPart: () => Promise<T>, fallback?: (value: T) => boolean) =>
+          deliverReplyPart(inbox.replyPart(replyId, key), state => inbox.setReplyPart(replyId, key, state), sendPart, fallback)
+        const documentKey = 'text:document'
+        if (inbox.replyPart(replyId, documentKey)) {
+          if (inbox.replyPart(replyId, documentKey) === 'sending') inbox.setReplyPart(replyId, documentKey, 'uncertain')
+          return false
+        }
+        const { parts, document } = textPlan(messageId)
+        if (document !== undefined) {
+          const result = await deliver(documentKey, () =>
+            withoutDeletedQuote(id => sendTextDocument(telegram, ownerChat, document, id), replyTo))
           if (result.value) {
+            agentChat.remember(result.value.message_id, true, true)
+            await recordQuestion(result.value.message_id)
+          }
+          return false
+        }
+        // The saved chunk plan keeps `text:N` receipts pointing at the chunks they were counted for.
+        for (const [index, original] of parts.entries()) {
+          const key = 'text:' + index
+          const part = redactOutboundText(original, 'HTML', secrets)
+          const target = index === 0 ? replyTo : undefined
+          const result = await deliver(key, () => withoutDeletedQuote(id => tryHtml(part, id), target),
+            value => 'fallback' in value)
+          if (result.value && 'message_id' in result.value) {
             agentChat.remember(result.value.message_id, true, true)
             if (index === 0) await recordQuestion(result.value.message_id)
           }
+          if (result.state !== 'fallback') continue
+          let pieces = plainPlans.get(index)
+          if (!pieces) {
+            // A plan saved by the previous bridge may already have plain receipts. Its saved HTML
+            // is the best available record of what the old plain splitter received.
+            const previous = inbox.replyPart(replyId, key + ':plain:0') ? saved?.[index] : undefined
+            pieces = protectPlainFallbackCuts(splitPlainFallback(previous ?? part), secrets)
+              .map(piece => redactSecrets(piece, secrets))
+            plainPlans.set(index, pieces)
+            savePlan(replyId, parts)
+          }
+          for (const [subIndex, piece] of protectPlainFallbackCuts(pieces, secrets).entries()) {
+            const sent = await deliver(key + ':plain:' + subIndex, async () => {
+              if (!piece) return undefined
+              const plain = redactSecrets(piece, secrets)
+              return withoutDeletedQuote(id => plain.length > TELEGRAM_MAX_MESSAGE
+                ? sendTextDocument(telegram, ownerChat, plain, id)
+                : telegram.sendMessage(ownerChat, plain,
+                  { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }),
+              subIndex === 0 ? target : undefined)
+            })
+            if (sent.value) {
+              agentChat.remember(sent.value.message_id, true, true)
+              if (index === 0 && subIndex === 0) await recordQuestion(sent.value.message_id)
+            }
+          }
         }
-        return
+        return false
       }
       let rich
       let retryAfter: number | undefined
@@ -707,34 +1229,58 @@ async function main(): Promise<void> {
         agentChat.remember(rich.message_id, true, true, true)
         onSent?.(rich.message_id)
         await recordQuestion(rich.message_id)
-        return
+        return false
       }
-      for (const [index, part] of splitMessage(markdownToTelegramHtml(text)).entries()) {
-        const options = { parse_mode: 'HTML' as const, ownerReply: true, ...(index === 0 ? quote : {}) }
-        if (retryAfter !== undefined && outbox) {
-          outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter, index === 0 ? question : undefined)
-          continue
+      const { parts, document } = textPlan()
+      let queued = false
+      async function sendOrDefer(part: string, format: 'HTML' | 'plain' | 'document', first: boolean, last: boolean): Promise<boolean> {
+        const options: SendMessageOpts = { ownerReply: true, ...(first ? quote : {}) }
+        if (format === 'HTML') options.parse_mode = 'HTML'
+        const target = first ? replyTo : undefined
+        const queue = (pending: Outbox, wait: number): true => {
+          // Per-chat FIFO: only the last piece of the final part completes the exchange.
+          pending.enqueue(ownerChat, redactSecrets(part, secrets), options, wait, { origin,
+            question: first ? question : undefined, brainKey: last ? brainKey : undefined, document: format === 'document' })
+          queued = true
+          return true
         }
+        if (retryAfter !== undefined && outbox) return queue(outbox, retryAfter)
+        let sent: { message_id: number } | { fallback: true }
         try {
-          const sent = await telegram.sendMessage(ownerChat, part, options)
-          agentChat.remember(sent.message_id, true, true)
-          onSent?.(sent.message_id)
-          if (index === 0) await recordQuestion(sent.message_id)
+          switch (format) {
+            case 'HTML': sent = await tryHtml(part, target); break
+            case 'plain': sent = await telegram.sendMessage(ownerChat, part, options); break
+            case 'document':
+              sent = await withoutDeletedQuote(id => sendTextDocument(telegram, ownerChat, part, id), target)
+              break
+          }
         } catch (error) {
           const flood = parse429(error)
-          if (flood && outbox) {
-            retryAfter = flood.retryAfter
-            outbox.enqueue(ownerChat, redactSecrets(part, secrets), options, retryAfter, index === 0 ? question : undefined)
-          } else {
-            if (!isTelegramHtmlParseError(error)) throw error
-            const sent = await telegram.sendMessage(ownerChat, plainTextWithLinks(part),
-              index === 0 ? quote : { ownerReply: true })
-            agentChat.remember(sent.message_id, true, true)
-            onSent?.(sent.message_id)
-            if (index === 0) await recordQuestion(sent.message_id)
+          if (!flood || !outbox) throw error
+          retryAfter = flood.retryAfter
+          return queue(outbox, retryAfter)
+        }
+        if ('fallback' in sent) return false
+        agentChat.remember(sent.message_id, true, true)
+        onSent?.(sent.message_id)
+        if (first) await recordQuestion(sent.message_id)
+        return true
+      }
+      if (document !== undefined) {
+        await sendOrDefer(document, 'document', true, true)
+      } else {
+        for (const [index, part] of parts.entries()) {
+          const first = index === 0
+          const last = index === parts.length - 1
+          if (validateTelegramHtml(part).downgraded || !await sendOrDefer(part, 'HTML', first, last)) {
+            const pieces = splitPlainFallback(part)
+            for (const [subIndex, plain] of pieces.entries()) {
+              await sendOrDefer(plain, 'plain', first && subIndex === 0, last && subIndex === pieces.length - 1)
+            }
           }
         }
       }
+      return queued
     }
     const actionApi = {
       ...telegram,
@@ -766,7 +1312,15 @@ async function main(): Promise<void> {
           if ('message_id' in result) return { messageId: result.message_id, rich: true as const }
         }
         const html = markdownToTelegramHtml(text)
-        const { message_id: messageId } = splitMessage(html).length === 1
+        let singlePart: boolean
+        try {
+          singlePart = splitMessage(html).length === 1
+        } catch (error) {
+          if (!(error instanceof PreformattedDocumentError)) throw error
+          const result = await sendTextDocument(telegram, ownerChat, plainTextWithLinks(error.html, Infinity), id)
+          return { messageId: result.message_id }
+        }
+        const { message_id: messageId } = singlePart
           ? await telegram.sendMessage(ownerChat, html, { ...quote, parse_mode: 'HTML' }).catch(error => {
             if (!isTelegramHtmlParseError(error)) throw error
             return telegram.sendMessage(ownerChat, text, quote)
@@ -780,6 +1334,7 @@ async function main(): Promise<void> {
         const done = await leases.agentAction(action, id, resolution)
         if (done && messageId !== undefined && questionStore.get(ownerChat)?.messageId === messageId) {
           questionStore.clear(ownerChat)
+          syncBrainQuestions()
         }
         return done
       },
@@ -791,12 +1346,18 @@ async function main(): Promise<void> {
     })
     onDeferredDelivery = (item, id) => {
       if (item.chatId !== ownerChat) return
+      // The outbox sent the last part of a reply: its exchange is delivered now (with the «Сохранено» notice).
+      if (item.brainKey) {
+        const key = item.brainKey
+        void brain.recover(key).then(ticket => ticket ? recordBrainDelivery(ticket, { status: 'delivered' }, undefined, true) : undefined)
+          .catch((error: unknown) => warnError(error, 'Could not record an outbox-delivered Brain reply'))
+      }
       work.repost(id)
       agentChat.remember(id, true, true)
+      // An item saved without an origin is a guest's: its question never becomes the owner's.
       if (questionConfig.enabled && item.question) {
-        const { code, snippet } = item.question
-        questionStore.set({ chatId: ownerChat, messageId: id, askedAtMs: Date.now(), code, snippet, remindersSent: 0 })
-        void leases.recordQuestion(id, snippet).catch((error: unknown) => warnError(error, 'Could not save an open question'))
+        void ownerEffects.questionSeen(parseTurnOrigin(item.origin, id), id, item.question)
+          .catch((error: unknown) => warnError(error, 'Could not save an open question'))
       }
     }
     function chatContext(messages: readonly Message[]): string {
@@ -876,17 +1437,19 @@ async function main(): Promise<void> {
     async function deliverGoalOutcome(thread: string, goal: Record<string, unknown> | null, text: string): Promise<void> {
       const completed = goal?.status === 'complete'
       const ticket = completed ? controls.goalLease(thread) : undefined
-      const reply = extractAttachments(ticket
+      // The goal result of the owner's main thread is his.
+      const origin = mainOrigin(thread)
+      const reply = ownerEffects.attachments(origin, ticket
         ? await leases.completion(ticket).complete(text) : hideLeaseCompletions(text))
       const headline = completed ? '🎯 Цель завершена.' : 'Работа над целью остановилась' +
         (goal?.status ? ' (' + String(goal.status) + ').' : '.')
       const body = [headline, leases.finalReply(reply.text, resolveAskGuardMode(config, log))].filter(Boolean).join('\n\n')
-      if (!completed) await sendFinalText(body, reply.files.length > 0)
+      if (!completed) await sendFinalText(body, origin, reply.files.length > 0)
       else if (controls.goalTextDelivery !== 'sent') {
         if (controls.goalTextDelivery !== 'sending') {
           controls.setGoalTextDelivery(thread, 'sending')
           try {
-            await sendFinalText(body, reply.files.length > 0)
+            await sendFinalText(body, origin, reply.files.length > 0)
             controls.setGoalTextDelivery(thread, 'sent')
           } catch (error) {
             const outcome = classifySendError(error, 30_000).kind
@@ -1007,7 +1570,7 @@ async function main(): Promise<void> {
         }
         if (mode === 'pause' || mode === 'cancel') {
           stopEpoch++
-          controls.setPendingOwnerTask(codex.currentThread)
+          ownerEffects.withdrawPendingTask(codex.currentThread)
           await goalStarting?.catch(() => undefined)
           if (controls.goalThread !== codex.currentThread || !controls.goalThread) {
             await send('В этом диалоге нет цели агента.')
@@ -1026,10 +1589,30 @@ async function main(): Promise<void> {
           await send(mode === 'cancel' ? 'Цель отменена.' : 'Цель на паузе. Продолжить: /goal resume.')
           return
         }
-        if (task || codex.isRunning || goalActive || recoveringGoal || deliveringGoal) {
-          await send('Сначала дождись завершения текущей задачи или приостанови её через /stop.')
+        // Claimed before the first await: /restart and /update cannot start in the gap before the goal counts as active.
+        const blocked = admission.blocker()
+        const release = blocked ? undefined : admission.claim()
+        if (!release) {
+          await send(blocked === 'maintenance'
+            ? 'Сейчас мост перезапускается или обновляется. Цель не запускаю: повтори /goal, когда он вернётся.'
+            : 'Сначала дождись завершения текущей задачи или приостанови её через /stop.')
           return
         }
+        try {
+          await startGoal(mode, args)
+        } finally {
+          release()
+          // A message that arrived while the start held admission runs now unless the goal took over.
+          if (!goalActive) startNext()
+        }
+      } catch (error) {
+        warnError(error, 'Codex could not run /goal')
+        await send('Codex не смог выполнить команду /goal.')
+      }
+    }
+
+    async function startGoal(mode: string, args: string): Promise<void> {
+      {
         const thread = await codex.attachGoalThread()
         if (mode === 'resume' && controls.goalThread !== thread) {
           await send('В этом диалоге нет сохранённой цели.')
@@ -1048,7 +1631,7 @@ async function main(): Promise<void> {
         }
         const completion = mode !== 'resume' || !previousTicket ? leases.completion() : undefined
         try {
-          const learned = mode === 'resume' ? '' : learning?.context(args)
+          const learned = brain.enabled || mode === 'resume' ? '' : learning?.context(args)
           const goalContext = [
             ...(completion ? [goalLeasePrefix, leases.instructions(), completion.instructions, agentChatInstructions,
               'Если в карточке нужны несколько ответов, напиши в заголовке вопроса «Выбери несколько».'] : []),
@@ -1067,9 +1650,6 @@ async function main(): Promise<void> {
         }
         await send(mode === 'resume' ? 'Продолжаю работу по цели.' :
           '🎯 Цель принята. Продолжу работу самостоятельно и сообщу о вехах. /stop ставит цель на паузу.')
-      } catch (error) {
-        warnError(error, 'Codex could not run /goal')
-        await send('Codex не смог выполнить команду /goal.')
       }
     }
 
@@ -1102,7 +1682,7 @@ async function main(): Promise<void> {
             await sendFinalText(sessions.length
               ? ['Сессии Claude за ' + date, ...sessions.map(([id, count]) =>
                 id + ' · записей ' + count), 'Продолжение /cc archive ' + date + ' resume <ID>'].join('\n')
-              : 'В архиве за эту дату нет идентификаторов сессий.', false)
+              : 'В архиве за эту дату нет идентификаторов сессий.', bridgeOrigin(codex.currentThread), false)
           } else if (rest[1] === 'resume' && rest[0] && rest.length <= 3) {
             if (task || recoveringInbox || recoveringGoal || deliveringGoal || codex.isRunning || goalActive) {
               await send('Дождись завершения текущей задачи или останови её через /stop.')
@@ -1193,14 +1773,9 @@ async function main(): Promise<void> {
       })
     }
 
-    const bridgeRepo = join(import.meta.dir, '..', '..', '..')
     const usage = usageCommand(days => collectUsage(bridgeRepo, paths.root, days), send)
     const doctor = new DoctorCommand({
-      collect: () => collectDoctorReport({
-        repo: bridgeRepo, env: process.env,
-        doctor: () => runDoctorScript(join(import.meta.dir, '..', '..', 'scripts', 'doctor.ts'), process.env),
-        errors: () => errorJournal.recent(),
-      }),
+      collect: () => collectBridgeDoctorReport(sandbox.fallback),
       send, repo: bridgeRepo, selfRestart: selfRestartEnabled, secrets,
     })
 
@@ -1217,7 +1792,7 @@ async function main(): Promise<void> {
       const result = codex.compact()
       task = (async () => {
         const [status] = await Promise.all([result, send('🗜 Сжимаю контекст.').catch(() => undefined)])
-        if (status === 'completed') await memory?.snapshotBoundary('compact')
+        if (status === 'completed' && !brain.enabled) await memory?.snapshotBoundary('compact')
         if (stopping) return
         await send(status === 'completed' ? 'Контекст сжат.' :
           status === 'interrupted' ? 'Сжатие остановлено.' : 'Codex не смог сжать контекст.')
@@ -1241,7 +1816,7 @@ async function main(): Promise<void> {
       stopEpoch++
       cancelPendingBridgeRestart()
       inbox.cancelContinuation()
-      controls.setPendingOwnerTask(codex.currentThread)
+      ownerEffects.withdrawPendingTask(codex.currentThread)
       approvals?.cancelAll()
       questions.cancel()
       await goalStarting?.catch(() => undefined)
@@ -1273,13 +1848,61 @@ async function main(): Promise<void> {
       }
     }
 
+    const legacyForget = new Map<string, () => string>()
+    async function handleMemory(args: string): Promise<void> {
+      const enabled = brain.enabled
+      const brainCommand = enabled || /^(?:on|off|status)$/u.test(args) || (!args && !learning)
+      if (brainCommand) {
+        const result = await brain.memoryCommand({ args, ownerPrivateChat: true })
+        if (enabled !== brain.enabled) {
+          legacyForget.clear()
+          commands = buildCommands()
+          void registerOwnerScopedCommands(bot.api, commands.menu, [ownerId], log)
+          if (brain.enabled) void refreshBrainHooks().catch(() => log.warn('Brain hook status could not be checked'))
+          else await memory?.snapshotStartup().catch((error: unknown) => warnError(error, 'Could not resume legacy memory'))
+        }
+        await sendMemory(result)
+        return
+      }
+      if (args === 'review') {
+        await send('Проверю недавний диалог в фоне.')
+        runLearning(true)
+        return
+      }
+      const forget = /^forget\s+(\S+)$/u.exec(args)
+      if (forget) {
+        const confirm = learning?.confirmForget(forget[1]!)
+        if (!confirm) return send('Запись не найдена.')
+        const data = 'krot:memory:' + randomUUID()
+        if (legacyForget.size >= 20) legacyForget.delete(legacyForget.keys().next().value!)
+        legacyForget.set(data, confirm)
+        await sendMemory({ text: 'Забыть «' + forget[1] + '»?', buttons: [[{ label: 'Подтвердить удаление', data }]] })
+        return
+      }
+      if (learning) await send(learning.command(args))
+    }
+
     async function handleCommand(name: string, args: string, messageId?: number): Promise<void> {
+      if (name === 'memory') {
+        if (commands.accepts(name) || /^(?:|status|on|off)$/u.test(args)) return handleMemory(args)
+        await send(brain.enabled ? 'Команда недоступна. Список команд: /help.' : 'Brain выключен. /memory on')
+        return
+      }
       if (!commands.accepts(name)) {
         await send('Команда недоступна. Список команд: /help.')
         return
       }
       if (name === 'stop') return stop()
       if (name === 'compact') return compact()
+      if (name === 'restart' || name === 'update') {
+        // In the background: npm and bun install take minutes and must not hold /stop and other updates.
+        void updateCommands.handle(name, args, messageId)
+          .catch((error: unknown) => {
+            warnError(error, 'Could not finish /' + name)
+            return send('Команда /' + name + ' не выполнилась. Подробности в /doctor.')
+          }).catch(() => undefined)
+        return
+      }
       if (name === 'usage') {
         void usage(args).catch((error: unknown) => warnError(error, 'Could not deliver /usage'))
         return
@@ -1294,15 +1917,6 @@ async function main(): Promise<void> {
       }
       if (name === 'cc') return handleCc(args, messageId)
       if (name === 'goal') return handleGoal(args)
-      if (name === 'memory' && learning) {
-        if (args === 'review') {
-          await send('Проверю недавний диалог в фоне.')
-          runLearning(true)
-        } else {
-          await send(learning.command(args))
-        }
-        return
-      }
       if (name === 'lease' && messageId !== undefined) {
         await send(await leases.command(args, messageId))
         void hud.updateNow(ownerChat)
@@ -1369,7 +1983,7 @@ async function main(): Promise<void> {
           }
         }
         cancelPendingBridgeRestart()
-        await memory?.snapshotBoundary('clear')
+        if (!brain.enabled) await memory?.snapshotBoundary('clear')
         codex.reset()
         plans = []
         if (name === 'new') await telegram.sendMessage(ownerChat, '<b>Новая сессия</b> — контекст очищен.', { parse_mode: 'HTML' })
@@ -1388,6 +2002,23 @@ async function main(): Promise<void> {
       await handleCommand(name, '')
     })
     void registerOwnerScopedCommands(bot.api, commands.menu, [ownerId], log)
+
+    bot.callbackQuery(BRAIN_CALLBACK, async ctx => {
+      const owner = isOwnerPrivateChat(ownerId, ctx.from, ctx.chat)
+      if (stopping || !owner) {
+        await ctx.answerCallbackQuery({ text: MEMORY_REFUSED }).catch(() => undefined)
+        return
+      }
+      await ctx.answerCallbackQuery().catch(() => undefined)
+      const callback = ctx.callbackQuery.data
+      const legacy = legacyForget.get(callback)
+      legacyForget.delete(callback)
+      if (!brain.enabled && legacy) {
+        await send(legacy())
+        return
+      }
+      await sendMemory(await brain.memoryCommand({ args: '', ownerPrivateChat: true, callback }))
+    })
 
     bot.callbackQuery(APPROVAL_CALLBACK, async ctx => {
       if (ctx.from.id !== ownerId || ctx.chat?.type !== 'private' || ctx.chat.id !== ownerId) return
@@ -1459,7 +2090,7 @@ async function main(): Promise<void> {
       albums.push(id, message, () => {
         try {
           const turnId = codex.steerableTurn
-          const batch = !stopping && !recoveringInbox && turnId ? inbox.claimAlbumFollowUp(id) : undefined
+          const batch = !brain.enabled && !stopping && !recoveringInbox && turnId ? inbox.claimAlbumFollowUp(id) : undefined
           if (batch && turnId) {
             void steerClaimed(batch, turnId).catch((error: unknown) => warnError(error, 'Could not route Telegram album'))
             return
@@ -1470,7 +2101,7 @@ async function main(): Promise<void> {
     }
 
     function launchSideReply(message: Message, epoch: number): boolean {
-      if (process.env.KROT_CODEX_SIDE_REPLY !== '1' || message.forward_origin ||
+      if (brain.enabled || process.env.KROT_CODEX_SIDE_REPLY !== '1' || message.forward_origin ||
           message.reply_to_message || !message.text) return false
       const question = sideQuestion(message.text)
       if (!question) return false
@@ -1487,7 +2118,8 @@ async function main(): Promise<void> {
               AbortSignal.any([learningAbort.signal, AbortSignal.timeout(25_000)])))
           if (reply && current()) {
             try {
-              await sendFinalText(reply, false, id)
+              // A separate quick answer, not the owner's main turn: a question in it is not his.
+              await sendFinalText(reply, bridgeOrigin(codex.currentThread), false, id)
               consumed = true
             } catch (error) {
               consumed = classifySendError(error, 30_000).kind === 'ambiguous'
@@ -1506,8 +2138,11 @@ async function main(): Promise<void> {
 
     function mainSummary() {
       const first = inbox.active?.messages[0]
-      const title = first ? taskTitle(agentBody(first.text) ?? first.caption) : goalActive ? 'цель агента' : 'текущая задача'
-      const step = plans.find(item => item.status === 'in_progress')?.content ?? plans.at(-1)?.content
+      // Only the owner's own main turn is described: an isolated turn (a forward, another agent) carries foreign text.
+      const described = !first || ownerOrigin(inbox.activeOrigin) !== undefined
+      const title = !first ? goalActive ? 'цель агента' : 'текущая задача'
+        : described ? taskTitle(agentBody(first.text) ?? first.caption) : 'основная задача'
+      const step = described ? plans.find(item => item.status === 'in_progress')?.content ?? plans.at(-1)?.content : undefined
       return {
         title: redactSecrets(title, secrets),
         ...(step ? { step } : {}),
@@ -1533,6 +2168,7 @@ async function main(): Promise<void> {
       const id = message.message_id
       const epoch = stopEpoch
       const agent = provenance.origin === 'agent'
+      const brainEnabled = brain.enabled
       sides.begin(id, redactSecrets(taskTitle(agentBody(message.text) ?? message.caption), secrets), reuse)
       const settleSide = () => {
         try { inbox.finishSide(id) } catch (error) { warnError(error, 'Could not clear a finished parallel turn') }
@@ -1544,13 +2180,21 @@ async function main(): Promise<void> {
       card?.show(sideFirstStage(message))
       let cardThread: string | undefined
       void (async () => {
+        // A reply to the bot's answer from the verified owner side thread it reuses brings nothing new into that
+        // fork; any other reply target that is not the owner's own words isolates the turn (see brain-origin.ts).
+        const target = message.reply_to_message
+        const trustedReply = brainEnabled && !agent && reuse !== undefined && target?.from?.is_bot === true &&
+          sides.threadOf(target.message_id) === reuse && await brain.isSafeSide(reuse, 'side').catch(() => false)
+        const sideOrigin = classifyTurn([message], ownerId, provenance,
+          { brain: brainEnabled, key: brainKey(message), side: true, ...(trustedReply ? { trustedReply } : {}) })
         let started = false
+        let brainTurn: BrainExecution | undefined
         // `thread` set: Codex accepted the turn, keep it as a side job; unset: drop the follow-up.
         const release = (thread?: string) => {
           if (started) return
           started = true
           if (inbox.uncertainFollowUp?.message_id === id) {
-            if (thread) inbox.startSide(id, thread)
+            if (thread) inbox.startSide(id, thread, sideOrigin)
             else inbox.finishFollowUp(id, false)
           }
           startNext()
@@ -1565,35 +2209,55 @@ async function main(): Promise<void> {
           }
           if (input.kind === 'error') {
             release()
+            const ticket = await brain.turnStarting({ ...brainInput(message, sideOrigin, undefined, input.text), sessionId: 'unbound' })
+            if (ticket) await brain.turnDelivered(ticket, { status: 'failed', error: input.text })
             await send(input.text)
             return
           }
+          const isolated = sideOrigin.isolate
+          const summary = isolated ? { title: 'основная задача', elapsedMs: 0 } : mainSummary()
           const prompt = agent
-            ? [sideInstructions(mainSummary(), provenance), input.text].filter(Boolean).join('\n\n')
+            ? [sideInstructions(summary, provenance), input.text].filter(Boolean).join('\n\n')
             : sideOwnerTurn(formatReminderOn,
-              [sideInstructions(mainSummary(), provenance), agentChatInstructions, chatContext([message]), input.text])
+              [sideInstructions(summary, provenance), ...(brainEnabled ? [] : [agentChatInstructions]), chatContext([message]), input.text])
           card?.show(sideThinking)
-          const result = await codex.runSide(prompt, agent ? [] : input.images, reuse, thread => {
+          const safeReuse = !brainEnabled || !reuse || await brain.isSafeSide(reuse, isolated ? 'guest' : 'side') ? reuse : undefined
+          brainTurn = brain.execution(sideOrigin.role, brainInput(message, sideOrigin, input.text))
+          const result = await brainTurn.run(() => codex.runSide(prompt, agent ? [] : input.images, safeReuse, thread => {
             sides.attach(id, thread)
             if (card) {
               cardThread = thread
               sideCards.set(thread, card)
             }
             release(thread)
-          }, { untrusted: agent })
+          }, { untrusted: agent || isolated }))
           if (stopping) return
           // Stopped while the side thread was still opening: Codex never took the turn.
           if (!started) release()
           if (result.status === 'completed' && result.text.trim()) {
             // A finished answer is delivered even if the main task was stopped meanwhile.
-            await sendFinalText(redactSecrets(hideLeaseCompletions(result.text), secrets), false, id > 0 ? id : undefined, undefined,
-              sent => sides.remember(sent, result.threadId))
+            const text = redactSecrets(hideLeaseCompletions(result.text), secrets)
+            if (brainTurn.ticket) await brain.turnAnswered(brainTurn.ticket, text)
+            let sent = false
+            const queued = await sendFinalText(text, sideOrigin, false, id > 0 ? id : undefined, undefined, messageId => {
+              sent = true
+              sides.remember(messageId, result.threadId)
+            }, brainTurn.ticket?.key)
+            // A reply waiting in the outbox is recorded when the outbox delivers it.
+            if (!queued) {
+              await recordBrainDelivery(brainTurn.ticket, sent ? { status: 'delivered' } :
+                { status: 'failed', error: 'Side reply delivery could not be confirmed' }, brainTurn, !agent)
+            }
             settleSide()
             log.info('Codex side reply delivered')
           } else {
             // A turn that answered through its tools (reaction, component, interim reply) ends silently.
             // Counted for this turn's ID: a late receipt of an earlier turn on a reused thread is not this turn's.
             const delivered = sideDeliveries.count(result.threadId, result.turnId)
+            if (delivered && brainTurn.ticket) await brain.turnAnswered(brainTurn.ticket, result.text)
+            await recordBrainDelivery(brainTurn.ticket, delivered ? { status: 'delivered' } :
+              result.status === 'interrupted' ? { status: 'cancelled' } :
+                { status: 'failed', error: 'Codex did not produce a side reply' }, brainTurn, !agent)
             // A failed side turn is an error worth the journal; a finished or stopped one is not.
             const ended = { area: 'side-turn', status: result.status, delivered, threadId: result.threadId, messageId: id }
             if (result.status === 'failed') log.warn('Codex side turn ended without text', ended)
@@ -1603,6 +2267,7 @@ async function main(): Promise<void> {
           }
         } catch (error) {
           warnError(error, 'Could not finish a parallel Codex turn', { area: 'side-turn', messageId: id })
+          await recordBrainDelivery(brainTurn?.ticket, { status: 'failed', error: 'Side turn failed' }, brainTurn, !agent)
           if (stopping) return
           if (!started && inbox.uncertainFollowUp?.message_id === id) {
             // Codex never took it: queue it for the main thread as before.
@@ -1650,6 +2315,11 @@ async function main(): Promise<void> {
 
     async function steerClaimed(messages: Message[], turnId: string): Promise<void> {
       const id = messages[0]!.message_id
+      if (brain.enabled) {
+        inbox.finishFollowUp(id, true)
+        resumeInbox(messages[0])
+        return
+      }
       const epoch = stopEpoch
       let accepted = false
       let completedRequest = false
@@ -1696,6 +2366,18 @@ async function main(): Promise<void> {
       }
     }
 
+    // `origin`: the asking turn; without it the question is the owner's main thread's.
+    async function askWithBrain(raw: unknown, signal?: AbortSignal, origin?: TurnOrigin) {
+      const thread = codex.currentThread
+      const from: TurnOrigin | undefined = origin ?? (thread ? mainOrigin(thread) : undefined)
+      const by = ownerOrigin(from)
+      if (brain.enabled && by && Array.isArray(raw)) {
+        const titles = raw.map(question => object(question).question).filter(title => typeof title === 'string')
+        await ownerEffects.exportQuestions(by, titles)
+      }
+      try { return await questions.ask(raw, signal, from ? storedOrigin(from) : undefined) } finally { syncBrainQuestions() }
+    }
+
     async function answerAsyncQuestion(thread: string, raw: unknown[], epoch: number): Promise<void> {
       const inputs = raw.slice(0, 4).map((value, index) => {
         const request = object(value)
@@ -1705,7 +2387,7 @@ async function main(): Promise<void> {
           multiSelect: typeof request.title === 'string' &&
             /(?:выбери|выберите|отметь|отметьте) несколько|select multiple|select all that apply/iu.test(request.title) }
       })
-      const answers = await questions.ask(inputs)
+      const answers = await askWithBrain(inputs)
       if (stopping || epoch !== stopEpoch || thread !== codex.currentThread) return
       const values = inputs.flatMap(input => answers[input.id]?.answers.map(answer => ({
         question: input.question, answer,
@@ -1715,7 +2397,7 @@ async function main(): Promise<void> {
         : 'Асинхронный вопрос закрыт без ответа. Продолжай всё, что возможно без него.'
       const id = Date.now()
       try {
-        if (await codex.steer(content, id)) return
+        if (!brain.enabled && await codex.steer(content, id)) return
       } catch {
         if (stopping) return
       }
@@ -1726,6 +2408,13 @@ async function main(): Promise<void> {
       })
     }
 
+    // Hidden owner-only spike command; registered before the generic handler, which would pass it to Codex.
+    if (keyspike) {
+      bot.on('message:text', async (ctx, next) => {
+        if (!stopping && await keyspike.command(ctx.message)) return
+        await next()
+      })
+    }
     // Registered before the generic handler, which ignores bot senders and would swallow it.
     bot.on('message:pinned_message', async (ctx, next) => {
       if (!removeOwnPinService(ctx.message, {
@@ -1733,7 +2422,12 @@ async function main(): Promise<void> {
       })) await next()
     })
     bot.on('message', async ctx => {
-      if (stopping || ctx.chat.type !== 'private' || ctx.from.is_bot || ctx.from.id !== ownerId) return
+      if (stopping) return
+      if (!isOwnerPrivateChat(ownerId, ctx.from, ctx.chat)) {
+        const command = !ctx.message.forward_origin && parseCodexCommand(ctx.message.text, bot.botInfo.username ?? '')
+        if (command && command.name === 'memory' && !ctx.from?.is_bot) await ctx.reply(MEMORY_REFUSED).catch(() => undefined)
+        return
+      }
       const decision = gateTelegramMessage({
         chatType: ctx.chat.type,
         chatId: String(ctx.chat.id),
@@ -1744,12 +2438,19 @@ async function main(): Promise<void> {
       acknowledge(ctx.message)
 
       const text = ctx.message.text?.trim()
-      if (text && !ctx.message.forward_origin) questionStore.clear(ownerChat)
+      if (text && !ctx.message.forward_origin) {
+        questionStore.clear(ownerChat)
+        syncBrainQuestions()
+      }
       if (!ctx.message.forward_origin && ownerTaskWithdrawn(text)) {
         await stop()
         return
       }
       const command = ctx.message.forward_origin ? undefined : parseCodexCommand(text, bot.botInfo.username ?? '')
+      if (command?.name === 'memory' && !mayRunMemoryCommand(ctx.message, ownerId, command.args)) {
+        await send(MEMORY_WRITE_REFUSED)
+        return
+      }
       if (command) {
         if (isChatAction(command.name)) await applyChatAction(command.name, ctx.message, command.args)
         else if (isBuiltInCommand(command.name) ||
@@ -1759,6 +2460,11 @@ async function main(): Promise<void> {
         return
       }
       if (text && !ctx.message.forward_origin && questions.reply(ctx.message.reply_to_message?.message_id, text)) {
+        return
+      }
+      // «обнови кодекс» in plain words: the same as /update codex, at once.
+      if (!ctx.message.forward_origin && !ctx.message.reply_to_message && isCodexUpdateRequest(text) && commands.accepts('update')) {
+        await handleCommand('update', 'codex', ctx.message.message_id)
         return
       }
       if (text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
@@ -1792,7 +2498,7 @@ async function main(): Promise<void> {
           } catch (error) { warnError(error, 'Could not persist the Telegram message for a parallel turn') }
         }
       }
-      if (!action && text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
+      if (!brain.enabled && !action && text && !ctx.message.forward_origin && !ctx.message.reply_to_message &&
           (task || goalActive || codex.isRunning) && process.env.KROT_CODEX_SIDE_REPLY === '1' &&
           (!turnId || /^(?:отдельный|быстрый) вопрос:/iu.test(text)) && sideQuestion(text)) {
         try {
@@ -1802,7 +2508,7 @@ async function main(): Promise<void> {
           if (outcome === 'accepted' && launchSideReply(ctx.message, stopEpoch)) return
         } catch (error) { warnError(error, 'Could not persist the Telegram side question') }
       }
-      if (!action && !ctx.message.media_group_id && turnId &&
+      if (!brain.enabled && !action && !ctx.message.media_group_id && turnId &&
           (text || hasMedia(ctx.message) || hasRichBody(ctx.message) || unhandledContentKeys(ctx.message).length)) {
         try {
           const outcome = inbox.beginFollowUp(ctx.message, ownerProvenance)
@@ -1843,10 +2549,10 @@ async function main(): Promise<void> {
       }
     }
 
-    async function deliverReply(reply: InboxReply, messageId: number): Promise<boolean> {
+    async function deliverReply(reply: InboxReply, messageId: number, origin: TurnOrigin): Promise<boolean> {
       // A file-only reply skips sendFinalText's wait, so wait here as well.
       await hudAnchor.settled()
-      await sendFinalText(reply.text, reply.files.length > 0, reply.replyTo, messageId)
+      await sendFinalText(reply.text, origin, reply.files.length > 0, reply.replyTo, messageId)
       for (const [index, file] of reply.files.entries()) {
         const key = 'file:' + index
         await deliverReplyPart(inbox.replyPart(messageId, key), state => inbox.setReplyPart(messageId, key, state),
@@ -1911,12 +2617,19 @@ async function main(): Promise<void> {
       const id = first.message_id
       // A sender name only the message text claims stays marked wherever it is shown.
       const agent = agentLabel(sender)
-      inbox.start(id)
-      const result = await codex.run([agentTurnInstructions(sender), text].join('\n\n'), [], turnId => {
+      const origin = classifyTurn([first], ownerId, agentProvenance(sender.agent), { brain: brain.enabled, key: brainKey(first) })
+      inbox.start(id, origin)
+      const prompt = [agentTurnInstructions(sender), text].join('\n\n')
+      const brainTurn = brain.execution(origin.role, brainInput(first, origin, text))
+      const save = (turnId: string) => {
         try { inbox.assignTurn(id, turnId) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
-      }, { untrusted: true })
+      }
+      const result = await brainTurn.run(() => brain.enabled ? codex.runSide(prompt, [], undefined, undefined, { untrusted: true })
+        : codex.run(prompt, [], save, { untrusted: true }))
       if (stopping) return
       if (result.status !== 'completed' || !result.text.trim()) {
+        await recordBrainDelivery(brainTurn.ticket, result.status === 'interrupted' ? { status: 'cancelled' } :
+          { status: 'failed', error: 'Codex did not produce an agent reply' })
         await send(result.status === 'interrupted' ? 'Задача от агента ' + agent + ' остановлена.'
           : 'Codex не вернул ответ на сообщение агента ' + agent + '.')
         inbox.finish(id)
@@ -1924,43 +2637,44 @@ async function main(): Promise<void> {
       }
       const reply = hideQuestionMarker(hideContinuationMarker(hideLeaseCompletions(result.text)))
       inbox.complete(id, { text: redactSecrets(agentReplyText(sender, reply), secrets), files: [] })
-      await finishOrdinaryReply(epoch)
+      await finishOrdinaryReply(epoch, false, brainTurn)
       log.info('Codex answered an agent message', { agent })
     }
 
-    function rememberBlocker(message: Message, objective: string | undefined, report: string, epoch: number): void {
-      if (message.message_id > 0 && objective && ownerExecutionTask(objective) &&
-          objective.length <= 4000 && ownerTaskBlocked(report) && !stopping && epoch === stopEpoch) {
-        controls.setPendingOwnerTask(codex.currentThread, objective)
-      }
-    }
-
-    async function finishOrdinaryReply(epoch: number, recovering = false): Promise<void> {
+    async function finishOrdinaryReply(epoch: number, recovering = false, brainTurn?: BrainExecution): Promise<void> {
       const active = inbox.active
       if (active?.outcome.stage !== 'ready') return
       const id = active.messages[0]!.message_id
-      // Continuation and restart act for the owner: never for an agent's or an unknown record.
+      // Continuation and restart act for the owner: only for an owner turn origin with owner provenance,
+      // never for an agent's, an isolated forward's or an unknown record.
       const fromOwner = inbox.provenance(id).origin === 'owner'
+      const origin = inbox.activeOrigin ?? parseTurnOrigin(undefined, id)
+      const by = fromOwner ? ownerOrigin(origin) : undefined
       const { reply } = active.outcome
-      const continueGoal = fromOwner && active.outcome.continueGoal === true
-      const restartBridge = fromOwner && active.outcome.restartBridge === true
-      const restartVerification = fromOwner && active.outcome.restartVerification === true
+      const continueGoal = by !== undefined && active.outcome.continueGoal === true
+      const restartBridge = by !== undefined && active.outcome.restartBridge === true
+      const restartVerification = by !== undefined && active.outcome.restartVerification === true
+      const ticket = brainTurn ? brainTurn.ticket : (await brainRecovery(active.messages[0]!)) ?? undefined
+      if (ticket) await brain.turnAnswered(ticket, reply.text)
       let delivered: boolean
       try {
-        delivered = await deliverReply(reply, id)
+        delivered = await deliverReply(reply, id, origin)
         deliveryRetryAt = 0
       } catch (error) {
         const limited = parse429(error)
         if (limited) deliveryRetryAt = Date.now() + limited.retryAfter * 1000
+        await recordBrainDelivery(ticket, { status: 'failed', error: 'Telegram could not deliver the reply' })
         throw error
       }
+      await recordBrainDelivery(ticket, delivered ? { status: 'delivered' } :
+        { status: 'failed', error: 'Telegram delivery could not be confirmed' }, brainTurn, fromOwner)
       if (stopping) return
-      if (continueGoal && active.work?.continuation) {
+      if (by && continueGoal && active.work?.continuation) {
         const thread = codex.currentThread
         const { objective } = active.work.continuation
         await continueAutomatically(objective, epoch, active.work.lease, recovering)
         if (epoch === stopEpoch && controls.pendingOwnerTask?.objective === objective) {
-          controls.setPendingOwnerTask(thread)
+          ownerEffects.settlePendingTask(by, thread)
         }
       }
       let shouldRestart = selfRestartEnabled && delivered && restartBridge && !continueGoal && epoch === stopEpoch
@@ -1975,12 +2689,15 @@ async function main(): Promise<void> {
         if (!shouldRestart && !alreadyRestored) await send('Не удалось сохранить проверку после перезапуска. Мост продолжает работу.')
       }
       inbox.finish(id)
-      if (shouldRestart && epoch === stopEpoch) bridgeRestart.request()
+      if (shouldRestart && epoch === stopEpoch) {
+        agentRestartOwnerId = id > 0 ? id : undefined
+        bridgeRestart.request()
+      }
     }
 
     function startNext(): void {
-      if (task || stopping || resetting || recoveringInbox || recoveringGoal || deliveringGoal ||
-          goalActive || externalQuestion || codex.isRunning) return
+      // A restart or an update holds the maintenance reservation: messages wait in the inbox.
+      if (admission.blocker()) return
       try { restartHandoff?.recover(inbox) } catch (error) { warnError(error, 'Could not restore a saved restart verification') }
       let messages: Message[] | undefined
       try { messages = inbox.take() } catch (error) {
@@ -1999,6 +2716,7 @@ async function main(): Promise<void> {
       mainStartedAt = Date.now()
       task = (async () => {
         let progressResult = 'Работа завершена'
+        let brainTurn: BrainExecution | undefined
         if (controls.mirror) {
           mirror = new CodexMirror(telegram, ownerChat, secrets, agentName)
           mirror.event('turn')
@@ -2021,6 +2739,10 @@ async function main(): Promise<void> {
             return
           }
           if (input.kind === 'error') {
+            const failed = brainInput(first, classifyTurn(messages, ownerId, inbox.provenance(first.message_id),
+              { brain: brain.enabled, key: brainKey(first) }), undefined, input.text)
+            const ticket = await brain.turnStarting({ ...failed, sessionId: codex.currentThread ?? 'unbound' })
+            if (ticket) await brain.turnDelivered(ticket, { status: 'failed', error: input.text })
             await send(input.text)
             inbox.finish(first.message_id)
             return
@@ -2030,21 +2752,43 @@ async function main(): Promise<void> {
             await runAgentTurn(first, input.text, sender, epoch)
             return
           }
+          let confirmedVoice: string | undefined
+          if (brain.enabled && input.ownerTranscript && input.ownerTranscript.length <= 2000 && classifyBrainOrigin(first, ownerId, {
+            confirmedVoice: input.ownerTranscript,
+          }).origin === 'owner-direct') {
+            const yes = 'Подтвердить'
+            const confirmation = await questions.ask([{
+              id: 'brain-voice', question: 'Подтвердите расшифровку голосового сообщения:\n' + input.ownerTranscript,
+              options: [{ label: yes }, { label: 'Продолжить без памяти' }], isOther: false,
+            }])
+            if (stopping || epoch !== stopEpoch) {
+              if (!stopping) inbox.finish(first.message_id)
+              return
+            }
+            if (confirmation['brain-voice']?.answers[0] === yes) confirmedVoice = input.ownerTranscript
+          }
+          // Classified once, over every album item: only foreign text (forward, pasted quote), another agent
+          // or a foreign chat runs isolated, and only an owner origin reaches the owner effects below.
+          const turnOrigin = classifyTurn(messages, ownerId, sender, {
+            brain: brain.enabled, key: brainKey(first), confirmedVoice, continuation: verification,
+          })
+          const isolate = turnOrigin.isolate
+          const ownerTurnOrigin = ownerOrigin(turnOrigin)
           const editTarget = first.text && first.reply_to_message && !first.forward_origin &&
             requestedChatAction(first.text, agentName) === 'edit' ? first.reply_to_message : undefined
           const ownerText = !editTarget && !first.forward_origin ? (first.text ?? first.caption)?.trim() : undefined
-          const intent = turnIntent(sender, {
+          const intent = turnIntent(turnOrigin, {
             message: first, transcript: input.ownerTranscript, editing: !!editTarget, verification,
             selfRestart: selfRestartEnabled, directBackend: !proxy, restartHandoff: !!restartHandoff,
             thread: codex.currentThread, pending: controls.pendingOwnerTask,
           })
           const { taskText, mayRestartBridge, verificationEligible, continuation } = intent
-          if (intent.clearPendingOwnerTask) controls.setPendingOwnerTask(codex.currentThread)
+          if (intent.clearPendingOwnerTask && ownerTurnOrigin) ownerEffects.settlePendingTask(ownerTurnOrigin, codex.currentThread)
           const sameTaskStatus = intent.statusCheck
-          const leaseCompletion = ownerText && first.message_id > 0 ? leases.completion() : undefined
+          const leaseCompletion = ownerTurnOrigin && ownerText && first.message_id > 0 ? leases.completion() : undefined
           const question = questionFallback()
           const began = Date.now()
-          inbox.start(first.message_id, {
+          inbox.start(first.message_id, turnOrigin, {
             ...(continuation ? { continuation: continuation.context } : {}),
             ...(leaseCompletion ? { lease: leaseCompletion.ticket } : {}),
             ...(mayRestartBridge ? { mayRestartBridge: true } : {}),
@@ -2059,7 +2803,7 @@ async function main(): Promise<void> {
             turnIds.push(turnId)
             try { inbox.assignTurn(first.message_id, turnId) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
           }
-          const handoff = memory && config.memory.workspace_path && !codex.status.hasThread
+          const handoff = !brain.enabled && memory && config.memory.workspace_path && !codex.status.hasThread
             ? await readHandoffContext(config.memory.workspace_path, secrets).catch(() => '') : ''
           if (origin) {
             const ready = origin.threadId === codex.currentThread && await codex.previousTurnIdle().catch(() => false)
@@ -2073,10 +2817,15 @@ async function main(): Promise<void> {
               return
             }
           }
-          let result = await codex.run(ownerTurn(formatReminderOn, [
-            leases.instructions(), agentChatInstructions, chatContext(messages),
-            handoff,
-            learning?.context(ownerText ?? input.text) ?? '',
+          const voiceError = first.voice && !input.ownerTranscript ? 'Автоматическая расшифровка недоступна.' : undefined
+          // The owner's own words only: an album's joined captions, never the prepared input.
+          const journalInput = voiceError ? undefined : turnOrigin.origin === 'owner-direct'
+            ? (ownerWords(messages, confirmedVoice) ?? input.text) : input.text
+          brainTurn = brain.execution(turnOrigin.role, brainInput(first, turnOrigin, journalInput, voiceError))
+          const prompt = ownerTurn(formatReminderOn, [
+            ...(isolate ? [] : [leases.instructions(), agentChatInstructions]),
+            chatContext(messages), handoff,
+            brain.enabled ? '' : learning?.context(ownerText ?? input.text) ?? '',
             config.ask_user_question.enabled
               ? 'Чтобы предложить мандат, начни вопрос с [LEASE: точный объём; ttl=24h] и дай отдельные варианты «Да» и «Нет».'
               : '',
@@ -2088,20 +2837,34 @@ async function main(): Promise<void> {
                 'Изменения выполняй после того, как мост подтвердит, что отчёт относится к сохранённому поручению.',
               !editTarget && question.instructions].filter(Boolean).join(' '), input.text,
             ...(editTarget ? ['Для редактирования верни только готовый новый текст цитируемого сообщения в нужном формате.'] : []),
-          ]), input.images, saveTurn)
+          ])
+          // An isolated turn runs on a side thread: restart recovery must find it there, not in the main history.
+          const saveSideTurn = (thread: string, turnId: string) => {
+            try { inbox.assignTurn(first.message_id, turnId, thread) } catch (error) { warnError(error, 'Could not persist the Codex turn ID') }
+          }
+          let result: Awaited<ReturnType<CodexSession['run']>> & { threadId?: string } = await brainTurn.run(() => isolate
+            ? codex.runSide(prompt, input.images, undefined, saveSideTurn, { untrusted: true })
+            : codex.run(prompt, input.images, saveTurn))
           await agentChat.flush()
           for (let count = 0; count < 4 && !stopping && epoch === stopEpoch && result.status === 'completed'; count++) {
             const requested = !editTarget && question.take(result.text)
             if (!requested) break
-            const answers = (await questions.ask(requested)).fallback?.answers
+            const answers = (await askWithBrain(requested, undefined, turnOrigin)).fallback?.answers
             if (!answers?.length || stopping || epoch !== stopEpoch) {
               if (!stopping) {
-                await send('Продолжение ожидает ответа. Уточнение можно отправить новым сообщением.')
+                const text = 'Продолжение ожидает ответа. Уточнение можно отправить новым сообщением.'
+                if (brainTurn.ticket) await brain.turnAnswered(brainTurn.ticket, text)
+                await send(text)
+                await recordBrainDelivery(brainTurn.ticket, { status: 'delivered' }, brainTurn, true)
                 inbox.finish(first.message_id)
               }
               return
             }
-            result = await codex.run(questionFollowUpTurn(formatReminderOn, leases.instructions(), answers), [], saveTurn)
+            const followUp = questionFollowUpTurn(formatReminderOn, isolate ? '' : leases.instructions(), answers)
+            result = await brain.execution(turnOrigin.role).run(() => isolate
+              ? codex.runSide(followUp, [], result.threadId,
+                saveSideTurn, { untrusted: true })
+              : codex.run(followUp, [], saveTurn))
           }
           await agentChat.flush()
           if (stopping) return
@@ -2111,6 +2874,8 @@ async function main(): Promise<void> {
               finalAfterComponents(result.text, componentDelivery, componentTexts) === 'drop') {
             // The component was the answer: no second message, not even a "no answer" notice.
             log.info('Codex turn ended with a component and an empty final answer')
+            if (brainTurn.ticket) await brain.turnAnswered(brainTurn.ticket, componentTexts.join('\n\n'))
+            await recordBrainDelivery(brainTurn.ticket, { status: 'delivered' }, brainTurn, true)
             inbox.finish(first.message_id)
             return
           }
@@ -2120,6 +2885,8 @@ async function main(): Promise<void> {
             if (result.status === 'interrupted') log.info('Codex turn ended without an answer', ended)
             else log.warn('Codex turn ended without an answer', ended)
             progressResult = result.status === 'interrupted' ? 'Задача остановлена' : 'Ответ не получен'
+            await recordBrainDelivery(brainTurn.ticket, result.status === 'interrupted' ? { status: 'cancelled' } :
+              { status: 'failed', error: 'Codex did not produce a reply' }, brainTurn, true)
             await send(result.status === 'interrupted' ? 'Задача остановлена.' : 'Codex не вернул готовый ответ.')
             inbox.finish(first.message_id)
             return
@@ -2128,12 +2895,14 @@ async function main(): Promise<void> {
           const requestedRestart = bridgeRestartReply(result.text, mayRestartBridge, false, verificationEligible).requested
           const interim = question.take(result.text) || requestedRestart ? undefined
             : await continuationReply(continuation?.context, result.text, epoch, planPending)
-          if (interim === undefined) rememberBlocker(first, taskText, result.text, epoch)
+          if (interim === undefined && ownerTurnOrigin) {
+            ownerEffects.rememberBlocker(ownerTurnOrigin, taskText, result.text, !stopping && epoch === stopEpoch)
+          }
           const completed = interim === undefined && leaseCompletion
             ? await leaseCompletion.complete(result.text) : hideLeaseCompletions(interim ?? result.text)
           const restart = bridgeRestartReply(completed, mayRestartBridge, interim !== undefined, verificationEligible)
           const targetId = first.reply_to_message?.message_id
-          const shown = extractAttachments(hideQuestionMarker(hideContinuationMarker(restart.text)))
+          const shown = ownerEffects.replyAttachments(turnOrigin, hideQuestionMarker(hideContinuationMarker(restart.text)))
           // After a component fell back to text, a final repeating that text would be a second message with nothing new.
           const dropNote = !editTarget && interim === undefined && !restart.requested && shown.files.length === 0 &&
             finalAfterComponents(shown.text, componentDelivery, componentTexts) === 'drop'
@@ -2146,15 +2915,20 @@ async function main(): Promise<void> {
             interim !== undefined, restart.requested && epoch === stopEpoch, restart.verify)
           await recordMemory(codex.currentThread, input.text, reply.text, Date.now() - began)
           if (reply.text && editTarget) {
+            if (brainTurn.ticket) await brain.turnAnswered(brainTurn.ticket, reply.text)
             try {
               await send(await executeChatAction(actionApi, ownerChat, bot.botInfo.id, 'edit', editTarget, reply.text,
                 text => redactSecrets(text, secrets)))
-            } catch { await send('Telegram отклонил изменение сообщения.') }
+              await recordBrainDelivery(brainTurn.ticket, { status: 'delivered' }, brainTurn, true)
+            } catch {
+              await recordBrainDelivery(brainTurn.ticket, { status: 'failed', error: 'Telegram declined the edit' }, brainTurn, true)
+              await send('Telegram отклонил изменение сообщения.')
+            }
             inbox.finish(first.message_id)
             return
           }
-          await finishOrdinaryReply(epoch)
-          if (learning && ownerText && first.message_id > 0 && !interim && !stopping) {
+          await finishOrdinaryReply(epoch, false, brainTurn)
+          if (!brain.enabled && learning && ownerText && first.message_id > 0 && !interim && !stopping) {
             try {
               learning.observe(ownerText, reply.text)
               runLearning()
@@ -2167,7 +2941,10 @@ async function main(): Promise<void> {
         } catch (error) {
           warnError(error, 'Codex turn failed', { area: 'codex-turn', messageId: first.message_id })
           progressResult = 'Работа завершилась с ошибкой'
-          if (!stopping && inbox.active?.outcome.stage !== 'ready') await send('Не удалось завершить задачу Codex.')
+          if (!stopping && inbox.active?.outcome.stage !== 'ready') {
+            await recordBrainDelivery(brainTurn?.ticket, { status: 'failed', error: 'Codex turn failed' }, brainTurn, true)
+            await send('Не удалось завершить задачу Codex.')
+          }
         } finally {
           // A running side turn may be waiting on its own approval card.
           if (!goalActive && codex.sideRunning === 0) approvals?.cancelAll()
@@ -2234,15 +3011,20 @@ async function main(): Promise<void> {
         }
         if (await codex.previousTurnIdle()) {
           if (active?.outcome.stage === 'running') {
-            const id = active.outcome.turnId
-            const turn = id ? (await codex.recentTurns()).turns.map(object).find(item => item.id === id) : undefined
+            const turn = await recoveredTurn(active.outcome.turnId, active.outcome.thread, {
+              main: async () => (await codex.recentTurns()).turns,
+              side: thread => codex.sideTurns(thread),
+            })
             const answer = savedTurnAnswer(turn)
             if (typeof answer === 'string') {
               for (const message of active.messages) acknowledge(message)
               const targetId = active.messages[0]?.reply_to_message?.message_id
               const original = active.messages[0]!
-              // Every saved owner capability below needs a saved owner origin; no origin means an agent.
-              const fromOwner = inbox.provenance(original.message_id).origin === 'owner'
+              // Every saved owner capability below needs a saved owner provenance and an owner turn origin;
+              // an agent's, an isolated forward's or an unknown record gets none of them.
+              const by = inbox.provenance(original.message_id).origin === 'owner'
+                ? ownerOrigin(inbox.activeOrigin) : undefined
+              const fromOwner = by !== undefined
               const work = fromOwner ? active.work : undefined
               const context = work?.continuation
               const mayRestart = selfRestartEnabled && work?.mayRestartBridge === true
@@ -2251,15 +3033,15 @@ async function main(): Promise<void> {
               const interim = requestedRestart ? undefined : await continuationReply(context, answer, epoch)
               const ownerTaskText = !fromOwner || isRestartVerificationMessage(original.message_id) ? undefined
                 : work?.voiceTaskText ?? directOwnerTask(original)
-              if (fromOwner && interim === undefined && !context?.statusQuestion) {
-                rememberBlocker(original, ownerTaskText, answer, epoch)
+              if (by && interim === undefined && !context?.statusQuestion) {
+                ownerEffects.rememberBlocker(by, ownerTaskText, answer, !stopping && epoch === stopEpoch)
               }
               const completed = interim === undefined && work?.lease
                 ? await leases.completion(work.lease).complete(answer) : hideLeaseCompletions(interim ?? answer)
               const restart = bridgeRestartReply(completed, mayRestart, interim !== undefined, mayVerify)
               const visible = hideQuestionMarker(hideContinuationMarker(restart.text))
               // An agent turn never sends workspace files.
-              const extracted = fromOwner ? extractAttachments(visible) : { text: visible, files: [] }
+              const extracted = by ? ownerEffects.attachments(by, visible) : { text: visible, files: [] }
               const reply = { ...extracted, text: leases.finalReply(extracted.text, resolveAskGuardMode(config, log)),
                 ...(targetId === undefined ? {} : { replyTo: targetId }) }
               inbox.complete(original.message_id, { ...reply, text: redactSecrets(reply.text, secrets) },
@@ -2379,6 +3161,7 @@ async function main(): Promise<void> {
   } finally {
     shutdown()
     await poller.stop()
+    await stopNotice
     await task
     await flushing
     await work.close()
@@ -2386,9 +3169,32 @@ async function main(): Promise<void> {
   }
 }
 
-await main().catch(error => {
+await main().then(() => {
+  const code = typeof process.exitCode === 'number' ? process.exitCode : EXIT.stop
+  // S9.5: the boot guard judges an /update trial by how its boot ended.
+  recordTrialOutcome(bridgeRepoRoot, trialOutcomeFor(code, startupWatchdogFired))
+  activeLedger?.recordExit(code)
+}, async (error: unknown) => {
   // Avoid printing validation payloads or dependency errors containing secrets.
   const safe = error instanceof Error && /^(Run the Codex pilot|The pilot requires|Set absolute|The Codex workspace|Telegram state must|A bot already|This private pilot|A Codex proxy requires|Configured Telegram token)/.test(error.message)
   console.error(safe ? error.message : 'Krot Codex pilot could not start')
-  process.exitCode = 1
+  // A fatal configuration error on the trial boot of an /update is the update's fault: exit 1, so
+  // systemd starts again and the boot guard rolls back at once (outcome=crash), instead of exit 78,
+  // which systemd never restarts (startup-failure.ts, tested there).
+  const token = process.env.TELEGRAM_BOT_TOKEN
+  const chat = process.env.TELEGRAM_ALLOWED_CHAT_IDS?.split(',')[0]?.trim()
+  const code = await startupFailureExit({
+    error, watchdog: startupWatchdogFired, stateDir: process.env.TELEGRAM_STATE_DIR,
+    recordTrial: outcome => recordTrialOutcome(bridgeRepoRoot, outcome),
+    send: async text => {
+      if (!token || !chat) return
+      const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, redirect: 'error',
+        body: JSON.stringify({ chat_id: chat, text }), signal: AbortSignal.timeout(10_000),
+      })
+      if (!response.ok) throw new Error('Telegram answered ' + response.status)
+    },
+  })
+  activeLedger?.recordExit(code)
+  process.exitCode = code
 })

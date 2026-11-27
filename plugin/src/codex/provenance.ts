@@ -14,6 +14,7 @@ import {
   ownerTaskWithdrawn,
 } from './continuation.js'
 import { ownerRequestedBridgeRestart, ownerRequestedRestartVerification, restartOwnerText } from './restart-bridge.js'
+import { ownerOrigin, type TurnOrigin } from './turn-origin.js'
 
 export type InputOrigin = 'owner' | 'agent'
 // `verified` is true only for a sender name the authenticated worker set; a record saved without it is unverified.
@@ -90,9 +91,9 @@ const agentIntent: TurnIntent = Object.freeze({
   clearPendingOwnerTask: false, statusCheck: false, mayRestartBridge: false, verificationEligible: false, ownerTurn: false,
 })
 
-/** Classifies one input; an agent input never runs the owner-intent classifiers. */
-export function turnIntent(provenance: Provenance, input: TurnIntentInput): TurnIntent {
-  if (provenance.origin !== 'owner') return agentIntent
+/** Classifies one input; only an owner turn origin runs the owner-intent classifiers (an isolated forward does not). */
+export function turnIntent(origin: TurnOrigin, input: TurnIntentInput): TurnIntent {
+  if (!ownerOrigin(origin)) return agentIntent
   const { message, transcript, editing, verification } = input
   const taskText = verification ? undefined : directOwnerTask(message, transcript, editing)
   const restartText = restartOwnerText(message, transcript)

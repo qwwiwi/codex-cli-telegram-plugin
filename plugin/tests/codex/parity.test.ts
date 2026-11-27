@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { startExternalTasks } from '../../src/codex/external.js'
 import { CodexMirror } from '../../src/codex/mirror.js'
 import { Outbox } from '../../src/safety/outbox.js'
+import { mainOrigin } from '../../src/codex/turn-origin.js'
 import { createLogger } from '../../src/log.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -13,7 +14,8 @@ test('an outbox question keeps its metadata and receives the eventual Telegram I
     const sent: unknown[] = []
     const settings = { stateDir, log: createLogger('test'), now: () => 0,
       sendFn: async () => ({ message_id: 57 }) }
-    new Outbox(settings).enqueue('123', 'Жду твоего ответа', {}, 20, { code: 'OQ_TEST', snippet: 'Жду твоего ответа' })
+    new Outbox(settings).enqueue('123', 'Жду твоего ответа', {}, 20,
+      { origin: mainOrigin('main'), question: { code: 'OQ_TEST', snippet: 'Жду твоего ответа' } })
     const outbox = new Outbox({ ...settings, onDelivered: (item, id) => sent.push([item.question, id]) })
     await outbox.flushDue(19_999)
     expect(sent).toEqual([])

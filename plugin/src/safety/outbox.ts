@@ -37,11 +37,12 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 
-import { splitMessage, splitPlainMessage } from '../format/chunk.js'
+import { plainTextWithLinks, PreformattedDocumentError, splitMessage, splitPlainMessage } from '../format/chunk.js'
 import { parse429 } from './rate-limited-telegram-api.js'
 import type { SendMessageOpts } from '../channel/tools.js'
 import type { Logger } from '../log.js'
 import type { OpenQuestionDetection } from './open-question.js'
+import { storedOrigin, StoredTurnOriginSchema, type StoredTurnOrigin, type TurnOrigin } from '../codex/turn-origin.js'
 
 export interface OutboxItem {
   /** Unique id (uuid) — diagnostics + dedupe of persisted entries. */
@@ -54,6 +55,11 @@ export interface OutboxItem {
   /** Send attempts so far (429 reschedules and non-flood failures both bump). */
   attempts: number
   question?: OpenQuestionDetection
+  /** The Brain exchange key of the reply whose last part this is: its delivery completes that exchange. */
+  brainKey?: string
+  /** The origin of the turn whose reply this is; an item without one (or a damaged one) is a guest's. */
+  origin?: StoredTurnOrigin
+  document?: true
   /**
    * 2: enqueued by a bridge that masks secrets in the source text before rendering and splitting. An item without
    * it was saved before: its parts were redacted one by one (see migrateLegacy).
@@ -74,6 +80,7 @@ export interface OutboxOptions {
   /** Plugin state dir; the outbox writes `<fileName>` here. */
   stateDir: string
   sendFn: OutboxSendFn
+  sendDocument?: OutboxSendFn
   onDelivered?: (item: Readonly<OutboxItem>, messageId: number) => void
   log: Logger
   /** Test seam: replace Date.now() for enqueue's notBefore computation. */
@@ -115,6 +122,20 @@ function joinParts(left: string, right: string, html: boolean): string {
   return left.slice(0, left.length - closers.length) + right.slice(openers.length)
 }
 
+/** What a turn's reply part carries into the outbox. */
+export interface OutboxReply {
+  origin: TurnOrigin
+  question?: OpenQuestionDetection | undefined
+  brainKey?: string | undefined
+  document?: boolean
+}
+
+// A saved origin is kept only when it is well formed; otherwise the item has none and reads as a guest's.
+function storedOriginField(value: unknown): { origin?: StoredTurnOrigin } {
+  const parsed = StoredTurnOriginSchema.safeParse(value)
+  return parsed.success ? { origin: parsed.data } : {}
+}
+
 const DEFAULT_MAX_ITEMS = 200
 const DEFAULT_MAX_ATTEMPTS = 5
 const DEFAULT_FILE_NAME = 'outbox.json'
@@ -122,6 +143,7 @@ const DEFAULT_FILE_NAME = 'outbox.json'
 export class Outbox {
   private readonly stateDir: string
   private readonly sendFn: OutboxSendFn
+  private readonly sendDocument: OutboxOptions['sendDocument']
   private readonly onDelivered: OutboxOptions['onDelivered']
   private readonly log: Logger
   private readonly now: () => number
@@ -134,6 +156,7 @@ export class Outbox {
   constructor(opts: OutboxOptions) {
     this.stateDir = opts.stateDir
     this.sendFn = opts.sendFn
+    this.sendDocument = opts.sendDocument
     this.onDelivered = opts.onDelivered
     this.log = opts.log
     this.now = opts.now ?? ((): number => Date.now())
@@ -147,7 +170,11 @@ export class Outbox {
   // Append an undelivered reply. `retryAfterSec` is the ban's cooldown (from
   // the 429) — the item won't be re-sent before now()+retryAfterSec. Persists
   // synchronously so a crash right after enqueue can't lose the reply.
-  enqueue(chatId: string, text: string, opts: SendMessageOpts, retryAfterSec: number, question?: OpenQuestionDetection): void {
+  // A reply of a turn passes `reply`: its origin is required, so a deferred question keeps whose question it is.
+  enqueue(chatId: string, text: string, opts: SendMessageOpts, retryAfterSec: number, reply?: OutboxReply): void {
+    const origin = reply?.origin
+    const question = reply?.question
+    const brainKey = reply?.brainKey
     const wait = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec : 0
     this.items.push({
       id: randomUUID(),
@@ -158,6 +185,9 @@ export class Outbox {
       attempts: 0,
       v: 2,
       ...(question ? { question } : {}),
+      ...(brainKey ? { brainKey } : {}),
+      ...(origin ? { origin: storedOrigin(origin) } : {}),
+      ...(reply?.document ? { document: true } : {}),
     })
     // Bounded: never grow without limit. Drop the OLDEST (front) so the most
     // recent replies survive — and NEVER silently (warn on every drop).
@@ -194,8 +224,10 @@ export class Outbox {
         for (const item of arr) {
           // FIFO: a not-due head holds the whole chat this round.
           if (item.notBefore > now) break
+          const send = item.document ? this.sendDocument : this.sendFn
+          if (!send) break
           try {
-            const result = await this.sendFn(item.chatId, item.text, item.opts)
+            const result = await send(item.chatId, item.text, item.opts)
             toRemove.add(item)
             changed = true
             try { this.onDelivered?.(item, result.message_id) } catch { this.log.warn('Could not record delivered outbox message') }
@@ -309,14 +341,23 @@ export class Outbox {
         continue
       }
       rewritten += 1
-      const parts = parseMode === 'HTML' ? splitMessage(redacted) : splitPlainMessage(redacted)
       const { reply_to_message_id: _quote, ...restOpts } = head.opts
       const notBefore = Math.max(...group.map(item => item.notBefore))
       const attempts = Math.max(...group.map(item => item.attempts))
+      let parts: string[]
+      try {
+        parts = parseMode === 'HTML' ? splitMessage(redacted) : splitPlainMessage(redacted)
+      } catch (error) {
+        if (!(error instanceof PreformattedDocumentError)) throw error
+        const { parse_mode: _mode, ...opts } = head.opts
+        out.push({ ...head, opts, notBefore, attempts, document: true, v: 2,
+          text: this.redact(plainTextWithLinks(error.html, Infinity), undefined) })
+        continue
+      }
       parts.forEach((text, index) => {
         out.push({
           id: index === 0 ? head.id : randomUUID(), chatId: head.chatId, text,
-          opts: index === 0 ? head.opts : restOpts, notBefore, attempts,
+          opts: index === 0 ? head.opts : restOpts, notBefore, attempts: index === 0 ? attempts : 0,
           ...(index === 0 && head.question ? { question: head.question } : {}), v: 2,
         })
       })
@@ -357,8 +398,11 @@ export class Outbox {
             notBefore: e.notBefore,
             attempts: typeof e.attempts === 'number' ? e.attempts : 0,
             ...(e.v === 2 ? { v: 2 as const } : {}),
+            ...(e.document === true ? { document: e.document } : {}),
             ...(e.question && typeof e.question.code === 'string' && typeof e.question.snippet === 'string'
               ? { question: e.question } : {}),
+            ...(typeof e.brainKey === 'string' && e.brainKey ? { brainKey: e.brainKey } : {}),
+            ...storedOriginField(e.origin),
           })
         }
       }

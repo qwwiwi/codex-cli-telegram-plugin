@@ -88,8 +88,8 @@ const TIER1: ReadonlyArray<AskPattern> = [
   //   (B) no owner prefix «жду подтверждения …» + one of:
   //         • TERMINAL: optional non-comma sentence punctuation then end-of-line
   //           (a bare owner-wait that ENDS the clause), OR
-  //         • COMMA + owner ref («жду подтверждения, вождь / твоё / от тебя»), OR
-  //         • SPACE + owner ref («жду подтверждения от тебя / твоё / вождь»).
+  //         • COMMA + owner ref («жду подтверждения, твоё / от тебя»), OR
+  //         • SPACE + owner ref («жду подтверждения от тебя / твоё»).
   // fix-loop #6 (Codex round-2): the OLD terminal branch accepted ANY comma
   // regardless of the following words, so a STATUS wait «жду подтверждения, что
   // CI завершился» self-gated by mistake. The comma now only satisfies the

@@ -54,6 +54,16 @@ The live product. `rpc.ts` starts app-server and speaks JSON-RPC. `session.ts` m
 - `commands.ts`, `chat-actions.ts`, `lease.ts`, `learning.ts`: commands and their helpers
 - `components.ts`: widget components for the model (`send_component`, `update_component`, `component_schema`), see [Widget components](#widget-components)
 - `restart-bridge.ts`, `restart-handoff.ts`, `continuation.ts`: self-restart and continuation of unfinished tasks
+- `exit-codes.ts`: exit-code contract with the unit (0 stop, 1 crash, 75 planned restart, 78 fatal config, no restart; `<state dir>/fatal.json`)
+- `boot-ledger.ts`: `<state dir>/boot-ledger.json`, one record per start; restart chain, startup backoff, health mark (first `getUpdates`, Codex handshake, 120 s uptime)
+- `safe-mode.ts`: after 3 unhealthy boots in a row only the poller and `/status`, `/doctor`, `/restart`, `/update rollback` run; one notice per chain; other messages go to `<state dir>/safe-mode-messages.jsonl`
+- `unit-contract.ts`: the restart-loop lines of `krotov-telegram.service`, checked by doctor; `plugin/scripts/notify-failed.sh` is the `OnFailure` notifier
+- `restart-intent.ts`: `<state dir>/restart-intent.json`, written before every planned restart (exit 75); an owner message restarts the bridge once, and the third restart without a new owner message within 300 s is refused
+- `update-commands.ts`: `/restart` (reply, then exit 75) and `/update` [`check` | `rollback` | `codex`], plus the plain phrase «обнови кодекс»
+- `self-update.ts`: `/update` in-process: fetch the upstream branch (or `KROT_UPDATE_BRANCH`), refuse a dirty tree, fast-forward only, `bun install --frozen-lockfile`, `tsc`, then exit 75. The trial record `<git dir>/krotov-update-pending` (key=value) is completed at the health mark. No cgroup escape is needed: every step finishes before the bridge exits on its own, and the bridge never calls `systemctl restart` on its unit
+- `plugin/scripts/boot-guard.sh`: `ExecStartPre=-` of the unit, bash only; the boot after a trial that never reached the health mark (or after an interrupted `/update`) runs `git reset --keep <from>` and `bun install --frozen-lockfile`, and the old version tells the owner
+- `codex-update.ts`: `/update codex`: `codex --version` vs `npm view @openai/codex version`, the changelog from developers.openai.com (then GitHub release notes), `npm install -g --prefix <home prefix>`, an App Server handshake plus `model/list`, the previous version back on failure; then exit 75 so `/cc` → Модель lists the new models
+- `watchdogs.ts`: a shutdown that hangs exits after 45 s with its exit code; a boot that is not ready within 180 s exits 75
 - `pin-service.ts`: deletes the bot's own "pinned a message" service messages
 - `external.ts`: optional local HTTP server on `127.0.0.1` for external tasks and policy cards
 - `agent-webhook.ts`: optional inter-agent webhook, the entry point for messages from other agents (`agentWebhookSettings`, `startAgentWebhook`, `routeAgentMessage`)
@@ -175,6 +185,7 @@ Shared HTTP helpers for `codex/external.ts` (capped body reads, schema parsing, 
 - `install.sh`, `update.sh`, `plugin/scripts/setup-common.sh`: Linux installer and updater
 - `plugin/scripts/doctor.ts` (`bun run doctor`): environment check
 - `plugin/scripts/codex-permission-hook.ts`: YAML policy hook run inside Codex (see [plugin/docs/claude-compatibility.md](../plugin/docs/claude-compatibility.md))
+- `codex-hooks/`: optional Codex hooks pack, separate from the bridge process. Codex runs `bun codex-hooks/src/main.ts <Event>` for SessionStart, PreCompact, UserPromptSubmit, PreToolUse, PostToolUse and Stop; `dispatch.ts` runs the enabled hooks of the event and renders the Codex output JSON (deny, additionalContext, Stop block). Only `main.ts` spawns programs (git, gh); `entry.ts` and every hook take the runner and the optional MCP client from the context, so tests drive them with fakes. State (turn record, check receipts, reminders, activity log) lives in `~/.local/state/krotov-plugin/codex-hooks`. It shares `findSecretKinds`/`redactSecrets` with `plugin/src/safety/redact.ts`; `install.ts` registers the hooks and backs the doctor check (`KROT_CODEX_HOOKS=1`). See [codex-hooks/README.md](../codex-hooks/README.md)
 - `plugin/scripts/codex-root-relay.py`, `root_backend.py`, `codex-root-health.py`: relay to a separate app-server (see [plugin/docs/root-backend.md](../plugin/docs/root-backend.md))
 - `examples/`: systemd units and a relay config example
 - `plugin/vendor/html-components/`: the vendored Telegram widget packs (MIT, see its `LICENSE` and `VENDOR.md`)
@@ -432,7 +443,8 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `TELEGRAM_ALBUM_FLUSH_MS` | how long to wait for all parts of a photo album |
 | `GROQ_API_KEY` | Groq key for voice transcription |
 | `KROT_CODEX_APPROVAL_MODE` | `standard` (default when unset), `risky` or `never` (what `install.sh` writes for a new install unless `--approval-mode` says otherwise); `risky` needs `KROT_CODEX_APPROVALS=1`; `never` turns every approval card off even when `KROT_CODEX_APPROVALS=1` (`codex/approval-mode.ts`) |
-| `KROT_CODEX_SANDBOX` | `workspace-write` (default) or `danger-full-access` |
+| `KROT_CODEX_SANDBOX` | `workspace-write` (default) or `danger-full-access` with verified system-wide managed hooks |
+| `KROT_CODEX_MEMORIES_DEFAULT` | `1` opts in to the native-memory default for the local backend when Brain is off at startup |
 | `TELEGRAM_WEBHOOK_HOST` | host of the inherited webhook config block; the Codex local endpoint always binds `127.0.0.1` |
 | `TELEGRAM_WEBHOOK_PORT` | port of the local HTTP endpoint for external tasks (with `TELEGRAM_WEBHOOK_TOKEN`) |
 | `TELEGRAM_WEBHOOK_TOKEN` | bearer token of that local endpoint; the endpoint starts only when both are set |
@@ -483,7 +495,7 @@ Only the variables below are read from the environment by `RuntimeEnvSchema`.
 | `KROT_AGENT_WEBHOOK_ALLOW_IPS` | `codex/agent-webhook.ts` | CSV of source IPs allowed to call the webhook; with the token set, both must pass |
 | `KROT_CODEX_SELF_RESTART` | `codex/server.ts` | `1` allows an owner-requested restart (Linux, under systemd) |
 | `KROT_CODEX_COMMANDS_DIR` | `codex/server.ts` | folder with custom prompt commands for `/cc <name>` |
-| `KROT_UPDATE_REMOTE` | `codex/doctor-command.ts` | git remote `/doctor` fetches to compare the install with GitHub; default `public` if present, else `origin` |
+| `KROT_UPDATE_REMOTE` | `codex/doctor-command.ts` | Git remote where `/doctor` looks up the branch ref with `git ls-remote` to compare it with the installed commit; default `public` if present, else `origin` |
 | `KROT_UPDATE_BRANCH` | `codex/doctor-command.ts` | branch of that remote `/doctor` compares with; default `main` |
 | `KROT_CODEX_LEARNING` | `codex/server.ts` | `1` turns on learning memory and `/memory` ([plugin/docs/learning.md](../plugin/docs/learning.md)) |
 | `KROT_CODEX_LEARNING_INTERVAL` | `codex/server.ts` | turns between background reviews (1 to 30, default 10) |

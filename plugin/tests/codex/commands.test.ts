@@ -6,6 +6,7 @@ test('hides disabled commands and resolves supported legacy aliases', () => {
   const config = AppConfigSchema.parse({ commands: { stop: false, new: false } })
   expect(codexCommands(config).map(x => x.command)).toEqual([
     'help', 'status', 'usage', 'reset', 'compact', 'keys', 'mirror', 'lease', 'cc', 'goal', 'pin', 'unpin', 'react', 'edit', 'get', 'doctor',
+    'restart', 'update',
   ])
   expect(parseCodexCommand('/CC@ExampleBot Context', 'examplebot')).toEqual({
     name: 'status', args: '',

@@ -57,10 +57,13 @@ export function bridgeRestartReply(reply: string, eligible: boolean, continuing:
 
 type RestartHooks = {
   idle: () => boolean
-  notify: () => Promise<unknown>
   restart: () => void
-  onNotifyError: () => void
-}
+} & (
+  /** A separate owner notice that must be delivered before the restart. */
+  | { notify: () => Promise<unknown>; onNotifyError: () => void }
+  /** No separate notice: the restart's own stop notice tells the owner. */
+  | { notify?: undefined; onNotifyError?: undefined }
+)
 
 export class BridgeRestart {
   private requested = false
@@ -82,15 +85,16 @@ export class BridgeRestart {
 
   async check(): Promise<void> {
     if (!this.requested || this.notifying || !this.hooks.idle()) return
-    if (!this.notified) {
+    const hooks = this.hooks
+    if (!this.notified && hooks.notify) {
       const epoch = this.epoch
       this.notifying = true
       try {
-        await this.hooks.notify()
+        await hooks.notify()
         if (epoch !== this.epoch) return
         this.notified = true
       } catch {
-        this.hooks.onNotifyError()
+        hooks.onNotifyError()
         return
       } finally {
         this.notifying = false

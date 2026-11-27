@@ -64,6 +64,13 @@ import type {
   TelegramApi,
 } from '../channel/tools.js'
 
+declare module '../channel/tools.js' {
+  interface SendDocumentOpts {
+    // Uses the owner's reply queue and minute-budget reserve for sendDocument.
+    ownerReply?: boolean
+  }
+}
+
 interface TokenBucket {
   tokens: number
   capacity: number
@@ -148,7 +155,7 @@ interface ChatState {
   // chat does not affect others. Worst-case per-chat stall is bounded by
   // `maxRetries * MAX_RETRY_AFTER_S`.
   tail: Promise<void>
-  // FIFO tail for the owner's replies (SendMessageOpts.ownerReply). Separate
+  // FIFO tail for the owner's replies (ownerReply). Separate
   // from `tail`: an auxiliary send parked on the minute budget must never hold
   // a reply, which may use the reserved slots it may not.
   replyTail: Promise<void>
@@ -342,6 +349,24 @@ export function createRateLimitedTelegramApi(
     ((ms: number): Promise<void> =>
       ms <= 0 ? Promise.resolve() : new Promise((r) => setTimeout(r, ms)))
 
+  // A sleep that `signal` cuts short with SendCancelledError. The real timer is
+  // cleared on abort: a cancelled wait must not keep the process alive.
+  function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
+    if (opts.sleep !== undefined || signal === undefined || ms <= 0) return unlessCancelled(sleep(ms), signal)
+    if (signal.aborted) return Promise.reject(new SendCancelledError())
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        clearTimeout(timer)
+        reject(new SendCancelledError())
+      }
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
   // One JSON line per outbound call. Append-only, best-effort: a logging
   // failure must never break delivery, so every error is swallowed. Written
   // synchronously — the volume is tens of lines a minute, and a crash must
@@ -448,7 +473,7 @@ export function createRateLimitedTelegramApi(
         }
         return t - startedAt
       }
-      await unlessCancelled(sleep(w), signal)
+      await pause(w, signal)
     }
   }
 
@@ -522,7 +547,12 @@ export function createRateLimitedTelegramApi(
           wait_ms: waitTotalMs,
         })
         try {
-          await unlessCancelled(sleep(waitTotalMs), signal)
+          await pause(waitTotalMs, signal)
+          // Another chat can extend the bot's cooldown while this call sleeps.
+          for (let remaining = cooldownUntil - now(); remaining > 0; remaining = cooldownUntil - now()) {
+            await pause(remaining, signal)
+          }
+          if (signal?.aborted) break
         } catch {
           // Cancelled during the backoff: report the 429 that stopped it.
           break
@@ -742,6 +772,7 @@ export function createRateLimitedTelegramApi(
     filePath: string,
     label: string,
     op: () => Promise<SendFileResult>,
+    kind: 'reply' | 'send' = 'send',
   ): Promise<SendFileResult> {
     const size = fileSizeBytes(filePath)
     const isHeavy =
@@ -753,7 +784,7 @@ export function createRateLimitedTelegramApi(
     // chain: the contact sheet that explains a render would otherwise
     // inherit the video's 90s wait, and the agent goes silent exactly when
     // it has something to show.
-    if (!isHeavy) return enqueueSend(chatId, op, label)
+    if (!isHeavy) return enqueueSend(chatId, op, label, 0, undefined, false, kind)
 
     const prev = uploadTail.get(chatId) ?? Promise.resolve()
     let release!: () => void
@@ -788,7 +819,7 @@ export function createRateLimitedTelegramApi(
         // back. Retry no sooner than a full window: obeying a 1s retry_after
         // literally would re-stream the video three times in ten seconds,
         // into the very ban it is reporting.
-        return await enqueueSend(chatId, op, label, cfg.heavyUploadMinIntervalMs)
+        return await enqueueSend(chatId, op, label, cfg.heavyUploadMinIntervalMs, undefined, false, kind)
       } finally {
         // Stamp on ANY completed attempt, not just success. Over-stamping
         // costs one extra window; under-stamping costs the 1.5h ban this
@@ -806,9 +837,11 @@ export function createRateLimitedTelegramApi(
       text: string,
       sendOpts: SendMessageOpts,
     ): Promise<{ message_id: number }> {
-      // The signal is this layer's business (see enqueueSend); it never travels on.
-      const { signal, releaseQueueInFlight, ownerReply, ...rest } = sendOpts
-      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, rest), 'sendMessage', 0, signal,
+      // The signal is this layer's business (see enqueueSend); it travels on to the
+      // transport only with abortInFlight, to cancel the HTTP request itself.
+      const { signal, releaseQueueInFlight, ownerReply, abortInFlight, ...rest } = sendOpts
+      const wire = abortInFlight === true && signal !== undefined ? { ...rest, signal } : rest
+      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, wire), 'sendMessage', 0, signal,
         releaseQueueInFlight === true, ownerReply === true ? 'reply' : 'send')
     },
 
@@ -881,8 +914,13 @@ export function createRateLimitedTelegramApi(
       filePath: string,
       docOpts: SendDocumentOpts,
     ): Promise<SendFileResult> {
-      return enqueueUpload(chatId, filePath, 'sendDocument', () =>
-        raw.sendDocument(chatId, filePath, docOpts),
+      const { ownerReply, ...rest } = docOpts
+      return enqueueUpload(
+        chatId,
+        filePath,
+        'sendDocument',
+        () => raw.sendDocument(chatId, filePath, rest),
+        ownerReply === true ? 'reply' : 'send',
       )
     },
 

@@ -187,3 +187,22 @@ test('[R36] both READMEs mention the fork and upstream only in their bottom part
     expect(early, readme.path).toEqual([])
   }
 })
+
+test('[S9c] the starter AGENTS.md tells the agent where the Codex docs are and to read the changelog before updating', () => {
+  const doc = read('examples/AGENTS.example.md')
+  const start = doc.indexOf('## Codex: обновления и документация')
+  expect(start).toBeGreaterThan(-1)
+  const section = doc.slice(start, doc.indexOf('\n## ', start + 1) === -1 ? undefined : doc.indexOf('\n## ', start + 1))
+  for (const page of ['cli', 'models', 'changelog', 'config-reference']) {
+    expect(section).toContain('https://developers.openai.com/codex/' + page)
+  }
+  expect(section).toContain('/update codex')
+  expect(section).toMatch(/changelog[^\n]*(before|перед)/i)
+})
+
+test('[S9] the architecture map names the self-update modules and the boot guard', () => {
+  const doc = read('docs/ARCHITECTURE.md')
+  for (const name of ['restart-intent.ts', 'self-update.ts', 'codex-update.ts', 'update-commands.ts', 'watchdogs.ts', 'boot-guard.sh']) {
+    expect(doc).toContain(name)
+  }
+})

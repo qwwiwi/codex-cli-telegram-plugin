@@ -4,9 +4,11 @@
 
 import { expect, test } from 'bun:test'
 
-import { splitMessage, splitPlainMessage } from '../../src/format/chunk.js'
+import { resumeMessagePlan, splitMessage, splitMessageFrom, splitPlainFallback, splitPlainMessage } from '../../src/format/chunk.js'
+import { splitMessageLegacy } from '../../src/format/chunk-legacy.js'
 import { escapeHtml, markdownToTelegramHtml } from '../../src/format/html.js'
 import { validateTelegramHtml } from '../../src/safety/html-validator.js'
+import { redactOutboundText } from '../../src/safety/safe-telegram-api.js'
 
 // Independent oracle for valid input: drop tags, decode the entities Telegram supports.
 function visibleText(html: string): string {
@@ -150,7 +152,51 @@ test('a preformatted block keeps every whitespace character across parts', () =>
     expect(validateTelegramHtml(part).downgraded).toBe(false)
     expect(visibleText(part).length).toBeLessThanOrEqual(4000)
     // Telegram refuses a message that shows only whitespace.
-    expect(visibleText(part).replace(/ /gu, 'x').trim().length).toBeGreaterThan(0)
+    expect(visibleText(part).trim().length).toBeGreaterThan(0)
   }
-  expect(parts.map(visibleText).join('').replace(/ /gu, ' ')).toBe(visibleText(html))
+  expect(parts.map(visibleText).join('')).toBe(visibleText(html))
+})
+
+test('an unpartitionable preformatted span signals document fallback', () => {
+  const html = '<pre>start\n' + ' '.repeat(8_100) + '\nend</pre>'
+  expect(() => splitMessage(html)).toThrow('Preformatted whitespace requires a document')
+})
+
+test('790 preformatted words followed by 5000 spaces fit in Telegram text parts', () => {
+  const words = Array(790).fill('word').join(' ')
+  expectSafeParts('<pre>' + words + ' '.repeat(5000) + '</pre>', 4000)
+})
+
+test('receipt recovery cuts the original HTML before applying new configured redactions', () => {
+  const changed = 'new&value'
+  const crossing = 'cross&boundary'
+  const html = '<b>' + escapeHtml(changed) + 'б'.repeat(3978) + escapeHtml(crossing) +
+    ' keep this ' + escapeHtml(changed) + '</b>'
+  const originalCut = splitMessageLegacy(html).ends[0]!
+  const secrets = [changed, crossing]
+  expect(originalCut).toBeGreaterThan(html.indexOf('cross'))
+  expect(originalCut).toBeLessThan(html.indexOf('boundary'))
+  const resumed = splitMessageFrom(html, originalCut, 4000, {
+    redact: body => redactOutboundText(body, 'HTML', secrets), secrets,
+  })
+  expect(resumed).toEqual(['<b> keep this [REDACTED]</b>'])
+})
+
+test('the old saved plan preserves the receipt boundary and masks a secret across reopened tags', () => {
+  const secret = 'cross&boundary'
+  const chunks = ['<b>already sent cross&amp;</b>', '<b>boundary keep</b>']
+  const pending = resumeMessagePlan(chunks, 1, {
+    secrets: [secret], redact: html => redactOutboundText(html, 'HTML', [secret]),
+  })
+  expect(pending).toEqual(['<b> keep</b>'])
+})
+
+test('plain fallback keeps every expanded URL when the labels already fill a Telegram message', () => {
+  const url = 'https://example.com/runbook?a=1&b=2'
+  const html = 'x'.repeat(4050) + '<a href="' + escapeHtml(url) + '">read this</a>'
+  const parts = splitPlainFallback(html)
+  expect(parts.length).toBe(2)
+  expect(parts.every(part => part.length <= 4096)).toBe(true)
+  expect(parts.join('')).toBe('x'.repeat(4050) + 'read this (' + url + ')')
+  expect(parts[1]).toContain(url)
 })

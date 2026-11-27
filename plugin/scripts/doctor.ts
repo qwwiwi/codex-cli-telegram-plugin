@@ -1,15 +1,56 @@
-import { accessSync, constants, realpathSync, statSync } from 'node:fs'
-import { isAbsolute, relative, sep } from 'node:path'
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, join, relative, sep } from 'node:path'
 import { loadConfig, type RuntimeEnv, RuntimeEnvSchema } from '../src/config.js'
 import { type ApprovalSetup, resolveApprovalSetup } from '../src/codex/approval-mode.js'
 import { ackReactionMode, parseReactionPalette } from '../src/codex/reactions.js'
+import { OWNER_INSTRUCTIONS_CHECK_PREFIX, ownerInstructionChecks, ownerInstructionsHome } from '../src/codex/owner-instructions-lock.js'
 import { CodexRpc, object } from '../src/codex/rpc.js'
+import { unitDrift } from '../src/codex/unit-contract.js'
+import { checkHooksPack, defaultPaths, listedHooks, managedCheck, rulesetCheck, type Check, type ListedHook } from '../../codex-hooks/src/install.js'
+import type { Runner } from '../../codex-hooks/src/types.js'
 
-type Check = { status: 'ok' | 'warning' | 'error'; message: string }
+// A missing executable or other spawn failure is handled like a failed ruleset probe.
+const spawnRun: Runner = (argv, options) => {
+  try {
+    const result = Bun.spawnSync([...argv], { ...(options.cwd ? { cwd: options.cwd } : {}), stdin: 'ignore', stdout: 'pipe', stderr: 'ignore', timeout: options.timeoutMs })
+    return { code: result.exitCode, stdout: result.stdout.toString() }
+  } catch {
+    return { code: null, stdout: '' }
+  }
+}
+
 type TelegramMethod = 'getMe' | 'getWebhookInfo'
 type Probes = {
   checkCodex: (env: NodeJS.ProcessEnv, workspace?: string) => Check | Promise<Check>
   telegram: (method: TelegramMethod, token: string) => Promise<Record<string, unknown> | null>
+  // Text of the installed user unit, undefined when there is none; absent skips the unit check.
+  unitFile?: (env: NodeJS.ProcessEnv) => string | undefined
+  // Hooks as Codex lists them (App Server hooks/list, trust included); used only with KROT_CODEX_HOOKS=1.
+  listHooks?: (env: NodeJS.ProcessEnv, workspace: string) => Promise<ListedHook[]>
+  // Whether the managed (root-owned) guards are installed; default reads /etc/codex.
+  managedCheck?: () => Check
+  // Lock status for owner instruction files in the resolved Codex home.
+  ownerInstructionChecks?: (codexHome: string) => Check[]
+}
+
+function readUnitFile(env: NodeJS.ProcessEnv): string | undefined {
+  const base = env.XDG_CONFIG_HOME || (env.HOME ? join(env.HOME, '.config') : undefined)
+  if (!base) return
+  const path = join(base, 'systemd', 'user', 'krotov-telegram.service')
+  if (!existsSync(path)) return
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return
+  }
+}
+
+// Restart-loop protection of an existing unit: install.sh keeps a changed unit, so drift is reported here.
+function unitCheck(text: string): Check {
+  const missing = unitDrift(text)
+  return missing.length === 0
+    ? { status: 'ok', message: 'Служба krotov-telegram.service защищена от бесконечных перезапусков.' }
+    : { status: 'warning', message: `Служба krotov-telegram.service без защиты от бесконечных перезапусков. Добавьте строки из examples/krotov-telegram.service: ${missing.join(', ')}; затем systemctl --user daemon-reload.` }
 }
 
 function directory(path: string | undefined, writable = true): string | undefined {
@@ -40,6 +81,15 @@ export async function probeProxy(workspace: string, env: NodeJS.ProcessEnv, comm
       : { status: 'error', message: 'Прокси подключается, но в App Server нужен вход через ChatGPT.' }
   } catch {
     return { status: 'error', message: 'Прокси не подключился к App Server. Проверьте sudo -n и статус службы.' }
+  } finally { clearTimeout(timer); rpc.close() }
+}
+
+export async function listHooksViaAppServer(env: NodeJS.ProcessEnv, workspace: string): Promise<ListedHook[]> {
+  const rpc = new CodexRpc(workspace, codexEnv(env), () => undefined, () => undefined)
+  const timer = setTimeout(() => rpc.close(), 8000)
+  try {
+    await rpc.initialize()
+    return listedHooks(await rpc.request('hooks/list', {}))
   } finally { clearTimeout(timer); rpc.close() }
 }
 
@@ -122,7 +172,7 @@ function approvalModeCheck(env: NodeJS.ProcessEnv): Check {
 
 export async function runDoctor(
   env: NodeJS.ProcessEnv,
-  probes: Probes = { checkCodex, telegram },
+  probes: Probes = { checkCodex, telegram, unitFile: readUnitFile },
 ): Promise<Check[]> {
   const checks: Check[] = []
   const report = (passed: boolean, success: string, failure: string) => {
@@ -131,6 +181,8 @@ export async function runDoctor(
   if (process.getuid?.() === 0) {
     checks.push({ status: 'error', message: 'Запустите doctor от того же непривилегированного пользователя, что и мост.' })
   }
+  const unit = probes.unitFile?.(env)
+  if (unit !== undefined) checks.push(unitCheck(unit))
 
   const parsed = RuntimeEnvSchema.safeParse(env)
   if (!parsed.success) {
@@ -160,6 +212,12 @@ export async function runDoctor(
     'Укажите один и тот же числовой ID владельца в TELEGRAM_ALLOWED_USER_IDS и TELEGRAM_ALLOWED_CHAT_IDS.')
 
   const workspace = directory(config?.workspace_root, !env.KROT_CODEX_PROXY)
+  if (env.KROT_CODEX_PROXY) {
+    checks.push({ status: 'info', message: `${OWNER_INSTRUCTIONS_CHECK_PREFIX}lock check does not apply in proxy mode` })
+  } else {
+    const codexHome = ownerInstructionsHome(env, workspace)
+    checks.push(...(probes.ownerInstructionChecks ?? ownerInstructionChecks)(codexHome))
+  }
   const state = directory(env.TELEGRAM_STATE_DIR)
   report(Boolean(workspace), env.KROT_CODEX_PROXY ? 'Рабочая папка доступна мосту на чтение.' : 'Рабочая папка доступна на запись.',
     'Создайте рабочую папку по абсолютному пути TELEGRAM_WORKSPACE_ROOT и проверьте права.')
@@ -172,6 +230,19 @@ export async function runDoctor(
       'TELEGRAM_STATE_DIR должен находиться за пределами TELEGRAM_WORKSPACE_ROOT.')
   }
   checks.push(await probes.checkCodex(env, workspace))
+  // Set by the bridge when it refused danger-full-access at startup (plugin/src/codex/full-access.ts).
+  if (env.KROT_CODEX_SANDBOX_FALLBACK) {
+    checks.push({ status: 'error', message: `Полный доступ (KROT_CODEX_SANDBOX=danger-full-access) отключён при запуске моста: ${env.KROT_CODEX_SANDBOX_FALLBACK}. Агент работает в песочнице workspace-write. Запустите ./install.sh --hooks --full-access и перезапустите мост.` })
+  }
+  if (env.KROT_CODEX_HOOKS === '1') {
+    const list = probes.listHooks ?? listHooksViaAppServer
+    checks.push(...await checkHooksPack(defaultPaths(env),
+      () => workspace ? list(env, workspace) : Promise.reject(new Error('no workspace'))))
+    // main is protected by GitHub, not by the hooks: warn when the workspace repo has no ruleset.
+    checks.push((probes.managedCheck ?? managedCheck)())
+    const ruleset = workspace ? rulesetCheck(spawnRun, workspace) : undefined
+    if (ruleset) checks.push(ruleset)
+  }
 
   const token = env.TELEGRAM_BOT_TOKEN
   if (!token || !/^\d+:[\w-]+$/.test(token)) {
@@ -204,11 +275,14 @@ export async function runDoctor(
   return checks
 }
 
-if (import.meta.main) {
-  const labels = { ok: 'OK', warning: 'ВНИМАНИЕ', error: 'ОШИБКА' }
-  const checks = await runDoctor(process.env)
-  for (const check of checks) console.log(`[${labels[check.status]}] ${check.message}`)
+export function printDoctorChecks(checks: readonly Check[], log = console.log): number {
+  const labels = { ok: 'OK', info: 'ИНФО', warning: 'ВНИМАНИЕ', error: 'ОШИБКА' }
+  for (const check of checks) log(`[${labels[check.status]}] ${check.message}`)
   const errors = checks.filter(check => check.status === 'error').length
-  console.log(errors ? `Ошибок: ${errors}. Исправьте их и запустите doctor ещё раз.` : 'Проверка пройдена. Первый ответ проверьте в личном чате бота.')
-  process.exitCode = errors ? 1 : 0
+  log(errors ? `Ошибок: ${errors}. Исправьте их и запустите doctor ещё раз.` : 'Проверка пройдена. Первый ответ проверьте в личном чате бота.')
+  return checks.some(check => check.status === 'error' && check.blocking !== false) ? 1 : 0
+}
+
+if (import.meta.main) {
+  process.exitCode = printDoctorChecks(await runDoctor(process.env))
 }

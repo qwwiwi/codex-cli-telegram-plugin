@@ -12,7 +12,7 @@
 [![Platform: Linux, macOS](https://img.shields.io/badge/platform-Linux%2C%20macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#requirements)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#license-and-credits)
 
-**Releases:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · current: v0.1.0 (pre-release), [release notes](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
+**Releases:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · current v0.4.0 · [release notes](docs/releases/v0.4.0.md) · [v0.1.0 notes](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
 
 ## Your own Codex agent in a private Telegram chat.
 
@@ -63,10 +63,9 @@ The installer asks for the token (hidden input), prints a one-time code and asks
 | `--approval-mode never\|standard\|risky` | approval cards: `never` (default for a new install, autonomous, no cards), `standard` or `risky` (see [Security](#security-model)) |
 | `--non-interactive --token-file PATH` | no prompts; token from a private file |
 | `--owner-id ID` / `--pair-code CODE` | owner by numeric ID, or by a pre-sent `krotov-<uuid>` code |
-| `--no-memories` | skip the native Codex memories default on a new installation |
+| `--hooks` / `--no-hooks` | install (default) or skip the Codex hooks pack |
+| `--no-memories` | skip the native Codex memory default on a fresh install |
 | `--dry-run` | print the plan and exit |
-
-A new installation enables [native Codex memories](plugin/docs/install.md#native-codex-memories) for its local Codex backend when there is no explicit setting.
 
 Manual setup on Ubuntu or Debian: [plugin/docs/quickstart.md](plugin/docs/quickstart.md). Setup by an AI agent: [INSTALL-WITH-AGENT.md](INSTALL-WITH-AGENT.md). On macOS there is no installer and no systemd unit; set `plugin/.env` by hand and run `bun run start` in `plugin/`.
 
@@ -93,7 +92,7 @@ Manual setup on Ubuntu or Debian: [plugin/docs/quickstart.md](plugin/docs/quicks
 - Optional parallel answers: a new question while a long task runs gets its own side conversation.
 - Widget answers: Codex can show numbers, charts, steps, plans and comparisons as a Telegram widget built from [html-components](https://github.com/qwwiwi/html-components), with a plain-text fallback ([details](docs/ARCHITECTURE.md#widget-components)).
 - Saved conversations: `/cc resume`, export to a file, model choice.
-- Optional learning memory (`/memory`), see [plugin/docs/learning.md](plugin/docs/learning.md).
+- Codex Brain is on by default. Manage facts, tasks, suggestions, and handoffs from `/memory` in the owner’s private chat. [Memory guide](plugin/docs/learning.md)
 
 ## Voice messages
 
@@ -118,7 +117,7 @@ Codex writes Markdown. The bridge first tries a **Rich Message**: Telegram's `se
 | `/lease <task>[; ttl=48h]`, `/lease revoke <ID>`, `/lease consume <ID>` | give, list or revoke an autonomy mandate |
 | `/cc` | `compact`, `context`, `status`, `model [name]`, `resume [number or ID]`, `export`, `cost`, `clear` |
 | `/goal <result>` | set a long goal; `/goal`, `/goal status`, `/goal pause`, `/goal resume`, `/goal cancel` |
-| `/memory` | learning suggestions and skills; only with `KROT_CODEX_LEARNING=1` |
+| `/memory` | manage Brain facts, tasks, suggestions and handoffs. Use `off` to disable Brain |
 | `/pin`, `/unpin` | pin or unpin the message you reply to |
 | `/react <emoji>` | put a reaction on the message you reply to |
 | `/edit <text>` | replace the text of a bot message you reply to |
@@ -140,12 +139,24 @@ Approval modes:
 
 | Setting | Codex behaviour | When to use |
 |---|---|---|
-| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=never` (set by the installer), or `KROT_CODEX_APPROVALS` unset | sandbox `workspace-write`, policy `never`: no approval cards of any kind (commands, files, MCP and GitHub connector calls); the agent never waits for you, actions that need approval fail | default: an autonomous agent working inside the workspace |
+| `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=never` (set by the installer), or `KROT_CODEX_APPROVALS` unset | sandbox `workspace-write` until managed hooks qualify for full access, policy `never`: no approval cards of any kind (commands, files, MCP and GitHub connector calls); the agent never waits for you, actions that need approval fail | default: an autonomous agent working inside the workspace |
 | `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=standard` (`--approval-mode standard`) | sandbox `workspace-write`, approval policy `on-request`: Codex asks before actions outside the sandbox; you get a card with the exact command or diff | when you want to confirm actions outside the workspace |
 | `KROT_CODEX_APPROVALS=1` + `KROT_CODEX_APPROVAL_MODE=risky` | as `standard`, but routine requests are decided by the bridge's policy and only risky or unclear ones reach you | when cards come too often |
-| `KROT_CODEX_SANDBOX=danger-full-access`, `KROT_CODEX_APPROVALS` unset | no sandbox, no cards: Codex can use the network and write anywhere the OS user can | only for a dedicated unprivileged OS user on a machine you can rebuild |
+| `KROT_CODEX_SANDBOX=danger-full-access`, with verified managed hooks in approval mode `never` | Codex can use the network and write anywhere the OS user can | only for a dedicated unprivileged OS user |
 
 `danger-full-access` cannot be combined with `KROT_CODEX_PROXY`.
+
+### Full access and managed hooks
+
+On Linux, full access lets the agent write wherever its dedicated system user can write. Run `./install.sh --hooks` as that user. Have an administrator review and run the single `sudo install …` line printed by the installer, then rerun `./install.sh --hooks` and check `/doctor` in Telegram or run `bun run doctor` from `plugin/`. In approval mode `never`, the bridge enables full access after it verifies the root-owned hooks. If verification fails, it uses the workspace sandbox.
+
+The hooks protect `AGENTS.md` and `AGENTS.override.md` in Codex home. For host-wide setup and protecting those files with the Linux immutable flag, see the [hooks guide](codex-hooks/README.md).
+
+### Brain memory
+
+Brain is on by default. It keeps facts and open tasks from your private chat so a new or shortened conversation can pick up where you left off. Forwarded and foreign text stays separate from your owner memory. Send `/memory` to see what is stored or `/memory off` to switch Brain off.
+
+On a new installation with Brain off at startup, the local backend defaults to native Codex memory when you have left the setting unset. See the [Brain guide](plugin/docs/learning.md) and [native memory settings](plugin/docs/install.md#native-codex-memories).
 
 ## Parallel answers
 
@@ -164,7 +175,7 @@ Settings live in `plugin/.env` (environment) and an optional `config.json` in th
 
 ## Update and uninstall
 
-Update (fast-forward from the remote branch your clone tracks, tests and `doctor` run on a staged copy first):
+Update (fast-forward from the tracked branch, tests and `doctor` run on a staged copy first):
 
 ```bash
 ./update.sh            # then restart when the bot is idle
@@ -209,8 +220,8 @@ grep -h '"level":"error"' ~/.local/state/krotov-plugin/errors-*.jsonl | tail -n 
 - [plugin/docs/quickstart.md](plugin/docs/quickstart.md): manual installation on a VPS (Russian)
 - [plugin/docs/install.md](plugin/docs/install.md): deployment guide and Telegram commands
 - [plugin/docs/root-backend.md](plugin/docs/root-backend.md): separate Codex App Server through a local relay
-- [plugin/docs/learning.md](plugin/docs/learning.md): learning memory
-- [CHANGES.md](CHANGES.md): changes in this fork
+- [Codex Brain and legacy memory migration](plugin/docs/learning.md)
+- [CHANGES.md](CHANGES.md): implementation history
 
 Developer tests: `bun test` in `plugin/`.
 

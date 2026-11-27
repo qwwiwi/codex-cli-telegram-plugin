@@ -18,6 +18,7 @@
 
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 
+import { StoredTurnOriginSchema, type StoredTurnOrigin } from '../codex/turn-origin.js'
 import type { Logger } from '../log.js'
 
 export interface OpenQuestionRecord {
@@ -37,6 +38,10 @@ export interface OpenQuestionRecord {
   // `exactOptionalPropertyTypes` is on, so this is built conditionally — never
   // assigned `undefined`.
   lastRemindedAtMs?: number
+  // The Codex thread and bridge role of the turn that asked. A question of an isolated turn
+  // (forward, another agent) is not the owner's and never enters the owner's Brain export.
+  // Read through parseTurnOrigin: a record without a valid origin is a guest's.
+  origin?: StoredTurnOrigin
 }
 
 // Persisted shape on disk: { "<chatId>": <record>, … }. Plain object, keyed by
@@ -118,6 +123,8 @@ function parseRecord(chatId: string, raw: unknown): OpenQuestionRecord | undefin
     remindersSent,
   }
   if (isPositiveInt(r.threadId)) out.threadId = r.threadId
+  const origin = StoredTurnOriginSchema.safeParse(r.origin)
+  if (origin.success) out.origin = origin.data
   if (typeof r.lastRemindedAtMs === 'number' && Number.isFinite(r.lastRemindedAtMs)) {
     out.lastRemindedAtMs = r.lastRemindedAtMs
   }

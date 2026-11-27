@@ -6,21 +6,27 @@ import type { ContinuationContext } from './continuation.js'
 import type { LeaseTicket } from './lease.js'
 import type { PartStatus } from './reply-delivery.js'
 import { agentFramePrefix, agentProvenance, isProvenance, ownerProvenance, type Provenance } from './provenance.js'
+import { object } from './rpc.js'
+import {
+  legacyOwnerOrigin, ownerOrigin, parseTurnOrigin, storedOrigin, withTurn, type StoredTurnOrigin, type TurnOrigin,
+} from './turn-origin.js'
 
 const filename = 'codex-inbox.json'
 const limit = 16
 export type InboxReply = { text: string; files: string[]; replyTo?: number }
 type Work = { continuation?: ContinuationContext; lease?: LeaseTicket; mayRestartBridge?: true;
   verificationEligible?: true; voiceTaskText?: string }
-type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string } |
+// `thread`: the side thread of an isolated turn (forward, another agent); its turn lives only there.
+type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string; thread?: string } |
   { stage: 'ready'; reply: InboxReply; continueGoal?: true; restartBridge?: true; restartVerification?: true;
     delivery?: Record<string, PartStatus>;
     // The Telegram HTML chunks the `text:N` receipts refer to, saved before the first text part is sent.
     textPlan?: string[] }
-type Active = { messages: Message[]; outcome: Outcome; work?: Work }
+// `origin`: the turn origin classified when the turn started; a record without one is a guest's.
+type Active = { messages: Message[]; outcome: Outcome; work?: Work; origin?: StoredTurnOrigin }
 // A side turn Codex accepted (turn/start answered); kept until the side turn finishes.
 // `unconfirmed`: a follow-up held by recovery because its dead letter could not be written.
-export type SideJob = { messages: Message[]; thread?: string; unconfirmed?: true }
+export type SideJob = { messages: Message[]; thread?: string; unconfirmed?: true; origin?: StoredTurnOrigin }
 type Pending = { ready: Message[][]; albums: Record<string, Message[]>; accepted: number[]; active?: Active;
   followUp?: Message[]; followUpIndex?: number; sides?: Record<string, SideJob>;
   // Who wrote each held message, keyed by message id. Missing means "not the owner".
@@ -67,7 +73,16 @@ export class CodexInbox {
             outcome.textPlan.every(part => typeof part === 'string'))) {
         delete outcome.textPlan
       }
-      if (state.active && (!first || state.origins[String(first.message_id)]?.origin !== 'owner')) {
+      // A record saved before origins were persisted: with owner provenance and no side thread it was
+      // an owner turn on the main thread; anything else is a guest's.
+      if (state.active && first && state.active.origin === undefined) {
+        const owner = state.origins[String(first.message_id)]?.origin === 'owner' && !threadOf(state.active.outcome)
+        state.active = { ...state.active, origin: storedOrigin(owner ? legacyOwnerOrigin(first.message_id)
+          : parseTurnOrigin(undefined, first.message_id)) }
+      }
+      // Owner metadata needs both an owner provenance and an owner origin.
+      if (state.active && (!first || state.origins[String(first.message_id)]?.origin !== 'owner' ||
+          !ownerOrigin(parseTurnOrigin(state.active.origin, first.message_id)))) {
         state.active = withoutOwnerMetadata(state.active)
       }
       this.state = state
@@ -98,8 +113,22 @@ export class CodexInbox {
   }
 
   /** Side turns Codex accepted before the bridge stopped. */
-  get sideJobs(): Array<SideJob & { id: number }> {
-    return Object.entries(this.state.sides ?? {}).map(([id, side]) => ({ id: Number(id), ...side }))
+  get sideJobs(): Array<Omit<SideJob, 'origin'> & { id: number; origin: TurnOrigin }> {
+    return Object.entries(this.state.sides ?? {}).map(([id, side]) => ({
+      ...side, id: Number(id), origin: parseTurnOrigin(side.origin, Number(id)),
+    }))
+  }
+
+  /** The origin of the active turn, bound to the thread and turn saved for it; a record without one is a guest's. */
+  get activeOrigin(): TurnOrigin | undefined {
+    const active = this.state.active
+    const first = active?.messages[0]
+    if (!active || !first) return undefined
+    const origin = parseTurnOrigin(active.origin, first.message_id)
+    const outcome = active.outcome
+    const thread = threadOf(outcome) ?? origin.thread
+    const turn = (outcome.stage === 'running' ? outcome.turnId : undefined) ?? origin.turn
+    return thread !== undefined && turn !== undefined ? withTurn(origin, thread, turn) : origin
   }
 
   /** Who wrote a held message; an id the inbox does not hold is never the owner's. */
@@ -117,10 +146,11 @@ export class CodexInbox {
   }
 
   /** Codex accepted the side turn of the uncertain follow-up: keep it as a side job until it finishes. */
-  startSide(id: number, thread: string): void {
+  startSide(id: number, thread: string, origin: TurnOrigin): void {
     const { followUp, followUpIndex: _index, ...pending } = this.state
     if (followUp?.[0]?.message_id !== id) return
-    this.save({ ...pending, sides: { ...pending.sides, [String(id)]: { messages: followUp, thread } } })
+    this.save({ ...pending, sides: { ...pending.sides,
+      [String(id)]: { messages: followUp, thread, origin: storedOrigin(origin) } } })
   }
 
   /** Moves the uncertain follow-up out of the queue's way, keeping its record as a side job. */
@@ -200,12 +230,17 @@ export class CodexInbox {
     if (active?.outcome.stage === 'claimed') this.save({ ...pending, ready: [active.messages, ...pending.ready] })
   }
 
-  start(id: number, work?: Work): void {
-    this.updateActive(id, { stage: 'running' }, work)
+  /** The turn started with this origin; owner work is kept only for an owner origin. */
+  start(id: number, origin: TurnOrigin, work?: Work): void {
+    const active = this.state.active
+    if (active?.messages[0]?.message_id !== id) return
+    const { work: _previous, ...rest } = active
+    this.save({ ...this.state, active: { ...rest, outcome: { stage: 'running' }, origin: storedOrigin(origin),
+      ...(work && ownerOrigin(origin) ? { work } : {}) } })
   }
 
-  assignTurn(id: number, turnId: string): void {
-    this.updateActive(id, { stage: 'running', turnId })
+  assignTurn(id: number, turnId: string, thread?: string): void {
+    this.updateActive(id, { stage: 'running', turnId, ...(thread === undefined ? {} : { thread }) })
   }
 
   complete(id: number, reply: InboxReply, continueGoal?: boolean, restartBridge?: boolean, restartVerification?: boolean): void {
@@ -311,7 +346,28 @@ function withoutOwnerMetadata(active: Active): Active {
   return { ...rest, outcome }
 }
 
+function threadOf(outcome: Outcome): string | undefined {
+  return outcome.stage === 'running' ? outcome.thread : undefined
+}
+
 function groups(state: Pending): Message[][] {
   return [...state.ready, ...Object.values(state.albums), ...(state.active ? [state.active.messages] : []),
     ...(state.followUp ? [state.followUp] : []), ...Object.values(state.sides ?? {}).map(side => side.messages)]
+}
+
+/** Where restart recovery reads a running turn from: the main thread's history or one side thread's turns. */
+export interface TurnHistory {
+  main(): Promise<unknown[]>
+  side(thread: string): Promise<unknown[]>
+}
+
+/**
+ * The saved Codex turn of a recovered running task. An isolated turn is looked up only on its own
+ * side thread, never in the main thread's history; an unreadable side thread gives no turn.
+ */
+export async function recoveredTurn(turnId: string | undefined, thread: string | undefined,
+  history: TurnHistory): Promise<Record<string, unknown> | undefined> {
+  if (!turnId) return undefined
+  const turns = thread === undefined ? await history.main() : await history.side(thread).catch(() => [])
+  return turns.map(object).find(turn => turn.id === turnId)
 }

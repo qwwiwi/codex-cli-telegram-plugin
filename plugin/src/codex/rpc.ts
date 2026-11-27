@@ -3,6 +3,8 @@ import { createInterface } from 'node:readline'
 
 export type Json = Record<string, unknown>
 
+export const LOCAL_CODEX_COMMAND: readonly [string, ...string[]] = ['codex', 'app-server', '--listen', 'stdio://']
+
 export function object(value: unknown): Json {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Json
@@ -34,7 +36,7 @@ export class CodexRpc {
     env: NodeJS.ProcessEnv,
     onEvent: (event: CodexEvent) => void,
     private readonly onClose: () => void,
-    command: readonly [string, ...string[]] = ['codex', 'app-server', '--listen', 'stdio://'],
+    command: readonly [string, ...string[]] = LOCAL_CODEX_COMMAND,
     onRequest?: (request: CodexServerRequest) => Promise<Json | undefined>,
   ) {
     const [executable, ...args] = command
@@ -76,7 +78,7 @@ export class CodexRpc {
 
   async initialize(timeoutMs?: number): Promise<void> {
     await this.request('initialize', {
-      clientInfo: { name: 'krot_telegram', version: '0.1.0' },
+      clientInfo: { name: 'krot_telegram', version: '0.4.0' },
       capabilities: { experimentalApi: true, requestAttestation: false },
     }, timeoutMs)
     this.write({ method: 'initialized' })

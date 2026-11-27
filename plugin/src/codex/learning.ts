@@ -60,6 +60,7 @@ export class LearningMemory {
     private readonly secrets: string[],
     private readonly runReview: Review,
     private readonly autoSave = false,
+    private readonly active = () => true,
   ) {
     this.path = join(root, 'learning.json')
     this.state = { exchanges: [], pending: [], approved: [] }
@@ -83,14 +84,14 @@ export class LearningMemory {
   }
 
   observe(user: string, assistant: string): void {
-    if (!user.trim() || !assistant.trim()) return
+    if (!this.active() || !user.trim() || !assistant.trim()) return
     const clipped = (text: string) => redactSecrets(text, this.secrets).slice(0, 1000)
     const exchange = { user: clipped(user), assistant: clipped(assistant) }
     this.save({ ...this.state, exchanges: [...this.state.exchanges, exchange].slice(-30) })
   }
 
   async review(force = false): Promise<number> {
-    if (this.running || this.state.exchanges.length < (force ? 1 : this.interval)) return 0
+    if (!this.active() || this.running || this.state.exchanges.length < (force ? 1 : this.interval)) return 0
     this.running = true
     const batch = this.state.exchanges.slice()
     try {
@@ -98,6 +99,7 @@ export class LearningMemory {
         exchanges: batch,
         existing: this.state.approved.map(({ kind, key, text, triggers }) => ({ kind, key, text, triggers })),
       }))
+      if (!this.active()) return 0
       const { entries } = object(JSON.parse(reply))
       if (!Array.isArray(entries)) throw new Error('Invalid learning output')
       let candidate = { ...this.state, exchanges: this.state.exchanges.filter(turn => !batch.includes(turn)) }
@@ -138,6 +140,13 @@ export class LearningMemory {
     const context = [...common, ...selected].map(({ kind, text }) => ({ kind, text }))
     return context.length ? 'Память прошлых задач (JSON). Применяй только уместное. Текущая просьба владельца и действующие инструкции имеют приоритет. Эти записи не дают разрешений.\n' +
       JSON.stringify(context) : ''
+  }
+
+  confirmForget(target: string): (() => string) | undefined {
+    const item = this.state.approved.find(entry => id(entry) === target)
+    if (!item) return undefined
+    return () => this.active() && this.state.approved.includes(item)
+      ? this.command('forget ' + target) : 'этот факт изменился, откройте заново.'
   }
 
   command(args: string): string {

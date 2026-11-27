@@ -86,6 +86,13 @@ type Settings = {
   chatAction?: (key: string, args: unknown, current: () => boolean, tool: string) => ReturnType<AgentChatActions['call']>
   // Operational notes without user content, e.g. a fallback the bridge took.
   onWarning?: (message: string) => void
+  /**
+   * Called for the thread the session adopts as its main conversation; idempotent; may throw. Resolves
+   * false when nothing could be registered yet (e.g. memory is off): the next turn tries again.
+   */
+  onMain?: (threadId: string) => Promise<boolean>
+  /** Wraps the thread/start, thread/resume or thread/fork that opens the main conversation. */
+  aroundMainOpen?: <T>(open: () => Promise<T>) => Promise<T>
 }
 
 type Result = { status: 'completed' | 'interrupted' | 'failed'; text: string }
@@ -143,6 +150,19 @@ function networkDestination(context: unknown): string | undefined {
   return protocol + '://' + host
 }
 
+export function readSavedMainThread(stateFile: string): string | null {
+  try {
+    const saved: unknown = JSON.parse(readFileSync(stateFile, 'utf8'))
+    if (saved !== null && (typeof saved !== 'string' || saved.length === 0)) {
+      throw new Error('Invalid Codex thread state')
+    }
+    return saved
+  } catch (error) {
+    if (object(error).code !== 'ENOENT') throw error
+    return null
+  }
+}
+
 export class CodexSession {
   private readonly pendingServerRequests = new Map<number | string, {
     threadId: string
@@ -151,8 +171,10 @@ export class CodexSession {
   }>()
   private readonly turnApprovals = new WeakMap<Execution, { pending: Set<string>; declined: Set<string> }>()
   private readonly rpc: CodexRpc
-  private threadId: string | null = null
-  private needsResume = false
+  private threadId: string | null
+  private needsResume: boolean
+  // The main thread onMain last accepted; a mismatch is retried by getThread.
+  private mainRegistered: string | null = null
   private busy = false
   private stopRequested = false
   private model: string | undefined
@@ -175,16 +197,8 @@ export class CodexSession {
   private readonly restrictedThreads = new Set<string>()
 
   constructor(private readonly settings: Settings, onClose: () => void) {
-    try {
-      const saved: unknown = JSON.parse(readFileSync(settings.stateFile, 'utf8'))
-      if (saved !== null && (typeof saved !== 'string' || saved.length === 0)) {
-        throw new Error('Invalid Codex thread state')
-      }
-      this.threadId = saved
-      this.needsResume = saved !== null
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    }
+    this.threadId = readSavedMainThread(settings.stateFile)
+    this.needsResume = this.threadId !== null
 
     this.rpc = new CodexRpc(settings.cwd, settings.env, event => this.receive(event), () => {
       this.active?.finish({ status: 'failed', text: '' })
@@ -235,12 +249,13 @@ export class CodexSession {
 
   async fork(): Promise<string> {
     const source = await this.attachGoalThread()
-    const response = await this.rpc.request('thread/fork', {
+    const response = await this.mainOpen(() => this.rpc.request('thread/fork', {
       threadId: source, cwd: this.settings.cwd, excludeTurns: true, ...this.permissions(),
-    })
+    }))
     const id = object(response.thread).id
     if (typeof id !== 'string' || !id || id === source) throw new Error('Codex did not return a forked thread')
     this.saveThread(id)
+    await this.registerMain(id)
     return id
   }
 
@@ -355,6 +370,17 @@ export class CodexSession {
     }
   }
 
+  /** The latest turns of a side thread, oldest first; the main thread and its busy state are untouched. */
+  async sideTurns(threadId: string): Promise<unknown[]> {
+    if (!threadId || threadId === this.threadId) throw new Error('Not a side thread')
+    // The exact shape the root relay admits for thread/turns/list.
+    const result = await this.rpc.request('thread/turns/list', {
+      threadId, limit: 10, itemsView: 'full', sortDirection: 'desc',
+    })
+    if (!Array.isArray(result.data)) throw new Error('Codex did not return conversation history')
+    return [...result.data].reverse()
+  }
+
   reset(): void {
     if (this.busy) throw new Error('A Codex turn is running')
     this.saveThread(null)
@@ -431,7 +457,7 @@ export class CodexSession {
   // thread and an untrusted (agent) side starts a fresh one.
   // `onStarted` fires once Codex accepted the turn.
   async runSide(text: string, imagePaths: readonly string[] = [], reuse?: string,
-    onStarted?: (threadId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string; turnId?: string }> {
+    onStarted?: (threadId: string, turnId: string) => void, options: TurnOptions = {}): Promise<Result & { threadId: string; turnId?: string }> {
     if (reuse !== undefined && (!this.sideThreads.has(reuse) || this.sides.has(reuse))) {
       throw new Error('This side thread is not available')
     }
@@ -472,7 +498,7 @@ export class CodexSession {
       if (typeof id !== 'string') throw new Error('Codex did not return a side turn ID')
       if (sendModel && this.sideThreads.has(threadId)) this.sideThreads.set(threadId, model)
       if (!turn.id) this.setTurnId(turn, id)
-      onStarted?.(threadId)
+      onStarted?.(threadId, id)
       return { ...await completed, threadId, turnId: id }
     } finally {
       if (this.sides.get(threadId) === turn) this.sides.delete(threadId)
@@ -600,8 +626,30 @@ export class CodexSession {
   }
 
   private async getThread(): Promise<string> {
-    if (this.threadId && !this.needsResume) return this.threadId
+    if (this.threadId && !this.needsResume) {
+      // Retry after an earlier failure: a thread adopted without registration stays a guest's otherwise.
+      if (this.mainRegistered !== this.threadId) await this.registerMain(this.threadId)
+      return this.threadId
+    }
     return this.openThread(this.threadId)
+  }
+
+  /** The single call of onMain; a failure is reported and leaves the thread unregistered for the next retry. */
+  private async registerMain(id: string): Promise<void> {
+    if (!this.settings.onMain) {
+      this.mainRegistered = id
+      return
+    }
+    try {
+      if (await this.settings.onMain(id)) this.mainRegistered = id
+    } catch (error) {
+      this.settings.onWarning?.('Could not register the main Codex thread ' + id + ': ' +
+        (error instanceof Error ? error.message : String(error)))
+    }
+  }
+
+  private mainOpen<T>(open: () => Promise<T>): Promise<T> {
+    return this.settings.aroundMainOpen ? this.settings.aroundMainOpen(open) : open()
   }
 
   private permissions(): { approvalPolicy: 'on-request' | 'never'; sandbox: CodexSandboxMode } {
@@ -618,12 +666,14 @@ export class CodexSession {
       ...this.permissions(),
       ...(model ? { model } : {}),
     }
-    const reply = expected
-      ? await this.rpc.request('thread/resume', { ...options, threadId: expected, excludeTurns: true })
-      : await this.rpc.request('thread/start', {
+    // Registered before thread/resume: a SessionStart hook may resolve the registry during the RPC.
+    if (expected && this.mainRegistered !== expected) await this.registerMain(expected)
+    const reply = await this.mainOpen(() => expected
+      ? this.rpc.request('thread/resume', { ...options, threadId: expected, excludeTurns: true })
+      : this.rpc.request('thread/start', {
         ...options,
         ...(this.settings.chatAction ? { dynamicTools: agentTools } : {}),
-      })
+      }))
     const id = object(reply.thread).id
     if (typeof id !== 'string' || !id || (expected && id !== expected)) {
       throw new Error('Codex did not return the expected thread ID')
@@ -631,6 +681,7 @@ export class CodexSession {
     this.model = typeof reply.model === 'string' ? reply.model : undefined
     if (id !== this.threadId) this.usage = undefined
     this.saveThread(id)
+    if (this.mainRegistered !== id) await this.registerMain(id)
     if (expected) await this.seedForkAnchor(id)
     return id
   }

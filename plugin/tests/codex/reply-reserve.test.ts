@@ -4,6 +4,7 @@
 
 import { expect, test } from 'bun:test'
 
+import type { SendDocumentOpts } from '../../src/channel/tools.js'
 import { createLogger } from '../../src/log.js'
 import { createRateLimitedTelegramApi } from '../../src/safety/rate-limited-telegram-api.js'
 import { fakeTelegramChat } from './fake-telegram-chat.js'
@@ -79,3 +80,34 @@ test('a final reply waiting for capacity is not held behind auxiliary sends wait
   expect(sentAt).toBeDefined()
   expect(sentAt! - start).toBeLessThanOrEqual(22_000)
 })
+
+for (const [size, heavyUploadMinBytes] of Object.entries({ light: Number.MAX_SAFE_INTEGER, heavy: 1 })) {
+  test(`an owner-reply ${size} document uses the reserved slot ahead of an auxiliary send`, async () => {
+    const chat = fakeTelegramChat()
+    const uploads: SendDocumentOpts[] = []
+    chat.raw.sendDocument = async (_chat, _path, options) => {
+      uploads.push(options)
+      return { message_id: 102 }
+    }
+    const clock = virtualClock()
+    const start = clock.now()
+    const api = createRateLimitedTelegramApi(chat.raw, log, {
+      jitterMaxMs: 0, now: clock.now, sleep: clock.sleep,
+      perChatMaxPerMinute: 2, perChatReplyReserve: 1, heavyUploadMinBytes,
+    })
+    void api.sendMessage(OWNER, 'card 1', {})
+    void api.sendMessage(OWNER, 'card 2', {})
+    await clock.runUntil(start)
+    expect(chat.texts()).toEqual(['card 1'])
+
+    // The fake transport accepts the test file itself as the upload fixture.
+    const options = { ownerReply: true, filename: 'reply.txt', reply_to_message_id: 99 }
+    void api.sendDocument(OWNER, import.meta.path, options)
+    await clock.runUntil(start)
+    expect(uploads).toEqual([{ filename: 'reply.txt', reply_to_message_id: 99 }])
+    expect(chat.texts()).toEqual(['card 1'])
+
+    await clock.runUntil(start + 60_000)
+    expect(chat.texts()).toEqual(['card 1', 'card 2'])
+  })
+}

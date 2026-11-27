@@ -3,13 +3,33 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
-## Unreleased
+## v0.4.0 – 2026-11-27
 
-- New installations default to native Codex memories for the local backend, honor explicit settings, and support `--no-memories`.
+[Release notes in English and Russian](docs/releases/v0.4.0.md).
 
-## Usage analytics
+### Added
 
-- Added the owner command `/usage` and a local JSON export for token trends and observed subscription quota. [Usage analytics](docs/usage-analytics.md).
+- Full access in approval mode `never` requires verified system-wide managed hooks.
+  Run `./install.sh --hooks` as the dedicated bridge user, run the printed
+  `sudo install …` line as an administrator, then rerun the installer and check
+  `/doctor`. The hooks protect `AGENTS.md` and `AGENTS.override.md` in Codex home.
+- Codex Brain stores owner facts and open tasks in the private memory directory.
+  Forwarded and foreign input is isolated from owner memory. PreCompact saves a
+  handoff before compaction, and the SessionStart hook sets its additional context limit
+  to 6,000. Open `/memory` to inspect or manage the store.
+- `/usage` shows local token trends for 1, 7 or 30 days, and the analytics
+  script exports JSON. [Usage analytics](docs/usage-analytics.md) · [#9](https://github.com/qwwiwi/codex-cli-telegram-plugin/pull/9)
+- Fresh installations with Brain off default to native Codex memories for the
+  local backend when Codex has no explicit setting. `--no-memories` skips the
+  default. [Native memory settings](plugin/docs/install.md#native-codex-memories) · [#10](https://github.com/qwwiwi/codex-cli-telegram-plugin/pull/10)
+
+### Fixed
+
+- Telegram retries recheck the bot-wide cooldown before sending, including when
+  another request extends the pause during a retry. [#4](https://github.com/qwwiwi/codex-cli-telegram-plugin/issues/4)
+- Telegram reply splitting preserves tag, entity and text boundaries. The
+  bridge migrates saved legacy queue entries before replay, redacting across
+  old chunk cuts and preserving delivery receipts. [#7](https://github.com/qwwiwi/codex-cli-telegram-plugin/issues/7)
 
 ## v0.3.1.1
 

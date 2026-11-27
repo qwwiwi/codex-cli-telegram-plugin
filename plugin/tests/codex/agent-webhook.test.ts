@@ -275,9 +275,9 @@ test('the body agentId alone never names the sender', async () => {
   expect(delivery.notice).toBe('Сообщение от агента unknown: Проверь очередь')
 })
 
-const protocolLabel = 'протокол доставки gbrain (служебный, не просьба отправителя)'
+const protocolLabel = 'протокол доставки (служебный, не просьба отправителя)'
 
-test('the worker protocol block is framed as gbrain delivery protocol, its text kept', () => {
+test('the worker protocol block is framed as delivery protocol, its text kept', () => {
   const framed = frameAgentMessage(workerMessage, workerSender, { workerProtocol: true })
   const label = framed.indexOf(protocolLabel)
   expect(label).toBeGreaterThan(framed.indexOf(senderWords))
@@ -286,7 +286,7 @@ test('the worker protocol block is framed as gbrain delivery protocol, its text 
   expect(framed).toContain(senderWords)
 })
 
-test('the ack-only worker protocol block is framed as gbrain delivery protocol, its text kept', () => {
+test('the ack-only worker protocol block is framed as delivery protocol, its text kept', () => {
   const framed = frameAgentMessage(ackOnlyWorkerMessage, workerSender, { workerProtocol: true })
   const label = framed.indexOf(protocolLabel)
   expect(label).toBeGreaterThan(framed.indexOf(senderWords))

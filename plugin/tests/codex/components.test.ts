@@ -300,6 +300,47 @@ test('[R12] a flood wait from a widget holds every later send until its deadline
   for (const [, at] of sentAt) expect(at - start).toBeGreaterThanOrEqual(30_000)
 })
 
+test('an in-flight retry honors an extended bot cooldown and can be cancelled while waiting', async () => {
+  for (const cancel of [false, true]) {
+    let clock = 0
+    const attempts: number[] = []
+    const waits: { until: number; release: () => void }[] = []
+    const short429 = { error_code: 429, parameters: { retry_after: 1 } }
+    const chat = fakeTelegramChat()
+    const api = createRateLimitedTelegramApi({
+      ...chat.raw,
+      async sendMessage() {
+        attempts.push(clock)
+        if (attempts.length === 1) throw short429
+        return { message_id: 1 }
+      },
+      async setMessageReaction() { throw { error_code: 429, parameters: { retry_after: 30 } } },
+    }, createLogger('components-test'), {
+      now: () => clock, jitterMaxMs: 0,
+      sleep: ms => new Promise<void>(release => { waits.push({ until: clock + ms, release }) }),
+    })
+    const releaseNext = (): void => {
+      const next = waits.shift()!
+      clock = next.until
+      next.release()
+    }
+    const signal = new AbortController()
+    const send = api.sendMessage(OWNER, 'retry me', { signal: signal.signal }).catch(error => error)
+    await Bun.sleep(0)
+    expect(waits.map(wait => wait.until)).toEqual([1_000])
+    clock = 500
+    await expect(api.setMessageReaction('456', 2, '👀')).rejects.toMatchObject({ error_code: 429 })
+    releaseNext()
+    await Bun.sleep(0)
+    expect(attempts).toEqual([0])
+    expect(waits.map(wait => wait.until)).toEqual([30_500])
+    if (cancel) signal.abort()
+    else releaseNext()
+    expect(await send).toEqual(cancel ? short429 : { message_id: 1 })
+    expect(attempts).toEqual(cancel ? [0] : [0, 30_500])
+  }
+})
+
 test('[R12][R13] component message IDs stay out of the persisted target cache', async () => {
   const root = mkdtempSync(join(tmpdir(), 'krot-component-targets-'))
   try {
@@ -447,6 +488,24 @@ test('[R12][R13] a widget fallback whose text an interim reply of the same turn 
   expect(chat.texts()).toEqual([same, 'Другое', same])
 })
 
+test('[R12][R13] an interim reply edited to other text is not reused for a widget fallback that matches its original text', async () => {
+  const chat = fakeTelegramChat()
+  const components = new AgentComponents({ ...chat.raw, async sendWidget() { throw refusal(TELEGRAM_CODE) } }, OWNER)
+  const actions = new AgentChatActions({ ...chat.raw, pinChatMessage: unexpected, unpinChatMessage: unexpected }, OWNER, { components })
+  const data = { title: 'Демо', label: 'Выполнено задач', value: 75 }
+  const same = componentFallbackText('progress', data, undefined, text => redactSecrets(text))
+  const reply = await actions.call(JSON.stringify(['thread', 'turn-1', 'reply-1']), { action: 'reply', text: same }, () => true)
+  const replyId = (parsed(reply).message_ids as number[])[0]!
+  const edit = await actions.call(JSON.stringify(['thread', 'turn-1', 'edit-1']),
+    { action: 'edit', target: replyId, text: 'Сейчас покажу прогресс.' }, () => true)
+  expect(parsed(edit)).toMatchObject({ ok: true })
+  const widget = await actions.component(JSON.stringify(['thread', 'turn-1', 'call-1']), 'send_component', { component: 'progress', data }, () => true)
+  // The edited message no longer shows the fallback text: the fallback goes out as its own message.
+  expect(parsed(widget)).toMatchObject({ ok: true, delivery: 'text' })
+  expect(parsed(widget).message_ids).not.toEqual([replyId])
+  expect(chat.texts()).toEqual(['Сейчас покажу прогресс.', same])
+})
+
 test('[R12][R13] after a text fallback a distinct short final, such as a rollback result, still reaches the owner', async () => {
   const chat = fakeTelegramChat()
   const components = new AgentComponents({ ...chat.raw, async sendWidget() { throw refusal(TELEGRAM_CODE) } }, OWNER)
@@ -506,7 +565,7 @@ test('[R13] a diagram the widget refuses reaches the owner as a numbered flow, n
   // The live payload: a flowchart with return edges (3→2, 4→2, 2→1), which the flowchart pack rejects as cyclic.
   const labels = ['Ты пишешь боту', 'Плагин на сервере', 'Codex ведёт задачу', 'Модель OpenAI', 'Файлы и команды', 'Ответ в Telegram']
   const data = {
-    title: 'Как Тиранда отвечает в Telegram',
+    title: 'Как агент отвечает в Telegram',
     nodes: labels.map(label => ({ label, kind: 'step' })),
     edges: [[0, 1], [1, 2], [2, 3], [3, 2], [2, 4], [4, 2], [2, 1], [1, 5]].map(([source, target]) => ({ source, target })),
   }
@@ -515,7 +574,7 @@ test('[R13] a diagram the widget refuses reaches the owner as a numbered flow, n
   expect(parsed(result)).toMatchObject({ ok: true, delivery: 'text' })
   expect(calls.map(call => call[0])).toEqual(['text'])
   expect(calls[0]![2]).toBe([
-    'Как Тиранда отвечает в Telegram',
+    'Как агент отвечает в Telegram',
     '1. Ты пишешь боту → Плагин на сервере',
     '2. Плагин на сервере → Codex ведёт задачу, Ответ в Telegram',
     '3. Codex ведёт задачу → Модель OpenAI, Файлы и команды, Плагин на сервере',

@@ -1,4 +1,4 @@
-// The shape of a gbrain worker delivery to the agent webhook: a worker header
+// The shape of an inter-agent worker delivery to the agent webhook: a worker header
 // line, the sender's own words, then the worker's delivery protocol block.
 // The body's agentId is the RECIPIENT, not the sender. Ids are placeholders.
 

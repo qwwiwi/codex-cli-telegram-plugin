@@ -146,6 +146,9 @@ for await (const line of createInterface({ input: process.stdin })) {
         source: { subAgent: { thread_spawn: { parent_thread_id: threadId, depth: 1 } } },
       } })
       break
+    case 'thread/inject_items':
+      respond({})
+      break
     case 'thread/goal/get':
       respond({ goal: goalState.current })
       break

@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from 'bun:test'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { type ApprovalEnv, resolveApprovalSetup } from '../../src/codex/approval-mode.js'
+import { BOOT_GUARD_LINE, unitDrift } from '../../src/codex/unit-contract.js'
 import { loadConfig } from '../../src/config.js'
 
 const source = resolve(import.meta.dir, '../../..')
@@ -25,7 +26,8 @@ function checkout() {
   mkdirSync(join(repo, 'plugin/scripts'), { recursive: true })
   mkdirSync(bin)
   mkdirSync(home)
-  for (const file of ['install.sh', 'update.sh', 'plugin/scripts/setup-common.sh']) {
+  for (const file of ['install.sh', 'update.sh', 'plugin/scripts/setup-common.sh', 'plugin/scripts/notify-failed.sh',
+    'plugin/scripts/boot-guard.sh']) {
     if (existsSync(join(source, file))) cpSync(join(source, file), join(repo, file))
   }
   writeFileSync(join(repo, '.gitignore'), 'plugin/.env\nplugin/node_modules/\n')
@@ -33,11 +35,13 @@ function checkout() {
   const env = {
     PATH: bin + ':/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: join(home, '.config'),
     XDG_STATE_HOME: join(home, '.local/state'), TELEGRAM_BOT_TOKEN: token, SETUP_CALLS: join(root, 'calls'),
+    SETUP_REAL_BUN: process.execPath,
     GIT_AUTHOR_NAME: 'Setup test', GIT_AUTHOR_EMAIL: 'test@example.test',
     GIT_COMMITTER_NAME: 'Setup test', GIT_COMMITTER_EMAIL: 'test@example.test',
   }
   const stub = (name: string, body: string) => writeFileSync(join(bin, name), '#!/usr/bin/env bash\n' + body + '\n', { mode: 0o700 })
   stub('bun', `printf 'bun %s\\n' "$*" >> "$SETUP_CALLS"
+if [[ "$1" == --no-env-file && "$2" == --env-file=* && "$3" == -e ]]; then exec "$SETUP_REAL_BUN" "$@"; fi
 if [[ "$*" == *' test' && -f broken ]]; then exit 8; fi
 if [[ "$*" == *'run doctor' && -v FAIL_DOCTOR ]]; then exit 9; fi
 if [[ "$*" == --env-file* && "$1" != --env-file=* ]]; then exit 13; fi`)
@@ -75,6 +79,7 @@ test('install configures a private owner and checks doctor without starting the 
   expect(result.text).not.toContain(token)
   const file = join(repo, 'plugin/.env')
   const saved = readFileSync(file, 'utf8')
+  expect(saved).toContain('KROT_CODEX_MEMORIES_DEFAULT=1')
   expect(saved).toContain('TELEGRAM_EXPECTED_BOT_ID=123456789')
   expect(saved).toContain('TELEGRAM_ALLOWED_CHAT_IDS=987654321')
   expect(saved).toContain('KROT_CODEX_AGENT_NAME="Полярная звезда"')
@@ -90,6 +95,18 @@ test('install configures a private owner and checks doctor without starting the 
   expect(repeated.code, repeated.text).toBe(0)
   expect(readFileSync(file, 'utf8')).toBe(saved)
   expect(readFileSync(profile, 'utf8')).toBe('A custom profile\n')
+})
+
+test('a fresh install accepts --no-memories and keeps the choice on rerun', () => {
+  const { repo, env } = checkout()
+  const invocation = ['bash', './install.sh', '--non-interactive', '--owner-id', '987654321']
+  const optedOut = command(repo, env, ...invocation, '--no-memories')
+  expect(optedOut.code, optedOut.text).toBe(0)
+  const file = join(repo, 'plugin/.env')
+  expect(readFileSync(file, 'utf8')).toContain('KROT_CODEX_MEMORIES_DEFAULT=0')
+  const rerun = command(repo, env, ...invocation)
+  expect(rerun.code, rerun.text).toBe(0)
+  expect(readFileSync(file, 'utf8')).toContain('KROT_CODEX_MEMORIES_DEFAULT=0')
 })
 
 // Reads the approval lines of plugin/.env into the shape resolveApprovalSetup takes.
@@ -160,6 +177,67 @@ test('[R01] the installer offers never and keeps standard selectable, on a fresh
   expect(switched.code, switched.text).toBe(0)
   expect(approvalEnv(file)).toEqual({ KROT_CODEX_APPROVALS: '1', KROT_CODEX_APPROVAL_MODE: 'never' })
   expect(command(repo, env, 'bash', './install.sh', '--approval-mode', 'sometimes').code).not.toBe(0)
+})
+
+test('[R17] every install sets up the Codex hooks pack unless --no-hooks; full access is left to the hooks installer', () => {
+  const envOf = (repo: string) => readFileSync(join(repo, 'plugin/.env'), 'utf8')
+  const hooksOn = (repo: string) => envOf(repo).includes('KROT_CODEX_HOOKS=1')
+  const autonomous = checkout()
+  const result = command(autonomous.repo, autonomous.env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(result.code, result.text).toBe(0)
+  expect(readFileSync(autonomous.env.SETUP_CALLS, 'utf8')).toContain('codex-hooks/src/install.ts')
+  expect(hooksOn(autonomous.repo)).toBe(true)
+  expect(envOf(autonomous.repo)).toContain('KROT_CODEX_APPROVAL_MODE=never')
+  // Full access is written by the hooks installer only after it sees the managed guards active.
+  expect(envOf(autonomous.repo)).not.toContain('KROT_CODEX_SANDBOX=danger-full-access')
+  expect(readFileSync(autonomous.env.SETUP_CALLS, 'utf8')).toContain('--full-access')
+  // No leftover copy of plugin/.env (it holds the bot token).
+  expect(readdirSync(join(autonomous.repo, 'plugin')).filter(name => name.startsWith('.env.'))).toEqual([])
+  const standard = checkout()
+  expect(command(standard.repo, standard.env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321',
+    '--approval-mode', 'standard').code).toBe(0)
+  expect(hooksOn(standard.repo)).toBe(true)
+  expect(envOf(standard.repo)).not.toContain('KROT_CODEX_SANDBOX=')
+  const optedOut = checkout()
+  expect(command(optedOut.repo, optedOut.env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321',
+    '--no-hooks').code).toBe(0)
+  expect(hooksOn(optedOut.repo)).toBe(false)
+  // An existing install gets the pack by default too.
+  expect(command(optedOut.repo, optedOut.env, 'bash', './install.sh').code).toBe(0)
+  expect(hooksOn(optedOut.repo)).toBe(true)
+  expect(readFileSync(optedOut.env.SETUP_CALLS, 'utf8')).toContain('--full-access')
+})
+
+for (const mode of ['standard', 'risky']) {
+  test(`[R01/R17] rerunning the installer in saved ${mode} mode does not request full access`, () => {
+    const { repo, env } = checkout()
+    const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321',
+      '--approval-mode', mode)
+    expect(fresh.code, fresh.text).toBe(0)
+    writeFileSync(env.SETUP_CALLS, '')
+    const rerun = command(repo, env, 'bash', './install.sh', '--non-interactive')
+    expect(rerun.code, rerun.text).toBe(0)
+    expect(approvalEnv(join(repo, 'plugin/.env')).KROT_CODEX_APPROVAL_MODE).toBe(mode)
+    const hooksCall = readFileSync(env.SETUP_CALLS, 'utf8').split('\n').find(line => line.includes('codex-hooks/src/install.ts'))
+    expect(hooksCall).toBeDefined()
+    expect(hooksCall).not.toContain('--full-access')
+  })
+}
+
+test('[R17] a saved workspace-write sandbox stays in place on an autonomous rerun', () => {
+  const { repo, env } = checkout()
+  const fresh = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(fresh.code, fresh.text).toBe(0)
+  const file = join(repo, 'plugin/.env')
+  const saved = readFileSync(file, 'utf8') + 'export KROT_CODEX_SANDBOX = "workspace-write" # owner preference\n'
+  writeFileSync(file, saved)
+  writeFileSync(env.SETUP_CALLS, '')
+  const rerun = command(repo, env, 'bash', './install.sh', '--non-interactive')
+  expect(rerun.code, rerun.text).toBe(0)
+  expect(readFileSync(file, 'utf8') === saved).toBe(true)
+  const hooksCall = readFileSync(env.SETUP_CALLS, 'utf8').split('\n').find(line => line.includes('codex-hooks/src/install.ts'))
+  expect(hooksCall).toBeDefined()
+  expect(hooksCall).not.toContain('--full-access')
 })
 
 test('[R18] the generated agent profile explains subagents and parallel side threads', () => {
@@ -247,4 +325,74 @@ test('update validates upstream in isolation and leaves the checkout untouched o
   expect(git('rev-parse', 'HEAD')).toBe(publish('rev-parse', 'HEAD'))
   expect(readFileSync(join(repo, 'plugin/.env'), 'utf8')).toBe('saved fixture\n')
   expect(readFileSync(env.SETUP_CALLS, 'utf8')).not.toContain('systemctl')
+})
+
+test('update.sh refuses an upstream that starts tracking an ignored local file instead of overwriting it', () => {
+  const { root, repo, env, git } = checkout()
+  const remote = join(root, 'remote.git')
+  const publisher = join(root, 'publisher')
+  git('init', '--bare', '-q', '-b', 'main', remote)
+  git('remote', 'add', 'origin', remote)
+  git('push', '-qu', 'origin', 'main')
+  git('clone', '-q', remote, publisher)
+  const old = git('rev-parse', 'HEAD')
+  writeFileSync(join(repo, 'plugin/.env'), 'saved fixture\n', { mode: 0o600 })
+  const publish = (...args: string[]) => {
+    const result = command(publisher, env, 'git', ...args)
+    if (result.code !== 0) throw Error(result.text)
+    return result.text.trim()
+  }
+  writeFileSync(join(publisher, 'plugin/.env'), 'upstream template\n')
+  publish('add', '-f', 'plugin/.env')
+  publish('commit', '-qm', 'track the env file')
+  publish('push', '-q')
+  const result = command(repo, env, 'bash', './update.sh')
+  expect(result.code, result.text).not.toBe(0)
+  expect(readFileSync(join(repo, 'plugin/.env'), 'utf8')).toBe('saved fixture\n')
+  expect(git('rev-parse', 'HEAD')).toBe(old)
+})
+
+test('[S2] install writes a unit that ends restart loops and a one-message failure notifier', () => {
+  const { repo, env, home } = checkout()
+  const result = command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321')
+  expect(result.code, result.text).toBe(0)
+  const unit = readFileSync(join(home, '.config/systemd/user/krotov-telegram.service'), 'utf8')
+  expect(unitDrift(unit)).toEqual([])
+  for (const line of ['Restart=on-failure', 'RestartSec=10s', 'RestartForceExitStatus=75', 'SuccessExitStatus=75',
+    'RestartPreventExitStatus=78', 'TimeoutStopSec=90', 'StartLimitIntervalSec=300', 'StartLimitBurst=6',
+    'OnFailure=krotov-telegram-failed.service']) expect(unit.split('\n')).toContain(line)
+  // Start-limit settings live in [Unit]; systemd ignores them in [Service].
+  expect(unit.indexOf('StartLimitBurst=6')).toBeLessThan(unit.indexOf('[Service]'))
+  const failed = readFileSync(join(home, '.config/systemd/user/krotov-telegram-failed.service'), 'utf8')
+  expect(failed.split('\n')).toContain('Type=oneshot')
+  expect(failed).toContain(join(repo, 'plugin/scripts/notify-failed.sh'))
+  expect(failed).not.toContain('bun')
+  // S9: the bash boot guard runs before every start and never blocks it.
+  // It is the copy in the state directory, outside the checkout an update could change.
+  const guard = join(realpathSync(join(home, '.local/state/krotov-plugin')), 'boot-guard.sh')
+  expect(unit.split('\n')).toContain('ExecStartPre=-/bin/bash "' + guard + '"')
+  expect(readFileSync(guard, 'utf8')).toBe(readFileSync(join(repo, 'plugin/scripts/boot-guard.sh'), 'utf8'))
+  // The guard's rollback reinstalls dependencies inside the start; the default 90 s can cut it off.
+  expect(unit.split('\n')).toContain('TimeoutStartSec=300')
+})
+
+test('[S2] a rerun migrates a unit an earlier installer generated and leaves a custom unit untouched', () => {
+  const { repo, env, home } = checkout()
+  expect(command(repo, env, 'bash', './install.sh', '--non-interactive', '--owner-id', '987654321').code).toBe(0)
+  const unitFile = join(home, '.config/systemd/user/krotov-telegram.service')
+  const current = readFileSync(unitFile, 'utf8')
+  // The v0.3.2 unit before this change ran the guard from inside the checkout.
+  const legacy = current.split('\n').map(line => line.startsWith('ExecStartPre=')
+    ? 'ExecStartPre=-/bin/bash "' + join(repo, 'plugin/scripts/boot-guard.sh') + '"' : line).join('\n')
+  writeFileSync(unitFile, legacy)
+  expect(unitDrift(legacy)).toEqual([BOOT_GUARD_LINE])
+  const rerun = command(repo, env, 'bash', './install.sh', '--non-interactive')
+  expect(rerun.code, rerun.text).toBe(0)
+  expect(readFileSync(unitFile, 'utf8')).toBe(current)
+  expect(readFileSync(unitFile + '.bak', 'utf8')).toBe(legacy)
+  // A unit the owner edited is theirs: kept as it is.
+  const custom = legacy + '# my own line\n'
+  writeFileSync(unitFile, custom)
+  expect(command(repo, env, 'bash', './install.sh', '--non-interactive').code).toBe(0)
+  expect(readFileSync(unitFile, 'utf8')).toBe(custom)
 })
