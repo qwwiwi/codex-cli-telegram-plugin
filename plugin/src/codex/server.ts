@@ -10,11 +10,12 @@ import {
   currentPublicRole, gateInbound, GroupController,
 } from '../access/index.js'
 import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
-import type { SendMessageOpts, TelegramApi } from '../channel/tools.js'
+import type { SendMessageOpts, SentMessage, TelegramApi } from '../channel/tools.js'
 import { getStatePaths, loadConfig, resolveAskGuardMode, resolveHudEnabled, resolveOutboxEnabled, RuntimeEnvSchema } from '../config.js'
 import {
-  plainTextWithLinks, PreformattedDocumentError, protectPlainFallbackCuts, redactedRenderOffset, resumeMessagePlan,
-  splitMessage, splitMessageFrom, splitPlainFallback, splitPlainMessage, TELEGRAM_MAX_MESSAGE,
+  maskAcrossCuts, maskShownSecrets, maskedPlainFallback, plainTextWithLinks, PreformattedDocumentError, protectPlainFallbackCuts,
+  redactedRenderOffset, resumeMessagePlan, splitMessage, splitMessageFrom, splitPlainFallback, splitPlainMessage, TELEGRAM_MAX_MESSAGE,
+  telegramTextLength,
 } from '../format/chunk.js'
 import { splitMessageLegacy } from '../format/chunk-legacy.js'
 import { splitLongBlock, splitLongBlockLegacy } from '../format/paragraphs.js'
@@ -25,6 +26,7 @@ import { Outbox, type OutboxOptions } from '../safety/outbox.js'
 import { validateTelegramHtml } from '../safety/html-validator.js'
 import { detectOpenQuestion } from '../safety/open-question.js'
 import { createOpenQuestionTick } from '../safety/open-question-sweep.js'
+import { MaskedOverflowError } from '../safety/pre-send-error.js'
 import { parse429 } from '../safety/rate-limited-telegram-api.js'
 import { classifySendError } from '../safety/reliable-telegram-api.js'
 import { redactSecrets } from '../safety/redact.js'
@@ -104,7 +106,7 @@ import { legacyCommand } from './legacy-command.js'
 import { sideQuestion, sideReply, sideReplySchema } from './side-reply.js'
 import { SideDeliveries, sideEndNotice } from './side-delivery.js'
 import { errorDetail, ErrorJournal, errorLogDays } from './error-log.js'
-import { RenderEyes, type RenderView } from './render-eyes.js'
+import { RenderEyes, shownSent, type RenderView } from './render-eyes.js'
 import { isRenderPreviewTool, renderPreview } from './render-preview.js'
 import { EXIT } from './exit-codes.js'
 import { bridgeUnitName } from './unit-contract.js'
@@ -134,12 +136,16 @@ import { codexAppServerCommand } from './native-memories.js'
 import { HookDenials, multiuserProblems } from './multiuser-readiness.js'
 import { startupErrorMessage } from './startup-error.js'
 import {
-  assertPublicHomesSafe, loadPublicPolicy, preparePublicHome, publicAppServerCommand, publicCodexEnv, publicCodexRuntime, publicRolesSummary, PUBLIC_ROLES,
-  type HookRuntime, type PublicPolicy,
+  assertPublicHomesSafe, hookProofName, loadPublicPolicy, publicAppServerCommand, publicCodexEnv, publicCodexRuntime, publicRolesSummary,
+  PUBLIC_ROLES, type HookRuntime, type PublicPolicy,
 } from './public-home.js'
+import { runPublicGc, type GcOptions } from './public-gc.js'
+import { createPublicGeneration, openPublicGenerations } from './public-generations.js'
 import { publicIntake } from './public-intake.js'
 import { PublicLane, PublicRouter } from './public-lane.js'
-import { doctorPublicRoles, provePublicHooks, startPublicBackends, type StartedPublicRole } from './public-backends.js'
+import {
+  doctorPublicRoles, proofCacheLine, provePublicHooks, startPublicBackends, type ProofCacheProblem, type StartedPublicRole,
+} from './public-backends.js'
 import { CodexSession, readSavedMainThread } from './session.js'
 import { hideQuestionMarker, questionFallback, QuestionCards, QUESTION_CALLBACK } from './questions.js'
 import { CodexWorkStatus } from './work-status.js'
@@ -225,6 +231,7 @@ async function main(): Promise<void> {
   let publicRoot: string | undefined
   let publicPolicy: PublicPolicy | undefined
   let publicRuntime: HookRuntime | undefined
+  const publicHomesRoot = join(stateRoot, 'codex-public')
   // The owner CODEX_HOME a public home is built from and must never overlap.
   const ownerCodexHome = process.env.CODEX_HOME || join(process.env.HOME ?? '', '.codex')
   if (accessEnv.enabled) {
@@ -235,9 +242,9 @@ async function main(): Promise<void> {
     publicRoot = realpathSync(root)
     // The per-role allowlist (skills, MCP servers, web search); throws on anything it does not understand.
     publicPolicy = loadPublicPolicy(paths.root, process.env)
-    // Before any role home is cleaned: none of them may overlap the owner workspace, the owner Codex home or HOME.
+    // Reject state that overlaps the owner workspace, the owner Codex home or contains HOME.
     assertPublicHomesSafe({
-      homesRoot: join(paths.root, 'codex-public'), ownerWorkspace: workspace, ownerCodexHome,
+      homesRoot: publicHomesRoot, ownerWorkspace: workspace, ownerCodexHome,
       userHome: process.env.HOME ?? '',
     })
     // The public hooks run on this bridge's own bun; the Codex build and that bun are part of each home hash.
@@ -280,10 +287,12 @@ async function main(): Promise<void> {
     const dir = await mkdtemp(join(tmpdir(), 'krot-codex-reply-'))
     const file = join(dir, 'reply.txt')
     try {
-      await writeFile(file, redactSecrets(body, secrets), { flag: 'wx', mode: 0o600 })
+      const redactedBody = redactSecrets(body, secrets)
+      await writeFile(file, redactedBody, { flag: 'wx', mode: 0o600 })
       const options = { filename: 'reply.txt', ownerReply: true,
         ...(id === undefined ? {} : { reply_to_message_id: id }) }
-      return await api.sendDocument(chat, file, options)
+      const result = await api.sendDocument(chat, file, options)
+      return { ...result, body: redactedBody }
     } finally {
       await unlink(file).catch(() => undefined)
       await rmdir(dir).catch(() => undefined)
@@ -293,7 +302,7 @@ async function main(): Promise<void> {
   const outbox = resolveOutboxEnabled(config)
     ? new Outbox({ stateDir: paths.root, sendFn: (id, text, opts) => safeTelegram.sendMessage(id, text, opts),
       sendDocument: (id, text, opts) => sendTextDocument(safeTelegram, id, text, opts.reply_to_message_id),
-      onDelivered: (item, messageId) => onDeferredDelivery?.(item, messageId), log,
+      onDelivered: (item, messageId, sent) => onDeferredDelivery?.(item, messageId, sent), log,
       // A legacy reply saved part by part is redacted as a whole on load (a secret may be cut across its parts).
       redact: (text, parseMode) => redactOutboundText(text, parseMode, secrets) })
     : undefined
@@ -324,12 +333,12 @@ async function main(): Promise<void> {
   // Owner restart notices: the "back" notice goes out after the first successful poll (bot verified).
   let restartNotices: RestartNotices | undefined
   // S0 phone spike of the secret hand-over (off unless KROT_KEYSPIKE_URL is set): owner-only /keytest
-  // and the sealed web_app_data consumer. Fixed texts without user content, so bot.api is used directly.
+  // and the sealed web_app_data consumer. Fixed texts, still sent through the safe wrapper like every outbound text.
   const keyspikePage = keyspikeUrl(process.env.KROT_KEYSPIKE_URL)
   const keyspike = keyspikePage === undefined ? undefined : new KeySpike({
     url: keyspikePage, ownerId, log,
     api: {
-      sendMessage: (chatId, text, markup) => bot.api.sendMessage(chatId, text, { reply_markup: markup }),
+      sendMessage: (chatId, text, markup) => safeTelegram.sendMessage(chatId, text, { reply_keyboard: markup }),
       deleteMessage: async (chatId, messageId) => { await bot.api.deleteMessage(chatId, messageId) },
     },
   })
@@ -1029,23 +1038,45 @@ async function main(): Promise<void> {
     // allowlist (public-home.ts), never the owner's. Live half of the startup check: a fresh
     // thread of each must report the public profile and reach exactly the allowlist (fail closed).
     let publicRoles: StartedPublicRole<CodexSession>[] = []
+    const publicGcProblems = new Set<string>()
+    const legacyPublicHomes = new Set<string>()
+    const quarantinedPublicHomes = new Set<string>()
+    const publicImportFailures = new Set<string>()
+    // Damaged generation markers or missing retry ids: this start's collections removed no generation.
+    const publicGcStopped = new Set<string>()
+    // Hook proofs that passed live but could not be cached; the roles work, the proof reruns next start.
+    const publicProofCacheProblems: ProofCacheProblem[] = []
     // Thread-role denials the loopback endpoint answered; the hook proof of each role reads them.
     const hookDenials = new HookDenials()
     let publicRouter: PublicRouter | undefined
     if (publicRoot && publicPolicy && publicRuntime) {
       const policy = publicPolicy
       const runtime = publicRuntime
+      const generations = openPublicGenerations(publicHomesRoot)
+      // Under the token lock: the parent fixes the candidates, the child removes only those and
+      // stops once this bridge is gone or no longer owns bot.pid (public-gc.ts).
+      const collect = (options: Omit<GcOptions, 'lockFile'>) => {
+        const gc = runPublicGc(generations, { ...options, lockFile: paths.pid })
+        for (const path of gc.problems) {
+          if (!publicGcProblems.has(path)) log.warn('Public home cleanup skipped an unsafe or inaccessible path', { path })
+          publicGcProblems.add(path)
+        }
+        for (const path of gc.quarantined) quarantinedPublicHomes.add(path)
+        for (const path of gc.stopped) {
+          if (!publicGcStopped.has(path)) log.warn('Public home cleanup stopped: a generation marker is damaged or missing; no generation was removed', { path })
+          publicGcStopped.add(path)
+        }
+        for (const path of gc.legacy) legacyPublicHomes.add(path)
+      }
+      collect({ keep: generations.keep, retire: generations.keep })
+      const generation = createPublicGeneration(generations, message => log.warn(message))
       const started = await startPublicBackends({
         roles: PUBLIC_ROLES,
-        // The role home is checked against this root, the owner workspace, the owner Codex home and HOME before anything in it is cleaned.
-        prepare: role => preparePublicHome({
-          role, policy, home: join(paths.root, 'codex-public', role), homesRoot: join(paths.root, 'codex-public'),
-          ownerWorkspace: workspace, ownerCodexHome, userHome: process.env.HOME ?? '', runtime,
-        }),
+        prepare: role => generation.prepare({ role, policy, ownerCodexHome, runtime }),
         probeCwd: join(publicRoot, '_probe'),
         stopping: () => stopping,
-        // Outside the role's home: a rebuild clears the home, the proof stays valid while the home hash matches.
-        proofFile: role => join(paths.root, 'codex-public', role + '.hook-proof.json'),
+        // The proof stays outside the generations, one exclusive entry per role and home hash.
+        proofDirectory: publicHomesRoot,
         createSession: (role, prepared, onExit) => {
           const publicSession = new CodexSession({
             cwd: publicRoot,
@@ -1068,6 +1099,11 @@ async function main(): Promise<void> {
           return publicSession
         },
       })
+      generation.publish()
+      // A failed import source stays (it is retried next start); proofs for another home hash go.
+      for (const path of generation.importFailures()) publicImportFailures.add(path)
+      collect({ keep: generation.keep(),
+        keepProofs: started.roles.map(role => hookProofName(role.role, role.prepared.configHash)) })
       publicRoles = started.roles
       publicRouter = started.router
     }
@@ -1317,8 +1353,14 @@ async function main(): Promise<void> {
         inbox.setReplyPlan(id, plainPlans.size === 0 ? parts :
           [...parts, fallbackPlanTag + encodeURIComponent(JSON.stringify(Object.fromEntries(plainPlans))) + fallbackPlanEnd])
       }
+      // Parts planned as the masked shown text of the reply: they go as its plain fallback, never as HTML.
+      const plainParts = new Set<string>()
+      const markPlain = (part: string): void => { plainParts.add(part) }
       function planParts(id?: number): string[] {
-        if (id === undefined) return splitMessage(markdownToTelegramHtml(text))
+        if (id === undefined) {
+          const html = markdownToTelegramHtml(text)
+          return maskShownSecrets(splitMessage(html), html, plain => redactSecrets(plain, secrets), markPlain)
+        }
         const redaction = { secrets, redact: (html: string) => redactOutboundText(html, 'HTML', secrets) }
         if (saved) {
           let done = 0
@@ -1330,7 +1372,9 @@ async function main(): Promise<void> {
           savePlan(id, parts)
           return parts
         }
-        if (!inbox.replyPart(id, 'text:0')) return plannedTextParts(inbox, id, normalized)
+        if (!inbox.replyPart(id, 'text:0')) {
+          return plannedTextParts(inbox, id, normalized, plain => redactSecrets(plain, secrets), markPlain)
+        }
         // Pre-plan receipts count cuts in the original stored reply. Recover those cuts before masking
         // currently configured values, which may change the length or push a line over the old limit.
         const original = markdownToTelegramHtml(splitLongBlockLegacy(normalizeChatReply(source)))
@@ -1353,13 +1397,14 @@ async function main(): Promise<void> {
           return { parts: [], document: redactSecrets(plainTextWithLinks(error.html, Infinity), secrets) }
         }
       }
-      async function tryHtml(part: string, id?: number): Promise<{ message_id: number } | { fallback: true }> {
-        if (validateTelegramHtml(part).downgraded) return { fallback: true }
+      async function tryHtml(part: string, id?: number): Promise<SentMessage | { fallback: true }> {
+        if (validateTelegramHtml(part).downgraded || telegramTextLength(part) > TELEGRAM_MAX_MESSAGE) return { fallback: true }
         try {
           return await telegram.sendMessage(ownerChat, part, { ownerReply: true, parse_mode: 'HTML',
             ...(id === undefined ? {} : { reply_to_message_id: id }) })
         } catch (error) {
-          if (!isTelegramHtmlParseError(error)) throw error
+          // Refused HTML and an HTML part that masking grew past the limit both go through the split plain fallback.
+          if (!isTelegramHtmlParseError(error) && !(error instanceof MaskedOverflowError)) throw error
           return { fallback: true }
         }
       }
@@ -1372,7 +1417,7 @@ async function main(): Promise<void> {
               { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }), replyTo),
             value => !('message_id' in value))
           if (result.value && 'message_id' in result.value) {
-            view.shown('rich', text, result.value.message_id)
+            view.sent(result.value, 'rich', text)
             agentChat.remember(result.value.message_id, true, true, true)
             await recordQuestion(result.value.message_id)
           }
@@ -1391,7 +1436,7 @@ async function main(): Promise<void> {
           const result = await deliver(documentKey, () =>
             withoutDeletedQuote(id => sendTextDocument(telegram, ownerChat, document, id), replyTo))
           if (result.value) {
-            view.shown('document', document, result.value.message_id)
+            view.shown('document', result.value.body, result.value.message_id)
             agentChat.remember(result.value.message_id, true, true)
             await recordQuestion(result.value.message_id)
           }
@@ -1402,10 +1447,11 @@ async function main(): Promise<void> {
           const key = 'text:' + index
           const part = redactOutboundText(original, 'HTML', secrets)
           const target = index === 0 ? replyTo : undefined
-          const result = await deliver(key, () => withoutDeletedQuote(id => tryHtml(part, id), target),
+          const result = await deliver<SentMessage | { fallback: true }>(key,
+            () => plainParts.has(original) ? Promise.resolve({ fallback: true }) : withoutDeletedQuote(id => tryHtml(part, id), target),
             value => 'fallback' in value)
           if (result.value && 'message_id' in result.value) {
-            view.shown('HTML', part, result.value.message_id)
+            view.sent(result.value, 'HTML', part)
             agentChat.remember(result.value.message_id, true, true)
             if (index === 0) await recordQuestion(result.value.message_id)
           }
@@ -1416,23 +1462,30 @@ async function main(): Promise<void> {
             // A plan saved by the previous bridge may already have plain receipts. Its saved HTML
             // is the best available record of what the old plain splitter received.
             const previous = inbox.replyPart(replyId, key + ':plain:0') ? saved?.[index] : undefined
-            pieces = protectPlainFallbackCuts(splitPlainFallback(previous ?? part), secrets)
-              .map(piece => redactSecrets(piece, secrets))
+            pieces = previous !== undefined
+              ? protectPlainFallbackCuts(splitPlainFallback(previous), secrets).map(piece => redactSecrets(piece, secrets))
+              : maskedPlainFallback(part, plain => redactSecrets(plain, secrets))
             plainPlans.set(index, pieces)
             savePlan(replyId, parts)
           }
-          for (const [subIndex, piece] of protectPlainFallbackCuts(pieces, secrets).entries()) {
+          // Saved pieces were masked one by one: mask them as one text across their cuts, slot by slot.
+          const slots = maskAcrossCuts(protectPlainFallbackCuts(pieces, secrets), plain => redactSecrets(plain, secrets))
+          for (const [subIndex, piece] of slots.entries()) {
             const sent = await deliver(key + ':plain:' + subIndex, async () => {
               if (!piece) return undefined
               const plain = redactSecrets(piece, secrets)
-              return withoutDeletedQuote(id => plain.length > TELEGRAM_MAX_MESSAGE
+              return withoutDeletedQuote<SentMessage & { body?: string }>(id =>
+                plain.length > TELEGRAM_MAX_MESSAGE
                 ? sendTextDocument(telegram, ownerChat, plain, id)
                 : telegram.sendMessage(ownerChat, plain,
                   { ownerReply: true, ...(id === undefined ? {} : { reply_to_message_id: id }) }),
               subIndex === 0 ? target : undefined)
             })
             if (sent.value) {
-              view.shown('plain', redactSecrets(piece, secrets), sent.value.message_id)
+              // A piece past the message limit went as a document: record the uploaded body in that format.
+              const { body } = sent.value
+              if (body !== undefined) view.shown('document', body, sent.value.message_id)
+              else view.sent(sent.value, 'plain', redactSecrets(piece, secrets))
               agentChat.remember(sent.value.message_id, true, true)
               if (index === 0 && subIndex === 0) await recordQuestion(sent.value.message_id)
             }
@@ -1452,7 +1505,7 @@ async function main(): Promise<void> {
         retryAfter = flood.retryAfter
       }
       if (rich && 'message_id' in rich) {
-        view.shown('rich', text, rich.message_id)
+        view.sent(rich, 'rich', text)
         agentChat.remember(rich.message_id, true, true, true)
         onSent?.(rich.message_id)
         await recordQuestion(rich.message_id)
@@ -1467,15 +1520,15 @@ async function main(): Promise<void> {
         const queue = (pending: Outbox, wait: number): true => {
           const queuedText = redactSecrets(part, secrets)
           // Per-chat FIFO: only the last piece of the final part completes the exchange.
-          pending.enqueue(ownerChat, queuedText, options, wait, { origin,
+          const outboxId = pending.enqueue(ownerChat, queuedText, options, wait, { origin,
             question: first ? question : undefined, brainKey: last ? brainKey : undefined, document: format === 'document' })
           // Shown later, in this format: the send is recorded once the outbox delivered it (onDeferredDelivery).
-          view.deferred(format, queuedText)
+          view.deferred(outboxId, format, queuedText)
           queued = true
           return true
         }
         if (retryAfter !== undefined && outbox) return queue(outbox, retryAfter)
-        let sent: { message_id: number } | { fallback: true }
+        let sent: SentMessage & { body?: string } | { fallback: true }
         try {
           switch (format) {
             case 'HTML': sent = await tryHtml(part, target); break
@@ -1491,7 +1544,8 @@ async function main(): Promise<void> {
           return queue(outbox, retryAfter)
         }
         if ('fallback' in sent) return false
-        view.shown(format, part, sent.message_id)
+        if (format === 'document') view.shown('document', sent.body ?? part, sent.message_id)
+        else view.sent(sent, format, part)
         agentChat.remember(sent.message_id, true, true)
         onSent?.(sent.message_id)
         if (first) await recordQuestion(sent.message_id)
@@ -1503,9 +1557,12 @@ async function main(): Promise<void> {
         for (const [index, part] of parts.entries()) {
           const first = index === 0
           const last = index === parts.length - 1
-          if (validateTelegramHtml(part).downgraded || !await sendOrDefer(part, 'HTML', first, last)) {
+          if (plainParts.has(part) || validateTelegramHtml(part).downgraded || telegramTextLength(part) > TELEGRAM_MAX_MESSAGE ||
+              !await sendOrDefer(part, 'HTML', first, last)) {
             view.brokenHtml()
-            const pieces = splitPlainFallback(part)
+            // Dropping the tags can join a token with its prefix (`Bearer <b>…</b>`), and a cut can split it: the
+            // whole plain text is masked before it is cut into messages.
+            const pieces = maskedPlainFallback(part, plain => redactSecrets(plain, secrets))
             for (const [subIndex, plain] of pieces.entries()) {
               await sendOrDefer(plain, 'plain', first && subIndex === 0, last && subIndex === pieces.length - 1)
             }
@@ -1544,7 +1601,7 @@ async function main(): Promise<void> {
         if (sendsAsRich(text, ownerChat, config.richMessages)) {
           const result = await telegram.sendRichMessage(ownerChat, text, quote)
           if ('message_id' in result) {
-            view.shown('rich', text, result.message_id)
+            view.sent(result, 'rich', text)
             view.finish()
             return { messageId: result.message_id, rich: true as const }
           }
@@ -1557,31 +1614,23 @@ async function main(): Promise<void> {
           if (!(error instanceof PreformattedDocumentError)) throw error
           const document = plainTextWithLinks(error.html, Infinity)
           const result = await sendTextDocument(telegram, ownerChat, document, id)
-          view.shown('document', document, result.message_id)
+          view.shown('document', result.body, result.message_id)
           view.finish()
           return { messageId: result.message_id }
         }
-        const sent = singlePart
+        type InterimSend = { result: SentMessage; format: 'HTML' | 'plain' }
+        const sent: InterimSend = singlePart
           ? await telegram.sendMessage(ownerChat, html, { ...quote, parse_mode: 'HTML' })
-            .then(result => ({ ...result, format: 'HTML' as const }), error => {
-              if (!isTelegramHtmlParseError(error)) throw error
+            .then<InterimSend, InterimSend>(result => ({ result, format: 'HTML' }), error => {
+              if (!isTelegramHtmlParseError(error) && !(error instanceof MaskedOverflowError)) throw error
               view.brokenHtml()
-              return telegram.sendMessage(ownerChat, text, quote).then(result => ({ ...result, format: 'plain' as const }))
+              return telegram.sendMessage(ownerChat, text, quote).then<InterimSend>(result => ({ result, format: 'plain' }))
             })
-          : { ...await telegram.sendMessage(ownerChat, text, quote), format: 'plain' as const }
-        const messageId = sent.message_id
-        if (sent.format === 'HTML') {
-          // The safe wrapper redacts the HTML and sends a part its validator refuses as plain text without
-          // parse_mode: record that effective payload and format, the way the wrapper computes them.
-          const checked = validateTelegramHtml(redactOutboundText(html, 'HTML', secrets))
-          if (checked.downgraded) view.brokenHtml()
-          view.shown(checked.downgraded ? 'plain' : 'HTML', checked.downgraded ? redactSecrets(checked.text, secrets) : checked.text,
-            messageId)
-        } else {
-          view.shown('plain', text, messageId)
-        }
+          : { result: await telegram.sendMessage(ownerChat, text, quote), format: 'plain' }
+        // The safe wrapper may have masked more or sent a refused HTML part as plain text: record what it sent.
+        view.sent(sent.result, sent.format, sent.format === 'HTML' ? redactOutboundText(html, 'HTML', secrets) : text)
         view.finish()
-        return { messageId }
+        return { messageId: sent.result.message_id }
       }, target),
       autonomy: async (action, id, resolution) => {
         const messageId = action === 'resolve_question'
@@ -1593,13 +1642,14 @@ async function main(): Promise<void> {
         }
         return done
       },
+      // Through the safe wrapper like every outbound text; the preview of the message shows what the edit sent.
       editRich: async (id, text) => {
-        await bot.api.raw.editMessageText({
-          chat_id: ownerChat, message_id: id, rich_message: { markdown: redactSecrets(text, secrets) },
-        })
+        if (telegram.editRichMessage === undefined) throw new Error('editRichMessage is not available on this transport')
+        const { sent } = await telegram.editRichMessage(ownerChat, id, redactSecrets(text, secrets))
+        renderEyes.edited(id, sent ?? { format: 'rich', text: redactSecrets(text, secrets) })
       },
     })
-    onDeferredDelivery = (item, id) => {
+    onDeferredDelivery = (item, id, sent) => {
       if (item.chatId !== ownerChat) return
       // The outbox sent the last part of a reply, so the exchange is delivered and can report its receipt.
       if (item.brainKey) {
@@ -1610,7 +1660,11 @@ async function main(): Promise<void> {
       work.repost(id)
       agentChat.remember(id, true, true)
       // R42: a deferred part is shown now, under this message ID; its send is recorded once all its parts are.
-      renderEyes.delivered(item.text, id)
+      // A part is sent with the redactions current at the flush: record the uploaded body or the text the
+      // transport sent, never the queued copy.
+      renderEyes.delivered(item.id, id, item.document
+        ? sent.body === undefined ? undefined : { format: 'document', text: sent.body }
+        : sent.sent === undefined ? undefined : shownSent(sent.sent))
       // An item saved without an origin is a guest's: its question never becomes the owner's.
       if (questionConfig.enabled && item.question) {
         void ownerEffects.questionSeen(parseTurnOrigin(item.origin, id), id, item.question)
@@ -2047,8 +2101,25 @@ async function main(): Promise<void> {
             probeCwd: join(publicRoot, '_probe'), canaryDir: join(publicRoot, '_canary'), canaryTimeoutMs: 120_000,
           })
           report.passes = [...report.passes ?? [],
-            ...publicRolesSummary(publicRoles.map(role => role.prepared)).map(line => 'ℹ️ ' + line), ...roles.passes]
-          report.problems.push(...roles.problems)
+            ...publicRolesSummary(publicRoles.map(role => role.prepared)).map(line => 'ℹ️ ' + line), ...roles.passes,
+            ...[...legacyPublicHomes].map(path => 'ℹ️ Устаревшую папку роли можно удалить вручную: ' + path)]
+          report.problems.push(...roles.problems,
+            ...[...publicImportFailures].map(path => ({
+              text: 'История гостевых чатов не прочиталась при переносе из ' + path + '. Папка сохранена, перенос повторится при следующем запуске.',
+              fix: 'Проверьте права на файлы в этой папке (владелец — пользователь моста, чтение разрешено) и перезапустите мост.',
+            })),
+            ...(quarantinedPublicHomes.size > 0
+              ? [{ text: 'Папок Codex на карантине (не удалены из-за ссылок или чужих файлов): ' + quarantinedPublicHomes.size }]
+              : []),
+            ...[...publicGcProblems].map(path => ({ text: 'Пропущена очистка папки Codex: ' + path })),
+            ...[...publicGcStopped].map(path => ({
+              text: 'Очистка папок Codex остановлена, ни одна папка не удалена: отметка поколения повреждена или не найдена — ' + path,
+              fix: 'Проверьте файл complete.json в этой папке; пока он повреждён, старые папки не удаляются.',
+            })),
+            ...publicProofCacheProblems.map(problem => ({
+              text: proofCacheLine(problem),
+              fix: 'Проверьте, что папка доступна мосту на запись и на диске есть место.',
+            })))
         }
         return report
       },
@@ -3539,8 +3610,12 @@ async function main(): Promise<void> {
     // failure its messages get «временно недоступно». Runs in the background: one model turn per role.
     if (publicRoot && publicRoles.length) {
       void provePublicHooks(publicRoles, { denials: hookDenials, probeCwd: join(publicRoot, '_probe'), timeoutMs: 120_000 })
-        .then(problems => {
-          for (const problem of problems) log.error('Public role disabled until a restart: ' + problem)
+        .then(result => {
+          for (const problem of result.problems) log.error('Public role disabled until a restart: ' + problem)
+          for (const problem of result.cacheProblems) {
+            log.warn('The public hook proof passed but could not be saved; it runs again at the next start', { path: problem.path })
+            publicProofCacheProblems.push(problem)
+          }
         })
         .catch(() => log.error('The public hook proof failed; public roles stay disabled'))
     }

@@ -8,12 +8,16 @@ import { z, ZodError } from 'zod'
 
 import { PollerFatalError } from '../telegram/poller.js'
 import { PublicHomeError } from './public-home.js'
+import { PublishUnsupportedError } from './public-publish.js'
 import { bridgeUnitName } from './unit-contract.js'
 
 export const EXIT = { stop: 0, crash: 1, restart: 75, fatalConfig: 78 } as const
 
 // The owner message and fatal.json line for a public-home error: its text names files and config keys, so only the log has it.
 export const PUBLIC_HOME_FATAL = 'Multi-user mode cannot start: the public allowlist or the owner Codex config is not usable; see the bridge log'
+
+// The owner message and fatal.json line when the state folder cannot hold hard links (public-publish.ts); the log names the folder.
+export const PUBLISH_UNSUPPORTED_FATAL = 'Multi-user mode cannot start: the file system of the bridge state folder does not support hard links; move the state folder to a regular disk or turn KROT_MULTIUSER off'
 
 // Startup errors a restart cannot fix: the owner has to change the setup.
 const fatalConfig = /^(Run the Codex pilot|The pilot requires|Set absolute|The Codex workspace|Telegram state must|This private pilot|A Codex proxy requires|Configured Telegram token|KROT_CODEX_SANDBOX=danger-full-access cannot|telegram bot_id mismatch|KROT_FORMAT_REMINDER must be|Multi-user mode cannot start:|KROT_MULTIUSER must be|KROT_START_ID_REPLY must be|KROT_MEMBER_USER_IDS must be|TELEGRAM_ALLOWED_USER_IDS holds only the owner)/
@@ -35,6 +39,8 @@ export function exitCodeFor(error: unknown): number {
   if (error instanceof ZodError) return EXIT.fatalConfig
   // KROT_MULTIUSER=1: the public allowlist or the owner Codex config the public homes are built from.
   if (error instanceof PublicHomeError) return EXIT.fatalConfig
+  // A file system without hard links does not change by restarting.
+  if (error instanceof PublishUnsupportedError) return EXIT.fatalConfig
   if (!(error instanceof Error)) return EXIT.crash
   if (fatalConfig.test(error.message)) return EXIT.fatalConfig
   if (ownedElsewhere.test(error.message)) return EXIT.restart
@@ -54,6 +60,7 @@ export function fatalReason(error: unknown): string {
     return 'Telegram rejected the bot token (401 Unauthorized)'
   }
   if (error instanceof PublicHomeError) return PUBLIC_HOME_FATAL
+  if (error instanceof PublishUnsupportedError) return PUBLISH_UNSUPPORTED_FATAL
   if (isKnownStartupError(error)) return error.message
   return 'Krot Codex pilot could not start'
 }

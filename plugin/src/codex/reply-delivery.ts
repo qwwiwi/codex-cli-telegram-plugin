@@ -1,5 +1,5 @@
 import { carriesExpandableBlockquote } from '../channel/tools.js'
-import { splitMessage, splitMessageFrom } from '../format/chunk.js'
+import { maskShownSecrets, splitMessage, splitMessageFrom } from '../format/chunk.js'
 import { splitMessageLegacy } from '../format/chunk-legacy.js'
 import { markdownToTelegramHtml } from '../format/html.js'
 import { splitLongBlock, splitLongBlockLegacy } from '../format/paragraphs.js'
@@ -69,13 +69,13 @@ export interface ReplyReceipts {
  * redaction of the rendered parts would no longer find a value that holds one of them.
  */
 export function plannedTextParts(receipts: ReplyReceipts, id: number, text: string,
-  redact: (text: string) => string = text => text): string[] {
+  redact: (text: string) => string = text => text, onMasked?: (part: string) => void): string[] {
   const saved = receipts.replyPlan(id)
   if (saved) return [...saved]
   const legacy = receipts.replyPart(id, 'text:0') !== undefined
   const source = redact(text)
   const html = markdownToTelegramHtml(legacy ? splitLongBlockLegacy(source) : splitLongBlock(source))
-  const parts = legacy ? legacyResumeParts(receipts, id, html) : splitMessage(html)
+  const parts = legacy ? legacyResumeParts(receipts, id, html) : maskShownSecrets(splitMessage(html), html, redact, onMasked)
   receipts.setReplyPlan(id, parts)
   return parts
 }

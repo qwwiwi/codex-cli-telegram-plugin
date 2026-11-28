@@ -8,18 +8,28 @@
 // never the reply's text. The offending markup itself (at most 24 characters, masked like the journal) stays in
 // memory for the pending note only, and the sent parts stay in memory for render_preview.
 
-import { readFileSync } from 'node:fs'
-import { basename, dirname } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import {
+  closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync,
+  type Stats,
+} from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { z } from 'zod'
 
-import { atomicWriteInRoot } from '../autonomy/store.js'
+import type { SentMessage, SentText } from '../channel/tools.js'
 import { htmlToPlainText } from '../format/chunk.js'
 import { markdownToTelegramHtml } from '../format/html.js'
 import type { Logger } from '../log.js'
 import { errorDetail, maskDiagnostic } from './error-log.js'
+import { object } from './rpc.js'
 
 /** How a part reached the owner: Telegram HTML, plain text, a .txt document or a Rich Message (Markdown). */
 export type ShownFormat = 'HTML' | 'plain' | 'document' | 'rich'
+
+/** The recorded form of what the safe wrapper reports it sent (MarkdownV2 is never an owner reply format). */
+export function shownSent(sent: SentText): { format: ShownFormat; text: string } {
+  return { format: sent.format === 'HTML' || sent.format === 'rich' ? sent.format : 'plain', text: sent.text }
+}
 
 /** One message the owner got: its format, its text as sent and its Telegram message ID once known. */
 export interface ShownPart {
@@ -190,6 +200,52 @@ export function renderNote(degradations: readonly Omit<RenderDegradation, 'code'
     '. Учти это в оформлении.'
 }
 
+/** A file's identity: a rename over it or a rewrite of it changes at least one of these. */
+export interface FileIdentity {
+  dev: number
+  ino: number
+  size: number
+  mtimeMs: number
+}
+
+/** The render history's file operations: a test seam (like the poller's lock hooks); the defaults use node:fs. */
+export interface RenderHistoryFiles {
+  /** The body and the identity of the file it came from, taken before reading. Throws ENOENT when there is none. */
+  read(file: string): { body: string; identity: FileIdentity }
+  /** The identity of the file now at `file`, undefined when there is none. */
+  identity(file: string): FileIdentity | undefined
+  rename(from: string, to: string): void
+}
+
+const identityOf = (stats: Stats): FileIdentity =>
+  ({ dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs })
+const sameFile = (now: FileIdentity | undefined, judged: FileIdentity): boolean => now !== undefined &&
+  now.dev === judged.dev && now.ino === judged.ino && now.size === judged.size && now.mtimeMs === judged.mtimeMs
+// Loading rereads a history that changed under it at most this often, then leaves the file alone.
+const settleAttempts = 3
+
+export const renderHistoryFiles: RenderHistoryFiles = {
+  read(file) {
+    const fd = openSync(file, 'r')
+    try {
+      // Taken before the read: a change during or after it makes the identity stale, so the file is judged again.
+      const identity = identityOf(fstatSync(fd))
+      return { body: readFileSync(fd, 'utf8'), identity }
+    } finally {
+      closeSync(fd)
+    }
+  },
+  identity(file) {
+    try {
+      return identityOf(lstatSync(file))
+    } catch (error) {
+      if (object(error).code === 'ENOENT') return undefined
+      throw error
+    }
+  },
+  rename: (from, to) => renameSync(from, to),
+}
+
 export interface RenderEyesOptions {
   /** <state>/render-diffs.json: the last 20 diffs, read back after a restart. */
   file?: string
@@ -197,6 +253,7 @@ export interface RenderEyesOptions {
   log?: Logger
   secrets?: readonly string[]
   now?: () => number
+  files?: RenderHistoryFiles
 }
 
 /** A send with parts the outbox still holds: recorded once the outbox delivered every one of them. */
@@ -204,8 +261,8 @@ export interface WaitingSend {
   source: string
   parts: ShownPart[]
   brokenHtml: number
-  /** Indexes of the parts still queued, in delivery (FIFO) order. */
-  queued: number[]
+  /** The UUID of each part still queued and its index in the send. */
+  queued: Map<string, number>
 }
 
 // Sends parked for the outbox; an older one past this (its parts dropped by the outbox) is forgotten.
@@ -214,7 +271,7 @@ const keptWaiting = 20
 /** Collects the parts of one send; `finish` records them. Never throws. */
 export class RenderView {
   private readonly parts: ShownPart[] = []
-  private readonly queued: number[] = []
+  private readonly queued = new Map<string, number>()
   private broken = 0
 
   constructor(private readonly eyes: RenderEyes, private readonly source: string) {}
@@ -223,9 +280,19 @@ export class RenderView {
     this.parts.push(messageId === undefined ? { format, text } : { format, text, messageId })
   }
 
-  /** A part the outbox queued (flood wait) with exactly this text: its message ID comes with RenderEyes.delivered. */
-  deferred(format: ShownFormat, text: string): void {
-    this.queued.push(this.parts.length)
+  /**
+   * A message the transport sent, recorded with the payload and format the safe wrapper reports; `format` and
+   * `text` (already masked) only when a raw transport reports none. An HTML part sent as plain text counts as refused.
+   */
+  sent(result: SentMessage, format: ShownFormat, text: string): void {
+    const shown = result.sent === undefined ? { format, text } : shownSent(result.sent)
+    if (format === 'HTML' && shown.format !== 'HTML') this.brokenHtml()
+    this.shown(shown.format, shown.text, result.message_id)
+  }
+
+  /** A part the outbox queued (flood wait): its message ID comes with RenderEyes.delivered. */
+  deferred(outboxId: string, format: ShownFormat, text: string): void {
+    this.queued.set(outboxId, this.parts.length)
     this.parts.push({ format, text })
   }
 
@@ -238,8 +305,8 @@ export class RenderView {
   finish(): RenderDiff | undefined {
     if (this.parts.length === 0 && this.broken === 0) return undefined
     const send = { source: this.source, parts: [...this.parts], brokenHtml: this.broken }
-    if (this.queued.length === 0) return this.eyes.record(send)
-    this.eyes.wait({ ...send, queued: [...this.queued] })
+    if (this.queued.size === 0) return this.eyes.record(send)
+    this.eyes.wait({ ...send, queued: new Map(this.queued) })
     return undefined
   }
 }
@@ -252,20 +319,107 @@ export class RenderEyes {
   private readonly waiting: WaitingSend[] = []
   private readonly secrets: readonly string[]
   private readonly now: () => number
+  private readonly files: RenderHistoryFiles
+  // A corrupt history file is still in place (moving it aside failed) or could not be read: no save may replace it.
+  private blocked = false
 
+  // The bridge process is the history's single owner. Every file operation below is synchronous, so the load, the
+  // migration, the quarantine and the saves of this process never interleave; a change by anyone else between a read
+  // and a rename is caught by the identity check right before that rename.
   constructor(private readonly options: RenderEyesOptions) {
     this.secrets = options.secrets ?? []
     this.now = options.now ?? Date.now
+    this.files = options.files ?? renderHistoryFiles
     if (!options.file) return
-    try {
-      const parsed = FileSchema.safeParse(JSON.parse(readFileSync(options.file, 'utf8')))
-      if (parsed.success) {
-        this.diffs = parsed.data.diffs.flatMap(entry => {
-          const diff = DiffSchema.safeParse(entry)
-          return diff.success ? [diff.data] : []
-        }).slice(-keptDiffs)
+    const diffs = this.settle(options.file)
+    this.blocked = diffs === undefined
+    this.diffs = diffs ?? []
+  }
+
+  /**
+   * Judges the history on disk and makes it safe to write: a corrupt file is moved aside, a legacy one rewritten
+   * without excerpts. A file that changed since it was read is judged again, never moved or rewritten on the old
+   * judgement. Returns the kept diffs, or undefined while a corrupt or unreadable file stays in place.
+   */
+  private settle(file: string): RenderDiff[] | undefined {
+    for (let attempt = 0; attempt < settleAttempts; attempt++) {
+      let read: { body: string; identity: FileIdentity }
+      try {
+        read = this.files.read(file)
+      } catch (error) {
+        if (object(error).code === 'ENOENT') return []
+        // A history that exists but cannot be read (EACCES…) is never overwritten: saves wait until it can be.
+        this.warnFailure('Could not read the render history', error)
+        return undefined
       }
-    } catch { /* No diffs yet or an unreadable file: start empty. */ }
+      let raw: unknown
+      try {
+        raw = JSON.parse(read.body)
+      } catch { /* The parser's error can quote history contents. */ }
+      const parsed = FileSchema.safeParse(raw)
+      if (!parsed.success) {
+        const moved = this.moveAside(file, read.identity)
+        if (moved === 'changed') continue
+        return moved === 'moved' ? [] : undefined
+      }
+      const diffs = parsed.data.diffs.flatMap(entry => {
+        const diff = DiffSchema.safeParse(entry)
+        return diff.success ? [diff.data] : []
+      }).slice(-keptDiffs)
+      if (diffs.length === parsed.data.diffs.length) return diffs
+      try {
+        if (!this.write(file, JSON.stringify({ diffs }) + '\n', read.identity)) continue
+      } catch (error) {
+        // The in-memory diffs still serve /doctor; the next save rewrites the file.
+        this.warnFailure('Could not save the render history', error)
+      }
+      return diffs
+    }
+    this.warnFailure('Render history kept changing while it was loaded')
+    return undefined
+  }
+
+  // Moves the corrupt file judged from the read with `identity` aside, unless the file changed since.
+  private moveAside(file: string, identity: FileIdentity): 'moved' | 'changed' | 'failed' {
+    try {
+      if (!sameFile(this.files.identity(file), identity)) return 'changed'
+      this.files.rename(file, file + '.corrupt-' + randomUUID())
+    } catch (error) {
+      this.warnFailure('Could not move aside corrupt render history', error)
+      return 'failed'
+    }
+    this.warnFailure('Moved aside corrupt render history')
+    return 'moved'
+  }
+
+  // Writes the history atomically (temp file, fsync, rename). With `expected`, the rename happens only while the
+  // file still has that identity; false: it changed and nothing was written.
+  private write(file: string, body: string, expected?: FileIdentity): boolean {
+    const dir = dirname(file)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const temp = join(dir, `.${basename(file)}.tmp-${randomUUID()}`)
+    let renamed = false
+    try {
+      const fd = openSync(temp, 'wx', 0o600)
+      try {
+        writeSync(fd, body)
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      if (expected && !sameFile(this.files.identity(file), expected)) return false
+      this.files.rename(temp, file)
+      renamed = true
+    } finally {
+      if (!renamed) {
+        try { unlinkSync(temp) } catch { /* The temp file may never have been created. */ }
+      }
+    }
+    try {
+      const dirFd = openSync(dir, 'r')
+      try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
+    } catch { /* Best effort: the rename itself is done. */ }
+    return true
   }
 
   /** Starts recording one send of `source` (the model's text with secrets masked). */
@@ -323,9 +477,10 @@ export class RenderEyes {
     })
   }
 
-  private warnFailure(message: string, error: unknown): void {
+  private warnFailure(message: string, error?: unknown): void {
     try {
-      this.options.log?.warn(message, { area: 'render', error: errorDetail(error, this.secrets) })
+      this.options.log?.warn(message, { area: 'render',
+        ...(error === undefined ? {} : { error: errorDetail(error, this.secrets) }) })
     } catch { /* A broken logger never breaks a send. */ }
   }
 
@@ -336,22 +491,21 @@ export class RenderEyes {
   }
 
   /**
-   * The outbox delivered an owner part with this text as `messageId`. The part goes to the oldest parked send whose
-   * next queued part it is (the outbox keeps per-chat FIFO); a send whose queued parts all arrived is recorded.
+   * The outbox delivered a part identified by its UUID; `sent` is what it actually delivered when that differs from
+   * the queued part (a document uploaded with the redactions current at the flush). Record the parked send after all
+   * its queued parts arrive.
    * A part of no parked send (one queued by an earlier bridge run) is ignored. Never throws.
    */
-  delivered(text: string, messageId: number): RenderDiff | undefined {
+  delivered(outboxId: string, messageId: number, sent?: { format: ShownFormat; text: string }): RenderDiff | undefined {
     try {
-      const at = this.waiting.findIndex(({ parts, queued }) => {
-        const next = queued[0]
-        return next !== undefined && parts[next]?.text === text
-      })
+      const at = this.waiting.findIndex(({ queued }) => queued.has(outboxId))
       const waiting = this.waiting[at]
-      const index = waiting?.queued.shift()
+      const index = waiting?.queued.get(outboxId)
       if (!waiting || index === undefined) return undefined
+      waiting.queued.delete(outboxId)
       const part = waiting.parts[index]
-      if (part) waiting.parts[index] = { ...part, messageId }
-      if (waiting.queued.length > 0) return undefined
+      if (part) waiting.parts[index] = { ...part, ...sent, messageId }
+      if (waiting.queued.size > 0) return undefined
       this.waiting.splice(at, 1)
       return this.record({ source: waiting.source, parts: waiting.parts, brokenHtml: waiting.brokenHtml })
     } catch {
@@ -371,6 +525,11 @@ export class RenderEyes {
     return this.diffs.slice(-limit).reverse()
   }
 
+  /** An edit of a message this bridge run sent: its preview shows the payload the edit sent from now on. */
+  edited(messageId: number, sent: SentText): void {
+    if (this.messages.has(messageId)) this.messages.set(messageId, { ...shownSent(sent), messageId })
+  }
+
   /** A part this bridge run sent to the owner, by its Telegram message ID. */
   shown(messageId: number): ShownPart | undefined {
     return this.messages.get(messageId)
@@ -384,8 +543,15 @@ export class RenderEyes {
   private save(): void {
     const file = this.options.file
     if (!file) return
+    if (this.blocked) {
+      // Retry the quarantine first: a save must never replace a corrupt file that has no backup.
+      const onDisk = this.settle(file)
+      if (onDisk === undefined) return
+      this.blocked = false
+      this.diffs = [...onDisk, ...this.diffs].slice(-keptDiffs)
+    }
     try {
-      atomicWriteInRoot({ root: dirname(file) }, basename(file), JSON.stringify({ diffs: this.diffs }) + '\n')
+      this.write(file, JSON.stringify({ diffs: this.diffs }) + '\n')
     } catch (error) {
       // The in-memory diffs still serve /doctor.
       this.warnFailure('Could not save the render history', error)

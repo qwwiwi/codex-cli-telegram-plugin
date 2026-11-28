@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -382,95 +382,251 @@ test('[S9] a check never deletes an applying record it did not create, so the bo
   expect(readFileSync(join(repo, '.git', 'krotov-update-pending'), 'utf8')).toBe(record)
 })
 
-test('[S9] the update lock file in the state directory keeps out a second process; a stale one is taken over', async () => {
-  const { author, repo } = repos()
-  commit(author, 'b.txt', '2\n', 'Second version')
-  git(author, 'push', '-q', 'origin', 'main')
-  const state = mkdtempSync(join(tmpdir(), 'krot-state-'))
-  temporary.push(state)
-  writeFileSync(join(state, 'boot-guard.sh'), `# krotov-boot-guard-version: ${GUARD_VERSION}\n`)
-  const lock = join(state, 'self-update.lock')
-  const tenMinutesAgo = new Date(Date.now() - 600_000)
-  // A live process (the test runner's parent) holds the lock, however old the lock is.
-  const live = JSON.stringify({ pid: process.ppid, startedAt: tenMinutesAgo.getTime(), token: 'live' }) + '\n'
-  writeFileSync(lock, live)
-  utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
-  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'refused', reason: 'busy' })
-  expect(readFileSync(lock, 'utf8')).toBe(live)
-  // A fresh lock of a process that no longer exists is still held: it is never taken over before the grace period.
-  writeFileSync(lock, JSON.stringify({ pid: 2147483646, startedAt: Date.now(), token: 'dead' }) + '\n')
-  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'refused', reason: 'busy' })
-  // Once it is older than that, a dead holder's lock does not block forever and is gone afterwards.
-  utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
-  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'plan' })
-  expect(existsSync(lock)).toBe(false)
-})
+const updateLockName = 'krotov-update.lock'
 
-test('[S9] a lock file another updater created but has not written yet is held, never taken over', async () => {
-  const { author, repo } = repos()
-  commit(author, 'b.txt', '2\n', 'Second version')
-  git(author, 'push', '-q', 'origin', 'main')
-  const state = mkdtempSync(join(tmpdir(), 'krot-state-'))
-  temporary.push(state)
-  writeFileSync(join(state, 'boot-guard.sh'), `# krotov-boot-guard-version: ${GUARD_VERSION}\n`)
-  const lock = join(state, 'self-update.lock')
-  // Contender A is paused between creating the lock file and writing its holder into it.
-  writeFileSync(lock, '')
-  // Contender B must refuse instead of reading the empty file as a dead holder.
-  expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'refused', reason: 'busy' })
-  expect(readFileSync(lock, 'utf8')).toBe('')
-})
+async function waitForFiles(paths: string[]): Promise<void> {
+  const deadline = Date.now() + 5000
+  while (!paths.every(path => existsSync(path))) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for ' + paths.join(', '))
+    await Bun.sleep(5)
+  }
+}
 
-test('[S9] a failed merge of one updater never deletes the recovery record another updater wrote', async () => {
-  const { author, repo, base } = repos()
+function lockFixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'krot-update-lock-'))
+  temporary.push(dir)
+  const lock = join(dir, updateLockName)
+  const module = join(import.meta.dir, '../../src/codex/self-update.ts')
+  const liveChild = `
+    import { existsSync, writeFileSync } from 'node:fs'
+    import { join } from 'node:path'
+    const [, dir] = process.argv
+    writeFileSync(join(dir, 'child-ready'), '')
+    const deadline = Date.now() + 5000
+    while (!existsSync(join(dir, 'finish-child')) && Date.now() < deadline) await Bun.sleep(5)
+    writeFileSync(join(dir, 'child-finished'), '')
+  `
+  const worker = (mode: 'race' | 'holder' | 'holder-with-child', id = '') => Bun.spawn([
+    process.execPath, '--no-env-file', '-e', `
+      import { spawnSync } from 'node:child_process'
+      import { existsSync, mkdirSync, rmdirSync, writeFileSync } from 'node:fs'
+      import { join } from 'node:path'
+      import { runCommand, SelfUpdate } from ${JSON.stringify(module)}
+      const [, dir, lock, mode, id] = process.argv
+      const signal = name => writeFileSync(join(dir, name), '')
+      const wait = async name => {
+        const deadline = Date.now() + 5000
+        while (!existsSync(join(dir, name))) {
+          if (Date.now() >= deadline) throw new Error('Timed out waiting for ' + name)
+          await Bun.sleep(5)
+        }
+      }
+      const run = async (_command, [step]) => {
+        if (step === 'rev-parse') return { code: 0, stdout: dir, stderr: '' }
+        if (step !== 'status') throw new Error('Unexpected git command: ' + step)
+        if (mode === 'race') {
+          const critical = join(dir, 'crit')
+          mkdirSync(critical)
+          try {
+            await Bun.sleep(50)
+            // Independently verify that the winner holds the permanent inode.
+            if (spawnSync('flock', ['-n', lock, 'true']).status !== 1) {
+              throw new Error('Winner did not hold the kernel lock')
+            }
+          } finally {
+            rmdirSync(critical)
+          }
+        } else {
+          if (mode === 'holder-with-child') {
+            void runCommand(process.execPath, ['--no-env-file', '-e', ${JSON.stringify(liveChild)}, dir], { cwd: dir })
+            await wait('child-ready')
+          }
+          signal('held')
+          await wait('crash')
+          process.kill(process.pid, 'SIGKILL')
+        }
+        return { code: 0, stdout: ' M fixture', stderr: '' }
+      }
+      if (mode === 'race') {
+        signal('ready-' + id)
+        await wait('start')
+      }
+      const result = await new SelfUpdate({ repo: dir, run, bun: 'unused', guardInstalled: async () => true }).check()
+      console.log(result.reason)
+    `, dir, lock, mode, id,
+  ], { stdout: 'pipe', stderr: 'pipe' })
+  const check = () => updater(dir, async (_command, [step]) => ({
+    code: 0, stdout: step === 'rev-parse' ? dir : ' M fixture', stderr: '',
+  })).check()
+  return { dir, lock, worker, check }
+}
+
+test('[A1] eight processes contend on the same old lock inode without overlapping', async () => {
+  const { dir, lock, worker } = lockFixture()
+  const old = new Date(Date.now() - 600_000)
+  // Seed the old implementation's filename too, so the same run exercises its stale takeover path.
+  for (const file of [lock, join(dir, 'self-update.lock')]) {
+    writeFileSync(file, 'junk', { mode: 0o600 })
+    utimesSync(file, old, old)
+  }
+  const original = statSync(lock)
+  const ids = Array.from({ length: 8 }, (_, i) => String(i))
+  const results = Promise.all(ids.map(async id => {
+    const child = worker('race', id)
+    return {
+      code: await child.exited,
+      stdout: (await new Response(child.stdout).text()).trim(),
+      stderr: await new Response(child.stderr).text(),
+    }
+  }))
+  try {
+    await waitForFiles(ids.map(id => join(dir, 'ready-' + id)))
+  } finally {
+    writeFileSync(join(dir, 'start'), '')
+    await results
+  }
+  const settled = await results
+  for (const { code, stderr } of settled) expect(code, stderr).toBe(0)
+  expect(settled.some(result => result.stdout === 'dirty')).toBe(true)
+  expect(settled.some(result => result.stdout === 'busy')).toBe(true)
+  expect(statSync(lock).ino).toBe(original.ino)
+  expect(readFileSync(lock, 'utf8')).toBe('junk')
+}, 15_000)
+
+test('[A2] a four-hour-old live lock stays held and is immediately free after SIGKILL', async () => {
+  const { dir, lock, worker, check } = lockFixture()
+  const holder = worker('holder')
+  let contention
+  try {
+    await waitForFiles([join(dir, 'held')])
+    const old = new Date(Date.now() - 4 * 3_600_000)
+    for (const file of [lock, join(dir, 'self-update.lock')]) {
+      if (existsSync(file)) utimesSync(file, old, old)
+    }
+    contention = await check()
+  } finally {
+    writeFileSync(join(dir, 'crash'), '')
+    await holder.exited
+  }
+  expect(contention).toMatchObject({ kind: 'refused', reason: 'busy' })
+  expect(holder.signalCode).toBe('SIGKILL')
+  expect(await check()).toMatchObject({ kind: 'refused', reason: 'dirty' })
+  expect(statSync(lock).mode & 0o777).toBe(0o600)
+}, 15_000)
+
+test('[A6] a live subprocess does not keep the lock after its holder is killed', async () => {
+  const { dir, worker, check } = lockFixture()
+  const holder = worker('holder-with-child')
+  const childReady = join(dir, 'child-ready')
+  const childFinished = join(dir, 'child-finished')
+  const crash = join(dir, 'crash')
+  try {
+    await waitForFiles([join(dir, 'held'), childReady])
+    expect(await check()).toMatchObject({ kind: 'refused', reason: 'busy' })
+    writeFileSync(crash, '')
+    await holder.exited
+    expect(holder.signalCode).toBe('SIGKILL')
+    expect(await check()).toMatchObject({ kind: 'refused', reason: 'dirty' })
+    expect(existsSync(childFinished)).toBe(false)
+  } finally {
+    writeFileSync(crash, '')
+    writeFileSync(join(dir, 'finish-child'), '')
+    await holder.exited
+    if (existsSync(childReady)) await waitForFiles([childFinished])
+  }
+}, 15_000)
+
+test('[A3] updaters with different state directories share the checkout lock and applying record', async () => {
+  const { root, author, repo, base } = repos()
   const target = commit(author, 'b.txt', '2\n', 'Second version')
   git(author, 'push', '-q', 'origin', 'main')
   const plan = await updater(repo, runner().run).check()
   if (plan.kind !== 'plan') throw new Error('no plan')
+  const next = commit(author, 'c.txt', '3\n', 'Third version')
+  git(repo, 'fetch', '-q', author, 'main')
+  const nextPlan = { ...plan, from: target, to: next, commits: [next.slice(0, 7) + ' Third version'] }
   const pending = join(repo, '.git', 'krotov-update-pending')
-  const pause = () => {
-    let release: () => void = () => undefined
-    const gate = new Promise<void>(resolve => { release = resolve })
-    return { gate, release: () => release() }
-  }
-  // Two contenders that both got past the lock (separate state directories stand in for the lost race).
-  const atMerge = pause()
-  let bPaused = false
-  const contenderB: Runner = async (command, args, options) => {
-    if (command === 'git' && args[0] === 'merge') {
-      bPaused = true
-      await atMerge.gate
-      return { code: 1, stdout: '', stderr: 'fatal: Not possible to fast-forward, aborting.' }
-    }
-    return runner().run(command, args, options)
-  }
-  const atInstall = pause()
-  let aPaused = false
+  const atInstall = Promise.withResolvers<void>()
+  const finishInstall = Promise.withResolvers<void>()
+  const a = runner()
   const contenderA: Runner = async (command, args, options) => {
-    if (command === 'bun-bin' && args[0] === 'install' && !aPaused) {
-      aPaused = true
-      await atInstall.gate
+    if (command === 'bun-bin' && args[0] === 'install') {
+      atInstall.resolve()
+      await finishInstall.promise
     }
-    return runner().run(command, args, options)
+    return a.run(command, args, options)
   }
-  const stateB = mkdtempSync(join(tmpdir(), 'krot-state-'))
-  const stateA = mkdtempSync(join(tmpdir(), 'krot-state-'))
-  temporary.push(stateA, stateB)
-  for (const state of [stateA, stateB]) writeFileSync(join(state, 'boot-guard.sh'), `# krotov-boot-guard-version: ${GUARD_VERSION}\n`)
-  const applyingB = updater(repo, contenderB, { stateDir: stateB }).apply(plan)
-  while (!bPaused) await new Promise(resolve => setTimeout(resolve, 5))
-  const applyingA = updater(repo, contenderA, { stateDir: stateA }).apply(plan)
-  while (!aPaused) await new Promise(resolve => setTimeout(resolve, 5))
-  // A has merged and its applying record is what the boot guard would recover from.
-  expect(git(repo, 'rev-parse', 'HEAD')).toBe(target)
-  atMerge.release()
-  expect(await applyingB).toMatchObject({ ok: false, stage: 'merge' })
-  expect(existsSync(pending)).toBe(true)
-  expect(readFileSync(pending, 'utf8')).toContain(`phase=applying\nfrom=${base}\nto=${target}\n`)
-  atInstall.release()
-  expect(await applyingA).toEqual({ ok: true, from: base, to: target })
+  const b = runner()
+  const stateA = join(root, 'state-a')
+  const stateB = join(root, 'state-b')
+  for (const state of [stateA, stateB]) {
+    mkdirSync(state)
+    writeFileSync(join(state, 'boot-guard.sh'), `# krotov-boot-guard-version: ${GUARD_VERSION}\n`)
+  }
+  const applying = updater(repo, contenderA, { stateDir: stateA }).apply(plan)
+  try {
+    await Promise.race([atInstall.promise, applying])
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(target)
+    const record = readFileSync(pending, 'utf8')
+    expect(record).toContain(`phase=applying\nfrom=${base}\nto=${target}\n`)
+    const result = await updater(repo, b.run, { stateDir: stateB }).apply(nextPlan)
+    expect(b.calls).toEqual([])
+    expect(result).toMatchObject({ ok: false, stage: 'state', detail: 'Обновление уже идёт.' })
+    expect(readFileSync(pending, 'utf8')).toBe(record)
+  } finally {
+    finishInstall.resolve()
+    await applying
+  }
+  expect(await applying).toEqual({ ok: true, from: base, to: target })
   expect(readFileSync(pending, 'utf8')).toBe(`v=1\nphase=trial\nfrom=${base}\nto=${target}\nboots=0\nat=5000\nfails=0\n`)
 })
+
+test('[A7] check refuses when flock is missing without changing the checkout', async () => {
+  const { root, repo, base } = repos()
+  const path = process.env.PATH
+  const emptyPath = join(root, 'empty-path')
+  mkdirSync(emptyPath)
+  const commands: string[] = []
+  const update = updater(repo, async (_command, [step]) => {
+    if (step) commands.push(step)
+    return { code: 0, stdout: join(repo, '.git'), stderr: '' }
+  })
+  try {
+    process.env.PATH = emptyPath
+    expect(await update.check()).toEqual({ kind: 'refused', reason: 'lock',
+      text: 'Не найдена утилита flock – обновление невозможно. Установи flock и повтори.' })
+    expect(await update.apply({ kind: 'plan', from: base, to: base, commits: [], total: 0 })).toMatchObject({ ok: false, stage: 'state',
+      detail: 'Не найдена утилита flock – обновление невозможно. Установи flock и повтори.' })
+    expect(await update.rollback()).toEqual({ ok: false, reason: 'failed',
+      text: 'Не найдена утилита flock – обновление невозможно. Установи flock и повтори.' })
+  } finally {
+    if (path === undefined) delete process.env.PATH
+    else process.env.PATH = path
+  }
+  expect(commands).toEqual(['rev-parse'])
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(base)
+  expect(git(repo, 'status', '--porcelain')).toBe('')
+  expect(existsSync(join(repo, '.git', 'krotov-update-pending'))).toBe(false)
+})
+
+test('[A7] a flock that does not answer in time is a lock failure, not a busy update', async () => {
+  const { root, repo, base } = repos()
+  const path = process.env.PATH
+  const slow = join(root, 'slow-flock')
+  mkdirSync(slow)
+  writeFileSync(join(slow, 'flock'), '#!/bin/sh\nexec sleep 10\n', { mode: 0o700 })
+  const update = updater(repo, async () => ({ code: 0, stdout: join(repo, '.git'), stderr: '' }))
+  try {
+    process.env.PATH = slow + ':/usr/bin:/bin'
+    expect(await update.check()).toEqual({ kind: 'refused', reason: 'lock',
+      text: 'Не удалось взять блокировку обновления. Повтори позже.' })
+  } finally {
+    if (path === undefined) delete process.env.PATH
+    else process.env.PATH = path
+  }
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(base)
+  expect(existsSync(join(repo, '.git', 'krotov-update-pending'))).toBe(false)
+}, 15_000)
 
 test('[R29] the boot guard of this checkout carries the version marker the bridge requires', () => {
   const guard = readFileSync(join(import.meta.dir, '..', '..', 'scripts', 'boot-guard.sh'), 'utf8')
@@ -509,6 +665,8 @@ test('[R29] without a compatible guard copy the update is refused with the reaso
   expect(refused).toMatchObject({ kind: 'refused', reason: 'old-guard' })
   if (refused.kind !== 'refused') throw new Error('not refused')
   expect(refused.text).toContain('boot-guard.sh')
+  expect(refused.text).toContain(`Проверка версии ${GUARD_VERSION} нужна, чтобы восстановление после сбоя не шло одновременно с обновлением.`)
+  expect(refused.text).not.toContain('помечена плохой')
   const plan = await updater(repo, runner().run).check()
   if (plan.kind !== 'plan') throw new Error('no plan')
   expect(await updater(repo, runner().run, { stateDir: state }).apply(plan)).toMatchObject({ ok: false, stage: 'guard', restored: true })

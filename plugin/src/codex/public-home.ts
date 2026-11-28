@@ -15,8 +15,8 @@
 // server that carries credentials (in keys, args or the url) needs
 // `public_safe = true`, and the environment variables it reads must be named
 // KROT_PUBLIC_MCP_*, so an owner credential (GBRAIN_BEARER and the like) is
-// never passed to a public app-server. A rebuild clears the home but for the
-// thread history.
+// never passed to a public app-server. Each start builds a fresh home and
+// imports thread history from the previous one.
 //
 // Allowlist file: KROT_PUBLIC_CONFIG or <state>/public-access.toml
 //   skills_dir = "public-skills"           # default; relative to the state directory
@@ -34,11 +34,11 @@
 //   bearer_token_env_var = "KROT_PUBLIC_MCP_SEARCH_TOKEN"
 
 import {
-  accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync,
-  rmSync, statSync, writeFileSync,
+  accessSync, closeSync, constants, copyFileSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync,
+  readdirSync, readFileSync, realpathSync, statSync, writeFileSync, type BigIntStats,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
 
 import { PUBLIC_FEATURES_OFF } from './public-profile.js'
@@ -192,113 +192,100 @@ function carriesCredentials(entry: Record<string, unknown>, url: URL): boolean {
   return url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== ''
 }
 
-// Only these survive a rebuild of a public home: Codex's thread history (so saved chats can resume)
-// and the bridge's own thread file. Everything else is written fresh.
-const KEPT_IN_HOME = new Set(['sessions', 'bridge-thread.json'])
-
-// The real path of a path that may not exist yet (then its absolute form).
+// Resolve existing ancestors even when the final path does not exist yet.
 function realOrResolved(path: string): string {
+  const absolute = resolve(path)
   try {
-    return realpathSync(path)
+    return realpathSync(absolute)
   } catch {
-    return resolve(path)
+    const parent = dirname(absolute)
+    return parent === absolute ? absolute : join(realOrResolved(parent), basename(absolute))
   }
 }
 
-// True when child lies strictly inside parent, compared by path segments.
 function strictlyInside(parent: string, child: string): boolean {
   const rel = relative(parent, child)
   return rel !== '' && !isAbsolute(rel) && rel.split(sep)[0] !== '..'
 }
 
-// True when a and b are the same folder or one lies inside the other.
-function overlaps(a: string, b: string): boolean {
-  return a === b || strictlyInside(a, b) || strictlyInside(b, a)
-}
-
-/** The owner folders a public-home cleanup must never delete or reach into. */
 export interface ProtectedPaths {
-  /** The owner Codex workspace (the cwd the owner thread runs in). */
   ownerWorkspace: string
-  /** The owner CODEX_HOME. */
   ownerCodexHome: string
-  /** The bridge user's HOME; folders under it are fine, HOME itself or a folder holding it is not. */
   userHome: string
 }
 
-/**
- * Makes sure the role home is a real folder the bridge owns before anything in it is deleted:
- * exactly <public-homes root>/<role>, neither it nor the root a symlink, not overlapping the
- * owner Codex home or the owner workspace in any direction, and neither HOME nor a folder
- * containing it. Creates the root and the home (mode 700) when missing; throws, and nothing is
- * cleaned, otherwise.
- */
-function assertSafeRoleHome(input: { role: PublicRole; home: string; homesRoot: string } & ProtectedPaths): void {
-  const { role, home, homesRoot } = input
-  if (resolve(home) !== join(resolve(homesRoot), role)) {
-    throw new PublicHomeError('The ' + role + ' home ' + home + ' is not <public-homes root>/' + role + ' (' + homesRoot + '); refusing to clean it')
-  }
-  mkdirSync(homesRoot, { recursive: true, mode: 0o700 })
-  if (lstatSync(homesRoot).isSymbolicLink()) {
-    throw new PublicHomeError('The public-homes root ' + homesRoot + ' is a symlink; refusing to clean anything in it')
-  }
-  const existing = lstatSync(home, { throwIfNoEntry: false })
-  if (existing?.isSymbolicLink()) throw new PublicHomeError('The ' + role + ' home ' + home + ' is a symlink; refusing to clean it')
-  if (existing && !existing.isDirectory()) throw new PublicHomeError('The ' + role + ' home ' + home + ' is not a folder')
-  if (!existing) mkdirSync(home, { mode: 0o700 })
-  const real = realpathSync(home)
-  if (real !== join(realpathSync(homesRoot), role)) {
-    throw new PublicHomeError('The ' + role + ' home ' + home + ' resolves outside the public-homes root ' + homesRoot + '; refusing to clean it')
-  }
-  const ownerCodex = realOrResolved(input.ownerCodexHome)
-  if (real === ownerCodex || strictlyInside(real, ownerCodex) || strictlyInside(ownerCodex, real)) {
-    throw new PublicHomeError('The ' + role + ' home ' + home + ' overlaps the owner Codex home ' + input.ownerCodexHome + '; refusing to clean it')
-  }
-  if (!isAbsolute(input.ownerWorkspace)) {
-    throw new PublicHomeError('The owner workspace ' + input.ownerWorkspace + ' is not an absolute path; refusing to clean the ' + role + ' home')
-  }
-  if (overlaps(real, realOrResolved(input.ownerWorkspace))) {
-    throw new PublicHomeError('The ' + role + ' home ' + home + ' overlaps the owner workspace ' + input.ownerWorkspace + '; refusing to clean it')
-  }
-  // Under HOME is the default state directory; HOME itself or a folder holding it never is a role home.
-  if (isAbsolute(input.userHome)) {
-    const userHome = realOrResolved(input.userHome)
-    if (real === userHome || strictlyInside(real, userHome)) {
-      throw new PublicHomeError('The ' + role + ' home ' + home + ' is or contains HOME (' + input.userHome + '); refusing to clean it')
-    }
-  }
-}
-
-/**
- * Every public role home checked before any of them is cleaned (startup): throws on the first
- * role home that fails assertSafeRoleHome, so nothing is deleted when one overlaps an owner folder.
- */
+/** Check configuration before taking the token lock or building public homes. */
 export function assertPublicHomesSafe(input: { homesRoot: string } & ProtectedPaths): void {
-  for (const role of PUBLIC_ROLES) assertSafeRoleHome({ ...input, role, home: join(input.homesRoot, role) })
+  const { homesRoot, ownerWorkspace, ownerCodexHome, userHome } = input
+  const root = realOrResolved(homesRoot)
+  if (!isAbsolute(ownerWorkspace)) throw new PublicHomeError('The owner workspace must be an absolute path')
+  const protectedPaths = [['owner workspace', ownerWorkspace], ['owner Codex home', ownerCodexHome]] satisfies [string, string][]
+  for (const [label, path] of protectedPaths) {
+    const owner = realOrResolved(path)
+    if (root === owner || strictlyInside(root, owner) || strictlyInside(owner, root)) {
+      throw new PublicHomeError('The public-homes root ' + homesRoot + ' overlaps the ' + label + ' ' + path)
+    }
+  }
+  if (isAbsolute(userHome)) {
+    const home = realOrResolved(userHome)
+    if (root === home || strictlyInside(root, home)) {
+      throw new PublicHomeError('The public-homes root ' + homesRoot + ' is or contains HOME (' + userHome + ')')
+    }
+  }
 }
 
+export function samePublicObject(a: BigIntStats, b: BigIntStats): boolean {
+  return a.dev === b.dev && a.ino === b.ino
+}
+
+export function isPublicOwner(stat: BigIntStats): boolean {
+  return stat.uid === BigInt(process.getuid?.() ?? -1)
+}
+
+/** Hook proof entries in codex-public: one per role and home hash, see public-backends.ts. */
+export const HOOK_PROOF_NAME = /^(?:member|guest)\.hook-proof-[0-9a-f]{16}\.json$/u
+
+export function hookProofName(role: PublicRole, hash: string): string {
+  return role + '.hook-proof-' + createHash('sha256').update(hash).digest('hex').slice(0, 16) + '.json'
+}
+
+export const HOOK_PROOF_VERSION = 1
+
 /**
- * Deletes everything in a role home but the kept thread history. Each target is checked again
- * right before it is removed: it must not be, contain or lie inside the owner workspace or the
- * owner Codex home, and must not be or contain HOME; otherwise it throws and the target stays.
+ * The home hash a hook proof file was made for, or undefined unless it is a regular bridge-owned
+ * file with one link (opened without following a link) holding a version 1 proof.
  */
-export function clearRoleHome(home: string, protectedPaths: ProtectedPaths): void {
-  const parent = realpathSync(home)
-  const ownerWorkspace = realOrResolved(protectedPaths.ownerWorkspace)
-  const ownerCodexHome = realOrResolved(protectedPaths.ownerCodexHome)
-  const userHome = isAbsolute(protectedPaths.userHome) ? realOrResolved(protectedPaths.userHome) : undefined
-  for (const entry of readdirSync(home)) {
-    const path = join(home, entry)
-    if (KEPT_IN_HOME.has(entry) && !lstatSync(path).isSymbolicLink()) continue
-    // The entry itself is never followed: rmSync removes a symlink, not what it points at.
-    const target = join(parent, entry)
-    if (overlaps(target, ownerWorkspace) || overlaps(target, ownerCodexHome) ||
-        (userHome !== undefined && (target === userHome || strictlyInside(target, userHome)))) {
-      throw new PublicHomeError('Refusing to delete ' + path + ': it is, holds or lies inside the owner workspace, ' +
-        'the owner Codex home or HOME')
+export function readHookProof(file: string): string | undefined {
+  try {
+    const entry = lstatSync(file, { bigint: true, throwIfNoEntry: false })
+    if (!entry?.isFile() || !isPublicOwner(entry) || entry.nlink !== 1n) return undefined
+    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    try {
+      const stat = fstatSync(fd, { bigint: true })
+      if (!stat.isFile() || !isPublicOwner(stat) || stat.nlink !== 1n || !samePublicObject(entry, stat)) return undefined
+      const proof = object(JSON.parse(readFileSync(fd, 'utf8')))
+      return proof.version === HOOK_PROOF_VERSION && typeof proof.configHash === 'string' ? proof.configHash : undefined
+    } finally {
+      closeSync(fd)
     }
-    rmSync(target, { recursive: true, force: true })
+  } catch {
+    return undefined
   }
+}
+
+/** True when the proof file at `name` (a HOOK_PROOF_NAME) is valid and made for the hash its name encodes. */
+export function validHookProof(directory: string, name: string): boolean {
+  const role = PUBLIC_ROLES.find(candidate => name.startsWith(candidate + '.'))
+  const hash = readHookProof(join(directory, name))
+  return role !== undefined && hash !== undefined && hookProofName(role, hash) === name
+}
+
+export function ownedPublicDirectory(path: string, expected?: BigIntStats): BigIntStats {
+  const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false })
+  if (!stat?.isDirectory() || !isPublicOwner(stat) || (expected && !samePublicObject(stat, expected))) {
+    throw new PublicHomeError('Expected an unchanged bridge-owned directory at ' + oneLine(path))
+  }
+  return stat
 }
 
 const HOOK_MARK = 'codex-permission-hook'
@@ -455,16 +442,39 @@ function envVarNames(entry: Record<string, unknown>): string[] {
   return names
 }
 
-// Copies a skill folder read-only (files 0444; folders stay 0700 so a plain rm still works); a symlink could point anywhere, so it refuses to start.
-function copySkill(source: string, target: string): void {
+function copyExclusive(source: string, target: string, mode: number, check: () => void): void {
+  copyFileSync(source, target, constants.COPYFILE_EXCL)
+  // Set permissions on the copy's inode, after rechecking the parent and refusing links.
+  check()
+  const entry = lstatSync(target, { bigint: true })
+  const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const stat = fstatSync(fd, { bigint: true })
+    if (!stat.isFile() || !isPublicOwner(stat) || stat.nlink !== 1n || !samePublicObject(entry, stat)) {
+      throw new PublicHomeError('Expected a regular bridge-owned file at ' + oneLine(target))
+    }
+    fchmodSync(fd, mode)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// Copies a skill folder read-only. Only real directories and regular files are accepted.
+function copySkill(source: string, target: string, before: (path: string) => void, check: () => void): void {
+  before(target)
+  check()
   const stat = lstatSync(source)
   if (stat.isSymbolicLink()) throw new PublicHomeError('Public skill file ' + source + ' is a symlink; copy the real file instead')
   if (stat.isDirectory()) {
     mkdirSync(target, { mode: 0o700 })
-    for (const entry of readdirSync(source)) copySkill(join(source, entry), join(target, entry))
+    const created = ownedPublicDirectory(target)
+    const checkChild = () => {
+      check()
+      ownedPublicDirectory(target, created)
+    }
+    for (const entry of readdirSync(source)) copySkill(join(source, entry), join(target, entry), before, checkChild)
   } else if (stat.isFile()) {
-    copyFileSync(source, target)
-    chmodSync(target, 0o444)
+    copyExclusive(source, target, 0o444, check)
   } else {
     throw new PublicHomeError('Public skill file ' + source + ' is not a regular file')
   }
@@ -478,20 +488,19 @@ function availableSkills(dir: string): string[] {
     .sort()
 }
 
-/**
- * Builds (or rebuilds) the CODEX_HOME of one public role from the allowlist.
- * Throws, and multi-user mode does not start, on any entry it cannot copy safely.
- */
+/** Adds the allowlisted files to a newly created public role directory. */
 export function preparePublicHome(input: {
   role: PublicRole; policy: PublicPolicy; home: string; ownerCodexHome: string; runtime: HookRuntime
-  /** The bridge's public-homes root (<state>/codex-public); `home` must be exactly <homesRoot>/<role>. */
-  homesRoot: string
-  /** The bridge user's HOME; a role home is never HOME or a folder containing it. */
-  userHome: string
-  /** The owner Codex workspace (canonical path); a role home never overlaps it in any direction. */
-  ownerWorkspace: string
+  beforeCreate?: (path: string) => void
+  checkParents?: () => void
 }): PreparedHome {
   const { role, policy, home, ownerCodexHome } = input
+  const identity = ownedPublicDirectory(home)
+  const check = () => {
+    input.checkParents?.()
+    ownedPublicDirectory(home, identity)
+  }
+  const before = (path: string) => input.beforeCreate?.(path)
   const rolePolicy = policy.roles[role]
   // Skills: every name must exist in the public skills folder.
   const available = availableSkills(policy.skillsDir)
@@ -546,13 +555,16 @@ export function preparePublicHome(input: {
   const auth = join(ownerCodexHome, 'auth.json')
   if (!existsSync(auth)) throw new PublicHomeError('The owner CODEX_HOME has no auth.json (the ChatGPT login file); the public Codex cannot log in')
 
-  const protectedPaths: ProtectedPaths = { ownerWorkspace: input.ownerWorkspace, ownerCodexHome, userHome: input.userHome }
-  assertSafeRoleHome({ role, home, homesRoot: input.homesRoot, ...protectedPaths })
-  chmodSync(home, 0o700)
-  clearRoleHome(home, protectedPaths)
   const skillsRoot = join(home, 'skills')
+  before(skillsRoot)
+  check()
   mkdirSync(skillsRoot, { mode: 0o700 })
-  for (const skill of skills) copySkill(join(policy.skillsDir, skill), join(skillsRoot, skill))
+  const skillsIdentity = ownedPublicDirectory(skillsRoot)
+  const checkSkills = () => {
+    check()
+    ownedPublicDirectory(skillsRoot, skillsIdentity)
+  }
+  for (const skill of skills) copySkill(join(policy.skillsDir, skill), join(skillsRoot, skill), before, checkSkills)
 
   const config = [
     '# Written by the Telegram bridge at every start: the Codex home of ' + role + ' threads. Do not edit;',
@@ -582,10 +594,14 @@ export function preparePublicHome(input: {
   if (!Bun.deepEquals(written.hooks, publicHooks(hookCommand)) || record(written.features).hooks !== true) {
     throw new PublicHomeError('The bridge could not write the permission hook of the ' + role + ' home exactly')
   }
-  writeFileSync(join(home, 'config.toml'), config, { mode: 0o600 })
-  chmodSync(join(home, 'config.toml'), 0o600)
-  copyFileSync(auth, join(home, 'auth.json'))
-  chmodSync(join(home, 'auth.json'), 0o600)
+  const configPath = join(home, 'config.toml')
+  before(configPath)
+  check()
+  writeFileSync(configPath, config, { flag: 'wx', mode: 0o600 })
+  const authPath = join(home, 'auth.json')
+  before(authPath)
+  check()
+  copyExclusive(auth, authPath, 0o600, check)
   // The hook script, the Codex build and the bun it runs on are part of what the proof proved:
   // a replaced hook build, a Codex upgrade or another bun needs a new proof.
   const hash = createHash('sha256').update(config).update('\0')

@@ -1,6 +1,5 @@
-// Reliable outbound wrapper around TelegramApi — bounded retry + dead-letter
-// + last-outbound tracking (M4, 2026-07-10 communication audit; hardened in
-// fix-loop 1 after the Codex/Fable dual review).
+// Reliable outbound wrapper around TelegramApi with bounded retries, a dead-letter
+// queue and last-outbound tracking.
 //
 // The audit found ~12 delivery failures/week (transient network / 5xx / 429)
 // that silently dropped a reply and forced the owner to ping «Статус?». This
@@ -82,6 +81,7 @@ import type {
   ChatAction,
   DownloadResult,
   EditOpts,
+  EditResult,
   SendDocumentOpts,
   SendMessageOpts,
   SendRichMessageOpts,
@@ -457,6 +457,11 @@ export function createReliableTelegramApi(
       const res = await raw.sendWidget(chatId, params)
       stampOutbound(chatId)
       return res
+    },
+
+    async editRichMessage(chatId: string, messageId: number, rawMarkdown: string): Promise<EditResult> {
+      if (raw.editRichMessage === undefined) throw new Error('editRichMessage is not available on this transport')
+      return raw.editRichMessage(chatId, messageId, rawMarkdown)
     },
 
     async editMessageText(chatId, messageId, text, editOpts: EditOpts): Promise<void> {

@@ -3,7 +3,7 @@ import { inflateSync } from 'node:zlib'
 
 import { agentTools } from '../../src/codex/chat-actions.js'
 import { RenderEyes } from '../../src/codex/render-eyes.js'
-import { renderPreview, type PreviewToolResult } from '../../src/codex/render-preview.js'
+import { draftSend, renderPreview, type PreviewToolResult } from '../../src/codex/render-preview.js'
 import { markdownToTelegramHtml } from '../../src/format/html.js'
 
 const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
@@ -44,6 +44,27 @@ test('[R42] render_preview is offered to trusted threads next to the component t
   expect(agentTools.map(tool => tool.name)).toContain('render_preview')
 })
 
+test('[R42] a draft document body masks a token exposed by plain conversion', () => {
+  // The blank pre falls back to a file. Plain conversion includes the link destination and decodes its colon.
+  const draft = '<pre><a href="https://example.invalid/123456789&#58;' + 'sample-'.repeat(5) + '"> </a></pre>'
+  const options = { shown: () => undefined, secrets: [] }
+  const preview = renderPreview({ text: draft }, options)
+  const masked = renderPreview({ text: '<pre><a href="https://example.invalid/[REDACTED]"> </a></pre>' }, options)
+  expect(JSON.parse(preview.contentItems[0].text)).toMatchObject({ formats: ['document'] })
+  expect(png(preview).equals(png(masked))).toBe(true)
+})
+
+test('[R42] a draft plain fallback masks a token exposed by plain conversion', () => {
+  // A raw HTML file link forces plain text; Markdown file links are rendered as code paths.
+  const link = '<a href="file:///tmp/x">link</a>'
+  const value = 'mock-value-123'
+  const options = { shown: () => undefined, secrets: [] }
+  const preview = renderPreview({ text: link + ' Bearer **' + value + '**' }, options)
+  const masked = renderPreview({ text: link + ' Bearer [REDACTED]' }, options)
+  expect(JSON.parse(preview.contentItems[0].text)).toMatchObject({ formats: ['plain'] })
+  expect(png(preview).equals(png(masked))).toBe(true)
+})
+
 test('[R42] render_preview returns a Telegram-like PNG of a draft and of a sent message', () => {
   const eyes = new RenderEyes({})
   const options = { shown: (id: number) => eyes.shown(id), secrets: [] }
@@ -66,4 +87,11 @@ test('[R42] render_preview returns a Telegram-like PNG of a draft and of a sent 
   expect(unknown.contentItems).toHaveLength(1)
   const both = renderPreview({ message_id: 55, text: 'x' }, options)
   expect(both.success).toBe(false)
+})
+
+test('[R42] a draft never draws a secret that markup splits in the source', () => {
+  // The picture is drawn from these parts: the masked plain fallback, as the send delivers it.
+  expect(draftSend('Ключ MA**SK**ME тут', ['MASKME']).parts).toEqual([{ format: 'plain', text: 'Ключ [REDACTED] тут' }])
+  const preview = renderPreview({ text: 'Ключ MA**SK**ME тут' }, { shown: () => undefined, secrets: ['MASKME'] })
+  expect(JSON.parse(preview.contentItems[0].text)).toMatchObject({ formats: ['plain'] })
 })

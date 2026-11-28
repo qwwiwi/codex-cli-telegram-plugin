@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# krotov-boot-guard-version: 2
+# krotov-boot-guard-version: 3
 # The bridge refuses to update while the installed copy carries an older version (GUARD_VERSION in
 # plugin/src/codex/self-update.ts): bump both together whenever the bridge starts relying on new behaviour.
 # Boot guard (docs/design/self-update-spec.md, S9): ExecStartPre=- of the configured bridge service.
@@ -8,6 +8,11 @@
 # or breaks plugin/scripts/boot-guard.sh can still be rolled back. It runs in the unit's
 # WorkingDirectory (the plugin directory), in bash only, so it works even when the new TypeScript
 # cannot be loaded at all.
+#
+# Recovery takes the checkout's update lock. If another instance is updating this checkout,
+# recovery waits for the next start. The lock lives on fd 9 of this shell only: every external
+# command runs with 9>&-, so a child left behind (a git or bun daemon) cannot keep the lock after
+# the guard exits and make the next guard skip an interrupted rollback.
 #
 # It reads <git-dir>/krotov-update-pending, written by /update (plugin/src/codex/self-update.ts):
 #   phase=trial, boots=0        -> the trial boot of the new commit: count it and start.
@@ -37,11 +42,27 @@ top=$(git rev-parse --show-toplevel 2>/dev/null) || { log 'not a git checkout, n
 pending=$(git rev-parse --path-format=absolute --git-path krotov-update-pending 2>/dev/null) || exit 0
 bad=$(git rev-parse --path-format=absolute --git-path krotov-update-bad 2>/dev/null) || exit 0
 probation=$(git rev-parse --path-format=absolute --git-path krotov-update-probation 2>/dev/null) || exit 0
+lock=$(git rev-parse --path-format=absolute --git-path krotov-update.lock 2>/dev/null) || exit 0
+if command -v flock >/dev/null 2>&1; then
+  lock_umask=$(umask)
+  umask 077
+  if ! exec 9>>"$lock"; then
+    log 'could not open update lock, recovery left for the next start'
+    exit 0
+  fi
+  umask "$lock_umask"
+  if ! flock -n 9; then
+    log 'update lock held, recovery left for the next start'
+    exit 0
+  fi
+else
+  log 'flock missing, recovering without the update lock'
+fi
 sha='^[0-9a-f]{40}$'
 
 # mark_bad SHA: listed once; a failure to write is logged, the rollback still goes on.
 mark_bad() {
-  if [[ -f $bad ]] && grep -qxF -- "$1" "$bad"; then return 0; fi
+  if [[ -f $bad ]] && grep -qxF -- "$1" "$bad" 9>&-; then return 0; fi
   printf '%s\n' "$1" >> "$bad" || log "could not mark ${1:0:12} as bad"
 }
 
@@ -56,13 +77,13 @@ check_probation() {
   done < "$probation"
   if [[ $v != 1 || ! $from =~ $sha || ! $to =~ $sha || ! $until =~ ^[0-9]+$ || ! $crashes =~ ^[0-9]+$ ]]; then
     log 'malformed probation record, removed'
-    rm -f -- "$probation"
+    rm -f -- "$probation" 9>&-
     return 0
   fi
-  head=$(git -C "$top" rev-parse HEAD)
-  now=$(date +%s)
+  head=$(git -C "$top" rev-parse HEAD 9>&-)
+  now=$(date +%s 9>&-)
   if [[ $head != "$to" ]] || (( now > until )); then
-    rm -f -- "$probation"
+    rm -f -- "$probation" 9>&-
     return 0
   fi
   case $outcome in
@@ -78,12 +99,12 @@ check_probation() {
     # old version tells the owner once (phase=rolled_back).
     write_probation_record() {
       printf 'v=1\nphase=%s\nfrom=%s\nto=%s\nboots=0\nat=%s000\nfails=0\n' "$1" "$from" "$to" "$now" > "$pending.tmp"
-      mv -f -- "$pending.tmp" "$pending"
+      mv -f -- "$pending.tmp" "$pending" 9>&-
     }
     write_probation_record applying
-    rm -f -- "$probation"
+    rm -f -- "$probation" 9>&-
     local phase=rolled_back
-    if ! git -C "$top" reset -q --keep "$from" || ! (cd "$top/plugin" && bun install --frozen-lockfile --ignore-scripts); then
+    if ! git -C "$top" reset -q --keep "$from" 9>&- || ! (cd "$top/plugin" && bun install --frozen-lockfile --ignore-scripts) 9>&-; then
       phase=rollback_failed
     fi
     write_probation_record "$phase"
@@ -92,7 +113,7 @@ check_probation() {
   fi
   tmp="$probation.tmp"
   printf 'v=1\nfrom=%s\nto=%s\nuntil=%s\ncrashes=%s\n' "$from" "$to" "$until" "$crashes" > "$tmp"
-  mv -f -- "$tmp" "$probation"
+  mv -f -- "$tmp" "$probation" 9>&-
 }
 
 if [[ ! -f $pending ]]; then
@@ -117,14 +138,14 @@ fi
 write_record() {
   local tmp="$pending.tmp"
   printf 'v=1\nphase=%s\nfrom=%s\nto=%s\nboots=%s\nat=%s\nfails=%s\n' "$1" "$from" "$to" "$2" "$at" "$3" > "$tmp"
-  mv -f -- "$tmp" "$pending"
+  mv -f -- "$tmp" "$pending" 9>&-
 }
 
 # roll_back [bad]: with `bad` the new commit failed on its own and is never installed automatically again.
 roll_back() {
   log "rolling back from ${to:0:12} to ${from:0:12}"
   if [[ ${1:-} == bad ]]; then mark_bad "$to"; fi
-  if git -C "$top" reset -q --keep "$from" && (cd "$top/plugin" && bun install --frozen-lockfile --ignore-scripts); then
+  if git -C "$top" reset -q --keep "$from" 9>&- && (cd "$top/plugin" && bun install --frozen-lockfile --ignore-scripts) 9>&-; then
     write_record rolled_back "$boots" "$fails"
     log 'rolled back'
   else
@@ -137,7 +158,7 @@ case $phase in
   applying)
     roll_back ;;
   trial)
-    head=$(git -C "$top" rev-parse HEAD)
+    head=$(git -C "$top" rev-parse HEAD 9>&-)
     if [[ $head == "$from" ]]; then
       log 'finishing a rollback that was cut off'
       roll_back

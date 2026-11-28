@@ -3,6 +3,28 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
+## v0.6.0 – 2026-11-28
+
+[Release notes in English and Russian](docs/releases/v0.6.0.md).
+
+- Multi-user mode creates fresh Codex homes for members and guests at each start
+  and carries over eligible thread history. The bridge keeps history it could
+  not copy and retries at the next start. `/doctor` reports copy failures,
+  quarantined homes, and damaged generation records that stop cleanup.
+- A failed write to the hook-check cache leaves the role available. `/doctor`
+  reports the write failure and the bridge repeats the check at the next start.
+- Multi-user mode requires hard links in the bridge state directory. If the file
+  system lacks support, the console and owner notice explain how to proceed.
+- Updates and startup recovery share a lock per checkout. Child processes cannot
+  keep the lock after recovery ends. `/update` explains when `flock` is missing or
+  the lock cannot be acquired.
+- New Telegram reply plans mask values that become visible when formatting is
+  removed. Plain-text fallbacks mask across message cuts and split text that
+  grows beyond Telegram's limit during masking.
+- Render diagnostics use the text or document body sent to Telegram. Opening
+  render history removes legacy excerpts and moves corrupt history aside with a
+  warning. Editing a Rich Message also updates its preview.
+
 ## v0.5.2 – 2026-11-27
 
 - The bridge guard blocks service changes that target the bridge through broad

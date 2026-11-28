@@ -1,11 +1,14 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { doctorPublicRoles, provePublicHooks, startPublicBackends } from '../../src/codex/public-backends.js'
+import { doctorPublicRoles, hookProofName, provePublicHooks, startPublicBackends } from '../../src/codex/public-backends.js'
 import { HookDenials } from '../../src/codex/multiuser-readiness.js'
+import { runPublicGc } from '../../src/codex/public-gc.js'
+import { openPublicGenerations } from '../../src/codex/public-generations.js'
 import type { PreparedHome, PublicRole } from '../../src/codex/public-home.js'
+import type { PublishFault } from '../../src/codex/public-publish.js'
 import { NO_SHELL, PUBLIC_FEATURES_OFF } from '../../src/codex/public-profile.js'
 import type { PublicProbe, PublicTurnProfile } from '../../src/codex/session.js'
 
@@ -43,7 +46,7 @@ class FakePublicSession {
   async stopPublic(): Promise<boolean> { return false }
 }
 
-function setup(leakRole?: PublicRole, root = mkdtempSync(join(tmpdir(), 'krot-public-backends-'))) {
+function setup(leakRole?: PublicRole, root = mkdtempSync(join(tmpdir(), 'krot-public-backends-')), proofFault?: PublishFault) {
   dirs.push(root)
   const sessions: FakePublicSession[] = []
   const exits = new Map<PublicRole, () => void>()
@@ -53,7 +56,8 @@ function setup(leakRole?: PublicRole, root = mkdtempSync(join(tmpdir(), 'krot-pu
     ({ role, home: join(root, 'codex-public', role), skills: [], mcp: [], webSearch: false, configHash: hashes[role] })
   const begin = () => startPublicBackends({
     roles: ['member', 'guest'], prepare: prepared, probeCwd: join(root, '_probe'), stopping: () => false,
-    proofFile: role => join(root, 'codex-public', role + '.hook-proof.json'),
+    proofDirectory: join(root, 'codex-public'),
+    ...(proofFault ? { proofFault } : {}),
     createSession: (role, _home, onExit) => {
       const session = new FakePublicSession(role, denials)
       session.leak = role === leakRole
@@ -106,7 +110,7 @@ test('S4 doctor: a role whose probe fails is quarantined, gets no canary, and it
 test('S4 doctor: a failed canary quarantines the role too; an exited app-server is reported, not probed', async () => {
   const { start, sessions, exits, root } = setup()
   const { roles } = await start()
-  sessions.find(session => session.role === 'member')!.answer = 'uid=1000(openclaw)'
+  sessions.find(session => session.role === 'member')!.answer = 'uid=1000(test-user)'
   exits.get('guest')!()
   const report = await doctorPublicRoles(roles, { probeCwd: join(root, '_probe'), canaryDir: join(root, '_canary'), canaryTimeoutMs: 1000 })
   expect(roles.find(role => role.role === 'member')!.alive()).toBe(false)
@@ -121,12 +125,12 @@ test('S4 R4: a role stays disabled until its hook proof passes; a failed proof q
   expect(roles.map(role => role.alive())).toEqual([false, false])
   await expect(router.runPublic('hi', { cwd: '/p', instructions: 'x', role: 'member' })).rejects.toThrow('not running')
   sessions.find(session => session.role === 'guest')!.hookDenies = false
-  const problems = await prove(roles)
+  const { problems } = await prove(roles)
   expect(problems.join('\n')).toContain('guest')
   expect(roles.find(role => role.role === 'member')!.alive()).toBe(true)
   expect(roles.find(role => role.role === 'guest')!.alive()).toBe(false)
-  expect(existsSync(join(root, 'codex-public', 'member.hook-proof.json'))).toBe(true)
-  expect(existsSync(join(root, 'codex-public', 'guest.hook-proof.json'))).toBe(false)
+  expect(existsSync(join(root, 'codex-public', hookProofName('member', 'hash-member')))).toBe(true)
+  expect(existsSync(join(root, 'codex-public', hookProofName('guest', 'hash-guest')))).toBe(false)
 })
 
 test('S4 R4: a hook proof whose turn did not complete is not cached, even with a denial seen', async () => {
@@ -134,11 +138,11 @@ test('S4 R4: a hook proof whose turn did not complete is not cached, even with a
   const { roles } = await begin()
   sessions.find(session => session.role === 'member')!.proofStatus = 'interrupted'
   sessions.find(session => session.role === 'guest')!.proofStatus = 'failed'
-  const problems = await prove(roles)
+  const { problems } = await prove(roles)
   expect(problems.length).toBe(2)
   expect(roles.map(role => role.alive())).toEqual([false, false])
-  expect(existsSync(join(root, 'codex-public', 'member.hook-proof.json'))).toBe(false)
-  expect(existsSync(join(root, 'codex-public', 'guest.hook-proof.json'))).toBe(false)
+  expect(existsSync(join(root, 'codex-public', hookProofName('member', 'hash-member')))).toBe(false)
+  expect(existsSync(join(root, 'codex-public', hookProofName('guest', 'hash-guest')))).toBe(false)
 })
 
 test('S4 R4: a passed hook proof is reused for the same home and redone when the home changes', async () => {
@@ -157,4 +161,127 @@ test('S4 R4: a passed hook proof is reused for the same home and redone when the
   await changed.prove(next.roles)
   expect(changed.sessions.map(session => session.proofs)).toEqual([0, 1])
   expect(next.roles.map(role => role.alive())).toEqual([true, true])
+})
+
+test('the hook proof is created exclusively per home hash and never follows a planted link', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-public-backends-'))
+  const outside = join(root, 'owner.txt')
+  writeFileSync(outside, 'owner work')
+  mkdirSync(join(root, 'codex-public'))
+  // A planted link at the proof name and at the old temporary name: neither is written through.
+  symlinkSync(outside, join(root, 'codex-public', hookProofName('member', 'hash-member')))
+  symlinkSync(outside, join(root, 'codex-public', 'member.hook-proof.json.tmp'))
+  const { begin, prove } = setup(undefined, root)
+  const { roles } = await begin()
+  const result = await prove(roles)
+  // The live proof passed: the role is enabled, only the cache entry is reported.
+  expect(result.problems).toEqual([])
+  expect(result.cacheProblems).toEqual([{ role: 'member', path: join(root, 'codex-public', hookProofName('member', 'hash-member')) }])
+  expect(roles.find(role => role.role === 'member')!.alive()).toBe(true)
+  expect(readFileSync(outside, 'utf8')).toBe('owner work')
+  expect(existsSync(join(root, 'codex-public', hookProofName('guest', 'hash-guest')))).toBe(true)
+  expect(hookProofName('guest', 'hash-guest')).toMatch(/^guest\.hook-proof-[0-9a-f]{16}\.json$/u)
+})
+
+test('a linked hook proof is not trusted even when its content matches', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-public-backends-'))
+  mkdirSync(join(root, 'codex-public'))
+  const valid = join(root, 'valid.json')
+  writeFileSync(valid, JSON.stringify({ configHash: 'hash-member' }))
+  symlinkSync(valid, join(root, 'codex-public', hookProofName('member', 'hash-member')))
+  const { begin } = setup(undefined, root)
+  const { roles } = await begin()
+  expect(roles.find(role => role.role === 'member')!.hookProven()).toBe(false)
+})
+
+// The first proof write (the member's: roles are proven in order) stops after a partial `{`.
+function partialFirstProof(): { fault: PublishFault; count: () => number } {
+  let faulted = 0
+  return {
+    count: () => faulted,
+    fault: (step, tempPath) => {
+      if (faulted > 0 || step !== 'write') return
+      faulted++
+      writeFileSync(tempPath, '{')
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    },
+  }
+}
+
+function collect(root: string, names: string[]) {
+  const lockFile = join(root, 'bot.pid')
+  writeFileSync(lockFile, String(process.pid))
+  const store = openPublicGenerations(join(root, 'codex-public'))
+  return runPublicGc(store, { keep: store.keep, keepProofs: names, lockFile })
+}
+
+const proofNames = [hookProofName('member', 'hash-member'), hookProofName('guest', 'hash-guest')]
+
+test('R7 a proof publish faulted after a partial write keeps the role alive; the next start proves again', async () => {
+  const partial = partialFirstProof()
+  const first = setup(undefined, undefined, partial.fault)
+  const { roles } = await first.begin()
+  const result = await first.prove(roles)
+  expect(partial.count()).toBe(1)
+  expect(roles.map(role => role.alive())).toEqual([true, true])
+  expect(result.problems).toEqual([])
+  expect(result.cacheProblems.map(problem => problem.role)).toEqual(['member'])
+  const again = setup(undefined, first.root)
+  const next = await again.begin()
+  expect(next.roles.find(role => role.role === 'member')!.hookProven()).toBe(false)
+  const retried = await again.prove(next.roles)
+  expect(retried).toEqual({ problems: [], cacheProblems: [] })
+  expect(again.sessions.map(session => session.proofs)).toEqual([1, 0])
+  expect(next.roles.map(role => role.alive())).toEqual([true, true])
+  const proof = JSON.parse(readFileSync(join(first.root, 'codex-public', proofNames[0]!), 'utf8'))
+  expect(proof).toMatchObject({ version: 1, configHash: 'hash-member' })
+})
+
+test('R8 a planted partial proof is ignored, collected before the proving, and replaced by a good one', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-public-backends-'))
+  mkdirSync(join(root, 'codex-public'))
+  const planted = join(root, 'codex-public', proofNames[0]!)
+  writeFileSync(planted, '{')
+  const first = setup(undefined, root)
+  const { roles } = await first.begin()
+  expect(roles.find(role => role.role === 'member')!.hookProven()).toBe(false)
+  // server.ts: the collection after the build runs before the background proving.
+  expect(collect(root, proofNames).problems).toEqual([])
+  expect(existsSync(planted)).toBe(false)
+  expect(await first.prove(roles)).toEqual({ problems: [], cacheProblems: [] })
+  expect(roles.map(role => role.alive())).toEqual([true, true])
+  const second = setup(undefined, root)
+  const next = await second.begin()
+  expect(next.roles.map(role => role.alive())).toEqual([true, true])
+  await second.prove(next.roles)
+  expect(second.sessions.map(session => session.proofs)).toEqual([0, 0])
+})
+
+test('R9 a read-only proof directory enables the role and reports only a cache problem', async () => {
+  const first = setup()
+  await first.start()
+  const again = setup(undefined, first.root)
+  again.hashes.member = 'hash-member-rebuilt'
+  const { roles } = await again.begin()
+  const directory = join(first.root, 'codex-public')
+  chmodSync(directory, 0o500)
+  try {
+    const result = await again.prove(roles)
+    expect(roles.map(role => role.alive())).toEqual([true, true])
+    expect(result.problems).toEqual([])
+    expect(result.cacheProblems).toEqual([{ role: 'member', path: join(directory, hookProofName('member', 'hash-member-rebuilt')) }])
+  } finally {
+    chmodSync(directory, 0o700)
+  }
+})
+
+test('R10 a failed live proof still quarantines the role and caches nothing', async () => {
+  const { begin, prove, sessions, root } = setup()
+  const { roles } = await begin()
+  sessions.find(session => session.role === 'member')!.hookDenies = false
+  const result = await prove(roles)
+  expect(result.problems.length).toBe(1)
+  expect(result.cacheProblems).toEqual([])
+  expect(roles.find(role => role.role === 'member')!.alive()).toBe(false)
+  expect(existsSync(join(root, 'codex-public', proofNames[0]!))).toBe(false)
 })

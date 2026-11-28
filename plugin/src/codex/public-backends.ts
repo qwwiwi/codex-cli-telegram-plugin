@@ -3,19 +3,19 @@
 // Each role gets its own app-server on its own CODEX_HOME (public-home.ts). Startup probes
 // every role and refuses to start on any problem. A role takes messages only once its permission
 // hook is proven (provePublicHooks: one fixture tool call the hook must deny, cached per home hash);
-// a failed proof quarantines it. /doctor probes again and runs the NO_SHELL
+// a failed proof quarantines it, a proof that passed but could not be cached only shows in /doctor. /doctor probes again and runs the NO_SHELL
 // canary, and a role that fails either is quarantined: its messages get «временно недоступно»
 // until a restart, never the owner's app-server.
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 
 import {
   checkPublicProfile, proveHookDenial, runPublicCanary, type HookDenials, type HookProofRunner,
 } from './multiuser-readiness.js'
 import { PublicRouter, type PublicRunner } from './public-lane.js'
-import type { PreparedHome, PublicRole } from './public-home.js'
-import { object } from './rpc.js'
+import { publishExclusive, type PublishFault } from './public-publish.js'
+import { HOOK_PROOF_VERSION, hookProofName, readHookProof, type PreparedHome, type PublicRole } from './public-home.js'
 import type { PublicProbe } from './session.js'
 
 export interface PublicSessionLike extends PublicRunner, HookProofRunner {
@@ -31,38 +31,50 @@ export interface StartedPublicRole<S extends PublicSessionLike = PublicSessionLi
   alive(): boolean
   /** True once the permission hook of this home was proven (now or by the cached proof of the same home hash). */
   hookProven(): boolean
-  /** Marks the hook proven, stores the proof for this home hash and lets the role take messages. */
-  proveHook(): void
+  /** Marks the hook proven and lets the role take messages (after a live pass). */
+  enable(): void
+  /** Stores the proof for this home hash; throws when it could not be saved. Never disables the role. */
+  cacheProof(): void
+  /** Where the proof of this home hash is stored. */
+  proofFile: string
   quarantine(): void
 }
 
-// The cached hook proof of a public home: valid only for the exact home hash it was made for.
+// One proof entry per role and home hash (hookProofName): published once (public-publish.ts), never
+// renamed over or rewritten. An entry for another hash, or an invalid one under the current name,
+// is collected by public-gc.ts before the proving of the same start.
+export { hookProofName }
+
+// The cached hook proof of a public home: a valid proof file whose content names this exact hash.
 function cachedProof(file: string, hash: string): boolean {
-  try {
-    const saved: unknown = JSON.parse(readFileSync(file, 'utf8'))
-    return object(saved).configHash === hash
-  } catch {
-    return false
-  }
+  return readHookProof(file) === hash
 }
 
-function saveProof(file: string, hash: string): void {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
-  const temp = file + '.tmp'
-  writeFileSync(temp, JSON.stringify({ configHash: hash, provenAt: new Date().toISOString() }) + '\n', { mode: 0o600 })
-  renameSync(temp, file)
+function saveProof(directory: string, name: string, hash: string, fault?: PublishFault): void {
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  const proof = JSON.stringify({ version: HOOK_PROOF_VERSION, configHash: hash, provenAt: new Date().toISOString() }) + '\n'
+  try {
+    publishExclusive(directory, name, proof, () => {}, fault)
+  } catch (error) {
+    // Never replaced: an existing entry counts only when it already is a valid proof for this hash.
+    if (error instanceof Error && 'code' in error && error.code === 'EEXIST' && cachedProof(join(directory, name), hash)) return
+    throw error
+  }
 }
 
 /** Starts and probes one app-server per role; throws (multi-user mode does not start) on the first problem. */
 export async function startPublicBackends<S extends PublicSessionLike>(input: {
   roles: readonly PublicRole[]
+  /** Builds this role in the generation opened by the caller before starting either backend. */
   prepare: (role: PublicRole) => PreparedHome
   /** `onExit` is called when this role's app-server stops. */
   createSession: (role: PublicRole, prepared: PreparedHome, onExit: () => void) => S
   probeCwd: string
   stopping: () => boolean
-  /** Where the hook proof of a role's home is cached (outside the home: a rebuild clears the home). */
-  proofFile: (role: PublicRole) => string
+  /** Where the hook proofs are cached (outside the generations), one entry per role and home hash. */
+  proofDirectory: string
+  /** Test seam for the proof publish (public-publish.ts). */
+  proofFault?: PublishFault
 }): Promise<{ roles: StartedPublicRole<S>[]; router: PublicRouter }> {
   const roles: StartedPublicRole<S>[] = []
   for (const role of input.roles) {
@@ -73,16 +85,16 @@ export async function startPublicBackends<S extends PublicSessionLike>(input: {
     await session.initialize()
     const problem = await checkPublicProfile(session, input.probeCwd, prepared)
     if (problem) throw new Error('Multi-user mode cannot start (' + role + '): ' + problem)
-    const proofFile = input.proofFile(role)
+    const proofName = hookProofName(role, prepared.configHash)
+    const proofFile = join(input.proofDirectory, proofName)
     let proven = cachedProof(proofFile, prepared.configHash)
     roles.push({
       role, prepared, session,
       alive: () => proven && !exited && !quarantined && !input.stopping(),
       hookProven: () => proven,
-      proveHook: () => {
-        saveProof(proofFile, prepared.configHash)
-        proven = true
-      },
+      enable: () => { proven = true },
+      cacheProof: () => saveProof(input.proofDirectory, proofName, prepared.configHash, input.proofFault),
+      proofFile,
       quarantine: () => { quarantined = true },
     })
   }
@@ -92,30 +104,46 @@ export async function startPublicBackends<S extends PublicSessionLike>(input: {
   return { roles, router }
 }
 
+/** A hook proof that passed live but could not be cached: the role works, the proof runs again next start. */
+export interface ProofCacheProblem { role: PublicRole; path: string }
+
+export interface HookProofResult {
+  /** Roles whose live proof failed; each is quarantined until a restart. */
+  problems: string[]
+  cacheProblems: ProofCacheProblem[]
+}
+
 /**
  * Startup, once the thread-role endpoint listens: every role without a proof for its home hash runs
- * the hook proof; a pass enables it, a failure quarantines it until a restart. Returns the problems.
+ * the hook proof; a pass enables it at once and then caches the proof, a failure quarantines it
+ * until a restart. A cache failure never disables the role.
  */
 export async function provePublicHooks(roles: readonly StartedPublicRole[], input: {
   denials: HookDenials; probeCwd: string; timeoutMs: number
-}): Promise<string[]> {
-  const problems: string[] = []
+}): Promise<HookProofResult> {
+  const result: HookProofResult = { problems: [], cacheProblems: [] }
   for (const started of roles) {
     if (started.hookProven()) continue
     const problem = await proveHookDenial(started.session, input.denials, input.probeCwd, input.timeoutMs)
     if (problem) {
       started.quarantine()
-      problems.push(started.role + ': ' + problem)
+      result.problems.push(started.role + ': ' + problem)
       continue
     }
+    started.enable()
     try {
-      started.proveHook()
+      started.cacheProof()
     } catch {
-      started.quarantine()
-      problems.push(started.role + ': the hook proof passed but could not be saved')
+      result.cacheProblems.push({ role: started.role, path: started.proofFile })
     }
   }
-  return problems
+  return result
+}
+
+/** The /doctor line of a proof that passed but was not saved. */
+export function proofCacheLine(problem: ProofCacheProblem): string {
+  const label = problem.role === 'member' ? 'участник' : 'гость'
+  return '⚠️ Проверка хука (' + label + ') прошла, но не сохранена; повторится при следующем запуске: ' + problem.path
 }
 
 export interface PublicDoctorReport {
