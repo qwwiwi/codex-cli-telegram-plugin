@@ -3,7 +3,8 @@
 // send it, plus the facts as text (parts, formats, what the owner would see raw). It sends nothing to Telegram.
 // Keep the root relay's validated catalog (codex-root-relay.py) in sync with this tool.
 
-import { PreformattedDocumentError, plainTextWithLinks, splitMessage, splitPlainFallback } from '../format/chunk.js'
+import { maskedPlainFallback, maskShownSecrets, PreformattedDocumentError, plainTextWithLinks, splitMessage,
+  TELEGRAM_MAX_MESSAGE, telegramTextLength } from '../format/chunk.js'
 import { markdownToTelegramHtml } from '../format/html.js'
 import { splitLongBlock } from '../format/paragraphs.js'
 import { renderTelegramPng, type PreviewBubble } from '../format/render-png.js'
@@ -70,22 +71,26 @@ function refused(hint: string): PreviewToolResult {
 export function draftSend(text: string, secrets: readonly string[]): RenderSend {
   const source = redactSecrets(text, secrets)
   const html = markdownToTelegramHtml(splitLongBlock(normalizeChatReply(source)))
+  const redact = (plain: string): string => redactSecrets(plain, secrets)
+  const plainParts = new Set<string>()
   let planned: string[]
   try {
-    planned = splitMessage(html)
+    // Markup inside a value (`MA**SK**ME`) survives source masking: plan the masked shown text, as the send does.
+    planned = maskShownSecrets(splitMessage(html), html, redact, part => { plainParts.add(part) })
   } catch (error) {
     if (!(error instanceof PreformattedDocumentError)) throw error
-    return { source, parts: [{ format: 'document', text: plainTextWithLinks(error.html, Infinity) }] }
+    return { source, parts: [{ format: 'document', text: redactSecrets(plainTextWithLinks(error.html, Infinity), secrets) }] }
   }
   const parts: ShownPart[] = []
   let brokenHtml = 0
   for (const part of planned) {
-    if (!validateTelegramHtml(part).downgraded) {
+    if (!plainParts.has(part) && !validateTelegramHtml(part).downgraded && telegramTextLength(part) <= TELEGRAM_MAX_MESSAGE) {
       parts.push({ format: 'HTML', text: part })
       continue
     }
     brokenHtml += 1
-    for (const piece of splitPlainFallback(part)) parts.push({ format: 'plain', text: piece })
+    // Dropping the tags can join a token with its prefix (`Bearer <b>…</b>`): mask the plain text, as the send does.
+    for (const piece of maskedPlainFallback(part, redact)) parts.push({ format: 'plain', text: piece })
   }
   return { source, parts, brokenHtml }
 }

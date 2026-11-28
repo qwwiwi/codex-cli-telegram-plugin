@@ -24,6 +24,7 @@ import type {
   ChatAction,
   DownloadResult,
   EditOpts,
+  EditResult,
   InlineKeyboardLike,
   SendDocumentOpts,
   SendFileResult,
@@ -31,14 +32,16 @@ import type {
   SendRichMessageOpts,
   SendRichMessageResult,
   SendWidgetParams,
+  SentMessage,
   TelegramApi,
 } from '../channel/tools.js'
+import { htmlToPlainText, TELEGRAM_MAX_MESSAGE, telegramTextLength } from '../format/chunk.js'
 import { escapeHtml, escapeHtmlAttr } from '../format/html.js'
 import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
 import { richErrorClass } from '../format/rich.js'
 import type { RichLatch } from './rich-latch.js'
-import { WidgetPreSendError } from './pre-send-error.js'
+import { MaskedOverflowError, WidgetPreSendError } from './pre-send-error.js'
 
 /**
  * Walk an inline keyboard and redact every button's `text` and `url`
@@ -132,13 +135,17 @@ export function redactOutboundText(text: string, parseMode: 'MarkdownV2' | 'HTML
   return redactSecrets(text, parseMode === 'HTML' ? htmlSecretForms(secrets) : secrets)
 }
 
+// The length Telegram checks against its message limit: what it shows for HTML, the raw text otherwise.
+function shownLength(text: string, parseMode: 'MarkdownV2' | 'HTML' | undefined): number {
+  return parseMode === 'HTML' ? telegramTextLength(text) : text.length
+}
+
 export function createSafeTelegramApi(
   raw: TelegramApi,
   log: Logger,
   extraSecrets?: ReadonlyArray<string>,
   richLatch?: RichLatch,
 ): TelegramApi {
-  const htmlSecrets = extraSecrets === undefined ? undefined : htmlSecretForms(extraSecrets)
   const sanitize = (
     text: string,
     parseMode: 'MarkdownV2' | 'HTML' | undefined,
@@ -146,11 +153,20 @@ export function createSafeTelegramApi(
     // Redact first — secrets must be stripped regardless of parse mode. HTML text
     // carries a secret in its escaped form (`&` as `&amp;`), so those forms are
     // masked too; callers still redact the source before rendering.
-    const redacted = redactSecrets(text, parseMode === 'HTML' ? htmlSecrets : extraSecrets)
+    // The escaped forms are derived per send: a secret registered after this wrapper was built is masked too.
+    const redacted = redactSecrets(text, parseMode === 'HTML' && extraSecrets !== undefined
+      ? htmlSecretForms(extraSecrets) : extraSecrets)
     if (parseMode !== 'HTML') {
       return { text: redacted, parseMode }
     }
     const validated = validateTelegramHtml(redacted)
+    // Markup can separate a token from the prefix that marks it (`Bearer <b>…</b>`): the text Telegram shows
+    // joins them. When that visible text still holds a secret, send it masked as plain text.
+    const visible = validated.downgraded ? '' : htmlToPlainText(validated.text)
+    if (!validated.downgraded && redactSecrets(visible, extraSecrets) !== visible) {
+      log.warn('telegram html downgrade', { reason: 'secret in visible text' })
+      return { text: redactSecrets(visible, extraSecrets), parseMode: undefined }
+    }
     if (validated.downgraded) {
       // Telegram-bound payload is unknown to the operator, so log only the
       // classification (reason). The original text is intentionally NOT in
@@ -164,8 +180,15 @@ export function createSafeTelegramApi(
   }
 
   return {
-    async sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }> {
+    // The redaction choke point for every outgoing text: the result carries the payload actually sent.
+    async sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<SentMessage> {
       const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
+      // Masking can grow a message (`[REDACTED]` is longer than a short value) past the limit Telegram counts on
+      // what it shows. Refuse before the request so the caller splits the text instead of losing it to a 400.
+      if (shownLength(safeText, parseMode) > TELEGRAM_MAX_MESSAGE &&
+          shownLength(text, opts.parse_mode) <= TELEGRAM_MAX_MESSAGE) {
+        throw new MaskedOverflowError('the masked message is longer than Telegram allows; nothing was sent')
+      }
       // Rebuild opts without mutating caller's object.
       const safeOpts: SendMessageOpts = { ...opts }
       if (parseMode === undefined) {
@@ -176,7 +199,8 @@ export function createSafeTelegramApi(
       if (safeOpts.reply_markup) {
         safeOpts.reply_markup = redactReplyMarkup(safeOpts.reply_markup, extraSecrets)
       }
-      return raw.sendMessage(chatId, safeText, safeOpts)
+      const result = await raw.sendMessage(chatId, safeText, safeOpts)
+      return { ...result, sent: { text: safeText, format: parseMode ?? 'plain' } }
     },
 
     // Widget html is CODE, not prose: redaction must never silently rewrite it
@@ -215,7 +239,9 @@ export function createSafeTelegramApi(
       const redacted = redactSecrets(rawMarkdown, extraSecrets)
 
       try {
-        return await raw.sendRichMessage(chatId, redacted, opts)
+        const result = await raw.sendRichMessage(chatId, redacted, opts)
+        // Like sendMessage: a sent Rich Message carries the Markdown that actually went out.
+        return 'message_id' in result ? { ...result, sent: { text: redacted, format: 'rich' } } : result
       } catch (err) {
         const cls = richErrorClass(err)
         if (cls === 'capability') {
@@ -242,6 +268,14 @@ export function createSafeTelegramApi(
         // actually landed. Re-throw so the reply tool's outer try reports it.
         throw err
       }
+    },
+
+    // A Rich Message edit is redacted like a rich send and reports the Markdown it sent.
+    async editRichMessage(chatId: string, messageId: number, rawMarkdown: string): Promise<EditResult> {
+      if (raw.editRichMessage === undefined) throw new Error('editRichMessage is not available on this transport')
+      const redacted = redactSecrets(rawMarkdown, extraSecrets)
+      await raw.editRichMessage(chatId, messageId, redacted)
+      return { sent: { text: redacted, format: 'rich' } }
     },
 
     async editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void> {

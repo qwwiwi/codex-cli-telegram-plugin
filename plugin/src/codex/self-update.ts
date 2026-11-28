@@ -15,7 +15,7 @@
 // Each trial boot writes how it ended (outcome=…) into the record; the guard decides from that (S9.5).
 import { execFile, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { copyFileSync, linkSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, copyFileSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { updateEnvironment } from './environment.js'
@@ -65,10 +65,10 @@ export const PROBATION_MS = 600_000
 export const GUARD_FILE = 'boot-guard.sh'
 /**
  * The boot-guard.sh behaviour this bridge relies on, the `# krotov-boot-guard-version:` line of
- * plugin/scripts/boot-guard.sh. 2 = R29: a rolled-back commit is recorded in krotov-update-bad, and probation.
- * An older copy would roll a broken commit back without marking it bad, so the next automatic run retries it.
+ * plugin/scripts/boot-guard.sh. Version 2 added probation and marking bad commits (R29).
+ * Version 3 makes boot recovery take the same checkout lock as the updater.
  */
-export const GUARD_VERSION = 2
+export const GUARD_VERSION = 3
 const guardMarker = /^# krotov-boot-guard-version: (\d+)$/m
 
 /** The version a boot-guard.sh text declares; 0 for a guard from before the marker. */
@@ -107,8 +107,8 @@ export function ensureGuardCopy(repo: string, stateDir: string): string | undefi
   const installed = guardFileVersion(target) ?? 0
   if (installed >= GUARD_VERSION) return undefined
   const refused = (why: string) => `Не обновляюсь: проверка запуска (boot-guard.sh) в каталоге состояния устарела ` +
-    `(версия ${installed}, нужна ${GUARD_VERSION}), а заменить её не удалось: ${why}. Со старой проверкой неудачная версия ` +
-    'откатилась бы, но не была бы помечена плохой, и автообновление ставило бы её снова. ' +
+    `(версия ${installed}, нужна ${GUARD_VERSION}), а заменить её не удалось: ${why}. Проверка версии ${GUARD_VERSION} нужна, ` +
+    'чтобы восстановление после сбоя не шло одновременно с обновлением. ' +
     'На сервере выполни ./install.sh --start: он поставит новую проверку.'
   const available = guardFileVersion(join(repo, 'plugin', 'scripts', 'boot-guard.sh')) ?? 0
   if (available < GUARD_VERSION) return refused('в копии моста нет её новой версии')
@@ -121,17 +121,6 @@ export function ensureGuardCopy(repo: string, stateDir: string): string | undefi
   return now >= GUARD_VERSION ? undefined : refused('после замены версия всё ещё старая')
 }
 
-/**
- * The update lock in the state directory (the git directory without one): check, apply and rollback hold
- * it, so an automatic preflight and an /update never interleave, also across processes. It holds one JSON
- * line {pid, startedAt, token}, written in full to a temporary file before it is linked into place, so no
- * contender ever sees a lock without its holder.
- */
-export const LOCK_FILE = 'self-update.lock'
-/** A lock older than this is stale whatever its pid says (a reused pid): an apply takes minutes, not hours. */
-const lockStaleMs = 3 * 3_600_000
-/** A lock younger than this is held whatever it says (empty, unreadable, dead pid): it is never taken over. */
-const lockGraceMs = 60_000
 const sha = /^[0-9a-f]{40}$/
 const maxCommits = 20
 
@@ -150,7 +139,7 @@ export interface PendingUpdate {
 export type UpdateCheck =
   | { kind: 'plan'; from: string; to: string; commits: string[]; total: number }
   | { kind: 'current'; head: string }
-  | { kind: 'refused'; reason: 'dirty' | 'branch' | 'fetch' | 'diverged' | 'no-guard' | 'old-guard' | 'pending' | 'busy'; text: string }
+  | { kind: 'refused'; reason: 'dirty' | 'branch' | 'fetch' | 'diverged' | 'no-guard' | 'old-guard' | 'pending' | 'busy' | 'lock'; text: string }
 
 export type ApplyResult =
   | { ok: true; from: string; to: string }
@@ -210,111 +199,6 @@ export function formatPending(pending: PendingUpdate): string {
 function writeFileAtomic(path: string, text: string): void {
   writeFileSync(path + '.tmp', text, { mode: 0o600 })
   renameSync(path + '.tmp', path)
-}
-
-function errorCode(error: unknown): unknown {
-  return error instanceof Error && 'code' in error ? error.code : undefined
-}
-
-interface LockHolder { pid: number; startedAt: number; token: string }
-
-/** The tokens of the update locks this process holds now. */
-const heldLockTokens = new Set<string>()
-
-function parseLockHolder(text: string): LockHolder | undefined {
-  let value: unknown
-  try {
-    value = JSON.parse(text)
-  } catch {
-    return undefined
-  }
-  if (typeof value !== 'object' || value === null) return undefined
-  const pid = 'pid' in value ? value.pid : undefined
-  const startedAt = 'startedAt' in value ? value.startedAt : undefined
-  const token = 'token' in value ? value.token : undefined
-  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return undefined
-  if (typeof startedAt !== 'number' || typeof token !== 'string' || !token) return undefined
-  return { pid, startedAt, token }
-}
-
-/**
- * The text of the lock when it is stale, undefined while it is held. A lock younger than lockGraceMs is
- * always held. After that it is stale when it has no readable holder, is older than lockStaleMs, or its
- * process is gone (a lock of this pid counts as gone unless this process holds its token).
- */
-function staleLockText(path: string): string | undefined {
-  try {
-    const age = Date.now() - statSync(path).mtimeMs
-    const text = readFileSync(path, 'utf8')
-    if (age < lockGraceMs) return undefined
-    const holder = parseLockHolder(text)
-    if (!holder || age > lockStaleMs) return text
-    if (holder.pid === process.pid) return heldLockTokens.has(holder.token) ? undefined : text
-    try {
-      process.kill(holder.pid, 0)
-      return undefined
-    } catch (error) {
-      // EPERM: the process exists but belongs to another user.
-      return errorCode(error) === 'EPERM' ? undefined : text
-    }
-  } catch {
-    // Gone or unreadable right now: treated as held this round.
-    return undefined
-  }
-}
-
-/**
- * Moves a stale lock out of the way: renamed aside first, so of two contenders taking over the same stale
- * lock only the one that moved exactly that lock goes on. A lock that changed in between is put back.
- */
-function removeStaleLock(path: string, stale: string, token: string): boolean {
-  const aside = `${path}.${token}.stale`
-  try {
-    renameSync(path, aside)
-  } catch {
-    return false
-  }
-  try {
-    if (readFileSync(aside, 'utf8') === stale) return true
-    try {
-      linkSync(aside, path)
-    } catch { /* another contender took the path meanwhile */ }
-    return false
-  } finally {
-    rmSync(aside, { force: true })
-  }
-}
-
-/**
- * Takes the lock file atomically: the full holder line goes into a private temporary file that is then
- * hard-linked to the lock path (EEXIST = held). False when the lock is held. A stale lock is replaced once.
- */
-function takeLockFile(path: string, token: string): boolean {
-  const temp = `${path}.${token}.tmp`
-  const holder: LockHolder = { pid: process.pid, startedAt: Date.now(), token }
-  writeFileSync(temp, JSON.stringify(holder) + '\n', { flag: 'wx', mode: 0o600 })
-  try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        linkSync(temp, path)
-        return true
-      } catch (error) {
-        if (errorCode(error) !== 'EEXIST') throw error
-      }
-      const stale = staleLockText(path)
-      if (stale === undefined || !removeStaleLock(path, stale, token)) return false
-    }
-    return false
-  } finally {
-    rmSync(temp, { force: true })
-  }
-}
-
-/** Removes the lock file only while it is still the one this token took. */
-function releaseLockFile(path: string, token: string): void {
-  try {
-    if (parseLockHolder(readFileSync(path, 'utf8'))?.token === token) rmSync(path, { force: true })
-  } catch { /* already gone */ }
 }
 
 function gitSync(repo: string, ...args: string[]): string | undefined {
@@ -393,6 +277,24 @@ export function refreshGuardCopy(repo: string, stateDir: string): void {
   renameSync(target + '.tmp', target)
 }
 
+const busyText = 'Обновление уже идёт.'
+
+/** The checkout's update lock: held (release it when done) or refused with the owner-facing reason. */
+type UpdateLock = { release: () => void } | { refused: 'busy' | 'lock'; text: string }
+
+/**
+ * Why `flock -n 0` did not take the lock: exit 1 is another holder (busy). A missing flock (ENOENT),
+ * a timeout or any other failure is not a running update and gets its own text.
+ */
+function lockRefusal(result: { status: number | null; error?: Error }): UpdateLock {
+  const error = result.error
+  if (error && 'code' in error && error.code === 'ENOENT') {
+    return { refused: 'lock', text: 'Не найдена утилита flock – обновление невозможно. Установи flock и повтори.' }
+  }
+  if (!error && result.status === 1) return { refused: 'busy', text: busyText }
+  return { refused: 'lock', text: 'Не удалось взять блокировку обновления. Повтори позже.' }
+}
+
 export class SelfUpdate {
   private readonly plugin: string
   private readonly now: () => number
@@ -423,29 +325,34 @@ export class SelfUpdate {
   }
 
   /**
-   * Takes the update lock: in this process first (synchronously, before any await), then the lock file.
-   * Returns its release, or undefined while another check, apply or rollback holds it.
+   * Excludes concurrent calls on this instance before resolving the per-checkout lock path.
+   * flock locks the shared open file description, so the bridge keeps the lock after the helper exits.
+   * Leave the inode in place so every updater and boot guard locks the same file.
    */
-  private async lock(): Promise<(() => void) | undefined> {
-    if (this.locked) return undefined
+  private async lock(): Promise<UpdateLock> {
+    if (this.locked) return { refused: 'busy', text: busyText }
     this.locked = true
+    let fd: number | undefined
+    let acquired = false
     try {
-      const path = this.options.stateDir ? join(this.options.stateDir, LOCK_FILE) : await this.statePath(LOCK_FILE)
-      const token = randomUUID()
-      heldLockTokens.add(token)
-      if (!takeLockFile(path, token)) {
-        heldLockTokens.delete(token)
-        this.locked = false
-        return undefined
+      const lockFd = openSync(await this.statePath('krotov-update.lock'), 'a', 0o600)
+      fd = lockFd
+      const result = spawnSync('flock', ['-n', '0'], {
+        stdio: [lockFd, 'ignore', 'ignore'], timeout: 5000, env: updateChildEnv(),
+      })
+      acquired = result.status === 0
+      if (!acquired) return lockRefusal(result)
+      return {
+        release: () => {
+          this.locked = false
+          closeSync(lockFd)
+        },
       }
-      return () => {
-        releaseLockFile(path, token)
-        heldLockTokens.delete(token)
+    } finally {
+      if (!acquired) {
         this.locked = false
+        if (fd !== undefined) closeSync(fd)
       }
-    } catch (error) {
-      this.locked = false
-      throw error
     }
   }
 
@@ -498,12 +405,12 @@ export class SelfUpdate {
 
   /** Fetches the configured branch and lists what /update would apply. Changes nothing in the tree. */
   async check(): Promise<UpdateCheck> {
-    const release = await this.lock()
-    if (!release) return { kind: 'refused', reason: 'busy', text: 'Обновление уже идёт.' }
+    const lock = await this.lock()
+    if ('refused' in lock) return { kind: 'refused', reason: lock.refused, text: lock.text }
     try {
       return await this.checkLocked()
     } finally {
-      release()
+      lock.release()
     }
   }
 
@@ -545,7 +452,7 @@ export class SelfUpdate {
       return { kind: 'refused', reason: 'no-guard', text: 'Не обновляюсь: служба не запускает проверку запуска (boot-guard.sh) из каталога состояния, без неё неудачную версию нельзя откатить автоматически. ' +
         'На сервере выполни ./update.sh, затем ./install.sh --start (он обновит файл службы), и /update заработает из чата.' }
     }
-    // R29: the installed copy must be the guard that marks a rolled-back commit bad; an older one is replaced first.
+    // Refresh an older guard before proceeding so recovery uses the same lock as the updater.
     const guard = this.options.stateDir ? ensureGuardCopy(this.options.repo, this.options.stateDir) : undefined
     if (guard) return { kind: 'refused', reason: 'old-guard', text: guard }
     const total = Number(await this.gitText('rev-list', '--count', `${from}..${to}`) ?? 0)
@@ -568,8 +475,8 @@ export class SelfUpdate {
    * the trial record makes the next boot prove the new version. On failure the copy is back on `from`.
    */
   async apply(plan: Extract<UpdateCheck, { kind: 'plan' }>): Promise<ApplyResult> {
-    const release = await this.lock()
-    if (!release) return { ok: false, stage: 'state', detail: 'Обновление уже идёт.', restored: true }
+    const lock = await this.lock()
+    if ('refused' in lock) return { ok: false, stage: 'state', detail: lock.text, restored: true }
     try {
       const files = await this.dirtyFiles()
       if (!files || files.length > 0 || await this.gitText('rev-parse', 'HEAD') !== plan.from) {
@@ -602,7 +509,7 @@ export class SelfUpdate {
       await this.writeRecord(PENDING_FILE, { ...record, phase: 'trial' })
       return { ok: true, from: plan.from, to: plan.to }
     } finally {
-      release()
+      lock.release()
     }
   }
 
@@ -642,8 +549,8 @@ export class SelfUpdate {
 
   /** /update rollback: returns the copy to the commit before the last update. The caller exits 75. */
   async rollback(): Promise<RollbackResult> {
-    const release = await this.lock()
-    if (!release) return { ok: false, reason: 'failed', text: 'Обновление уже идёт.' }
+    const lock = await this.lock()
+    if ('refused' in lock) return { ok: false, reason: 'failed', text: lock.text }
     try {
       const head = await this.gitText('rev-parse', 'HEAD')
       // A live trial of HEAD (the boot after /update, before its health mark) is rolled back from its own record.
@@ -671,7 +578,7 @@ export class SelfUpdate {
       await this.removeRecord(LAST_FILE)
       return { ok: true, from: last.to, to: last.from }
     } finally {
-      release()
+      lock.release()
     }
   }
 }

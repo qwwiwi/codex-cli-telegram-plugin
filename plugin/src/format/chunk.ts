@@ -148,6 +148,34 @@ export function splitPlainFallback(html: string, max: number = TELEGRAM_MAX_MESS
   return splitTokens(segments.map(segment => segment.text).join(''), tokens, max)
 }
 
+/**
+ * The plain fallback of `html` cut into messages, masked as one text: a cut can split a token or separate it from the
+ * prefix that marks it (`Bearer` | value), which no per-message redaction sees. When the whole plain text holds
+ * anything `redact` masks, the masked whole is what is split.
+ */
+export function maskedPlainFallback(html: string, redact: (text: string) => string,
+  max: number = TELEGRAM_MAX_MESSAGE): string[] {
+  const whole = plainTextWithLinks(html, Infinity)
+  const masked = redact(whole)
+  return masked === whole ? splitPlainFallback(html, max) : splitPlainMessage(masked, max)
+}
+
+/**
+ * The parts of `html` from splitMessage, unless the text Telegram shows for the whole still holds something `redact`
+ * masks (markup inside a value, `MA<b>SK</b>ME`, or between a token and its prefix): then the reply becomes one part,
+ * its masked plain fallback escaped as HTML, so no saved plan, queued message or draft keeps the joined value.
+ * `onMasked` gets that part: the sender delivers it through maskedPlainFallback (plain text, split unchanged), as the
+ * reply Telegram would have shown without its formatting.
+ */
+export function maskShownSecrets(parts: string[], html: string, redact: (text: string) => string,
+  onMasked?: (part: string) => void): string[] {
+  const shown = htmlToPlainText(html)
+  if (redact(shown) === shown) return parts
+  const masked = escapeHtml(redact(plainTextWithLinks(html, Infinity)))
+  onMasked?.(masked)
+  return [masked]
+}
+
 /** The length Telegram checks against its message limit: the text after entity parsing, in UTF-16 units. */
 export function telegramTextLength(html: string): number {
   return htmlToPlainText(html).length
@@ -378,6 +406,26 @@ export function protectPlainFallbackCuts(parts: readonly string[], secrets: read
     const piece = body.slice(start, end)
     start = end
     return piece
+  })
+}
+
+/**
+ * Saved plain pieces masked as one text, one piece per saved slot: a pattern match across a saved cut (`Bearer` |
+ * value) is masked too, and each cut moves to its place in the masked text, so `:plain:N` receipts keep their pieces.
+ */
+export function maskAcrossCuts(pieces: readonly string[], redact: (text: string) => string): string[] {
+  const whole = pieces.join('')
+  const masked = redact(whole)
+  if (masked === whole) return [...pieces]
+  let start = 0
+  let originalEnd = 0
+  return pieces.map((piece, index) => {
+    originalEnd += piece.length
+    const end = index === pieces.length - 1 ? masked.length
+      : Math.min(masked.length, Math.max(start, redactedRenderOffset(whole, masked, originalEnd)))
+    const slice = masked.slice(start, end)
+    start = end
+    return slice
   })
 }
 

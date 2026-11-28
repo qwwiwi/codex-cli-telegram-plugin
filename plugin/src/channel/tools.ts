@@ -109,10 +109,24 @@ export interface InlineKeyboardLike {
   inline_keyboard: { text: string; callback_data?: string }[][]
 }
 
+// A reply keyboard under the input field (the key spike's web_app button) and its removal.
+export interface ReplyKeyboardLike {
+  keyboard: { text: string; web_app?: { url: string } }[][]
+  one_time_keyboard?: boolean
+  resize_keyboard?: boolean
+}
+
+export interface RemoveKeyboardLike {
+  remove_keyboard: true
+}
+
 export interface SendMessageOpts {
   reply_to_message_id?: number
   parse_mode?: 'MarkdownV2' | 'HTML'
   reply_markup?: InlineKeyboardLike
+  // A reply keyboard or its removal, sent as reply_markup when no inline keyboard is set. Its fields are
+  // bot-authored (button labels, a web_app URL), so the safe wrapper passes it unchanged.
+  reply_keyboard?: ReplyKeyboardLike | RemoveKeyboardLike
   // Forum-topic thread id. When set, Telegram delivers the message into the
   // matching topic instead of the supergroup's General topic. Omitted in
   // private chats and the General topic (no thread).
@@ -206,7 +220,8 @@ export interface SendRichMessageOpts {
 // is the signal the reply tool reads to decide whether to also run the HTML
 // chunk path — exactly one of the two ships, so a message is never lost or
 // duplicated.
-export type SendRichMessageResult = { message_id: number } | { fallback: true }
+// `sent` is set by the safe wrapper: the redacted Markdown it sent.
+export type SendRichMessageResult = { message_id: number; sent?: SentText } | { fallback: true }
 
 // Body of Bot API sendWidget minus chat_id. Optional fields are omitted when absent.
 export interface SendWidgetParams {
@@ -429,8 +444,28 @@ export function resolveGuestStagingChatId(
   }
 }
 
+/**
+ * The payload a message actually went out with, after the safe wrapper's redaction and HTML check: the only copy a
+ * recorder (render diffs, previews, deferred delivery) may keep.
+ */
+export interface SentText {
+  text: string
+  format: 'HTML' | 'MarkdownV2' | 'plain' | 'rich'
+}
+
+/** The result of an edit: `sent` is set by the safe wrapper, as on a send. */
+export interface EditResult {
+  sent?: SentText
+}
+
+export interface SentMessage {
+  message_id: number
+  /** Set by the safe wrapper (createSafeTelegramApi); a raw transport leaves it out. */
+  sent?: SentText
+}
+
 export interface TelegramApi {
-  sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
+  sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<SentMessage>
   // Telegram Bot API 10.1 Rich Messages: ship RAW markdown that Telegram
   // renders server-side (tables/math/headings/task-lists/<details>/footnotes,
   // up to 32768 bytes). The result is either a message_id (sent) or
@@ -447,6 +482,9 @@ export interface TelegramApi {
   // before the HTTP call, redaction runs in the safe wrapper.
   sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
+  // Replace a Rich Message's Markdown. Optional: a transport without Rich Messages leaves it out, and the layers
+  // refuse the edit. Redaction runs in the safe wrapper, like on sendRichMessage.
+  editRichMessage?(chatId: string, messageId: number, rawMarkdown: string): Promise<EditResult>
   setMessageReaction(chatId: string, messageId: number, emoji: string): Promise<void>
   sendChatAction(chatId: string, action: ChatAction): Promise<void>
   sendDocument(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<SendFileResult>
@@ -499,6 +537,8 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       }
       if (opts.reply_markup !== undefined) {
         other.reply_markup = opts.reply_markup
+      } else if (opts.reply_keyboard !== undefined) {
+        other.reply_markup = opts.reply_keyboard
       }
       if (opts.message_thread_id !== undefined) {
         other.message_thread_id = opts.message_thread_id
@@ -555,6 +595,10 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       if (opts.parse_mode !== undefined) other.parse_mode = opts.parse_mode
       if (opts.reply_markup !== undefined) other.reply_markup = opts.reply_markup
       await bot.api.editMessageText(chatId, messageId, text, other)
+    },
+    async editRichMessage(chatId, messageId, rawMarkdown) {
+      await bot.api.raw.editMessageText({ chat_id: chatId, message_id: messageId, rich_message: { markdown: rawMarkdown } })
+      return {}
     },
     async setMessageReaction(chatId, messageId, emoji) {
       await bot.api.setMessageReaction(chatId, messageId, [

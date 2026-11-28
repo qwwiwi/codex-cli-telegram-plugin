@@ -4,3 +4,9 @@
 export class WidgetPreSendError extends Error {
   override readonly name = 'WidgetPreSendError'
 }
+
+// The safe wrapper's masking grew a message that fit Telegram's limit past it: nothing was sent, and the caller
+// sends the text through its split plain fallback instead of losing it to Telegram's refusal.
+export class MaskedOverflowError extends Error {
+  override readonly name = 'MaskedOverflowError'
+}

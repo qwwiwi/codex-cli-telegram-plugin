@@ -39,7 +39,7 @@ import { join } from 'node:path'
 
 import { plainTextWithLinks, PreformattedDocumentError, splitMessage, splitPlainMessage } from '../format/chunk.js'
 import { parse429 } from './rate-limited-telegram-api.js'
-import type { SendMessageOpts } from '../channel/tools.js'
+import type { SendMessageOpts, SentMessage } from '../channel/tools.js'
 import type { Logger } from '../log.js'
 import type { OpenQuestionDetection } from './open-question.js'
 import { storedOrigin, StoredTurnOriginSchema, type StoredTurnOrigin, type TurnOrigin } from '../codex/turn-origin.js'
@@ -74,14 +74,22 @@ export type OutboxSendFn = (
   chatId: string,
   text: string,
   opts: SendMessageOpts,
-) => Promise<{ message_id: number }>
+) => Promise<OutboxSent>
+
+/**
+ * What a re-send delivered: its message ID and, for a document, the body actually uploaded (redacted at upload); for
+ * a text, the payload the safe wrapper sent.
+ */
+export interface OutboxSent extends SentMessage {
+  body?: string
+}
 
 export interface OutboxOptions {
   /** Plugin state dir; the outbox writes `<fileName>` here. */
   stateDir: string
   sendFn: OutboxSendFn
   sendDocument?: OutboxSendFn
-  onDelivered?: (item: Readonly<OutboxItem>, messageId: number) => void
+  onDelivered?: (item: Readonly<OutboxItem>, messageId: number, sent: OutboxSent) => void
   log: Logger
   /** Test seam: replace Date.now() for enqueue's notBefore computation. */
   now?: () => number
@@ -169,15 +177,16 @@ export class Outbox {
 
   // Append an undelivered reply. `retryAfterSec` is the ban's cooldown (from
   // the 429) — the item won't be re-sent before now()+retryAfterSec. Persists
-  // synchronously so a crash right after enqueue can't lose the reply.
+  // synchronously so a crash right after enqueue can't lose the reply. Return the item's UUID for delivery tracking.
   // A reply of a turn passes `reply`: its origin is required, so a deferred question keeps whose question it is.
-  enqueue(chatId: string, text: string, opts: SendMessageOpts, retryAfterSec: number, reply?: OutboxReply): void {
+  enqueue(chatId: string, text: string, opts: SendMessageOpts, retryAfterSec: number, reply?: OutboxReply): string {
     const origin = reply?.origin
     const question = reply?.question
     const brainKey = reply?.brainKey
     const wait = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec : 0
+    const id = randomUUID()
     this.items.push({
-      id: randomUUID(),
+      id,
       chatId,
       text,
       opts,
@@ -200,6 +209,7 @@ export class Outbox {
       })
     }
     this.persist()
+    return id
   }
 
   // Re-send every DUE item, per-chat in FIFO order. NEVER throws — a broken
@@ -230,7 +240,7 @@ export class Outbox {
             const result = await send(item.chatId, item.text, item.opts)
             toRemove.add(item)
             changed = true
-            try { this.onDelivered?.(item, result.message_id) } catch { this.log.warn('Could not record delivered outbox message') }
+            try { this.onDelivered?.(item, result.message_id, result) } catch { this.log.warn('Could not record delivered outbox message') }
             // Delivered — drain the next same-chat item this round.
             continue
           } catch (err) {

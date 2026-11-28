@@ -55,6 +55,7 @@ import type {
   ChatAction,
   DownloadResult,
   EditOpts,
+  EditResult,
   SendDocumentOpts,
   SendFileResult,
   SendMessageOpts,
@@ -882,6 +883,12 @@ export function createRateLimitedTelegramApi(
       // The signal is this layer's business; it never travels on.
       const { signal, ...rest } = editOpts
       return enqueueEdit(chatId, messageId, text, rest, signal)
+    },
+
+    async editRichMessage(chatId: string, messageId: number, rawMarkdown: string): Promise<EditResult> {
+      const edit = raw.editRichMessage
+      if (edit === undefined) throw new Error('editRichMessage is not available on this transport')
+      return withRetry('editRichMessage', () => edit(chatId, messageId, rawMarkdown), 0, chatId)
     },
 
     async setMessageReaction(

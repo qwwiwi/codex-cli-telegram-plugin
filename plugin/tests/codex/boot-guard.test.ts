@@ -1,7 +1,10 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+
+import { runCommand, SelfUpdate } from '../../src/codex/self-update.js'
 
 const script = resolve(import.meta.dir, '../../scripts/boot-guard.sh')
 const temporary: string[] = []
@@ -35,12 +38,108 @@ function checkout(installCode = 0) {
   const pending = join(repo, '.git', 'krotov-update-pending')
   const write = (phase: string, boots: number, extra = '') =>
     writeFileSync(pending, `v=1\nphase=${phase}\nfrom=${from}\nto=${to}\nboots=${boots}\nat=1\n${extra}`)
-  const run = () => Bun.spawnSync(['bash', script], { cwd: join(repo, 'plugin'),
-    env: { PATH: bin + ':/usr/bin:/bin', HOME: root }, stdout: 'pipe', stderr: 'pipe' })
+  const options = { cwd: join(repo, 'plugin'), env: { PATH: bin + ':/usr/bin:/bin', HOME: root } }
+  const run = (path = options.env.PATH, bash = 'bash') => Bun.spawnSync([bash, script], {
+    ...options, env: { ...options.env, PATH: path }, stdout: 'pipe', stderr: 'pipe',
+  })
+  const start = () => Bun.spawn(['bash', script], { ...options, stdout: 'ignore', stderr: 'pipe' })
   const read = () => existsSync(pending) ? readFileSync(pending, 'utf8') : ''
   const callLog = () => existsSync(calls) ? readFileSync(calls, 'utf8') : ''
-  return { repo, from, to, write, run, read, callLog }
+  return { root, bin, repo, from, to, write, run, start, read, callLog }
 }
+
+test('[A4] boot guard leaves an applying record alone while the checkout lock is held', () => {
+  const box = checkout()
+  box.write('applying', 0)
+  const record = box.read()
+  const lock = join(box.repo, '.git', 'krotov-update.lock')
+  const fd = openSync(lock, 'a', 0o600)
+  try {
+    expect(spawnSync('flock', ['-n', '0'], { stdio: [fd, 'ignore', 'ignore'], timeout: 5000 }).status).toBe(0)
+    const busy = box.run()
+    expect(busy.exitCode).toBe(0)
+    expect(busy.stderr.toString()).toContain('update lock held, recovery left for the next start')
+    expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.to)
+    expect(box.read()).toBe(record)
+    expect(box.callLog()).toBe('')
+  } finally {
+    closeSync(fd)
+  }
+  expect(box.run().exitCode).toBe(0)
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.from)
+  expect(box.read()).toContain('phase=rolled_back')
+})
+
+test('[A5] boot guard holds the checkout lock throughout its rollback install', async () => {
+  const box = checkout()
+  const ready = join(box.root, 'ready')
+  const finish = join(box.root, 'finish')
+  writeFileSync(join(box.bin, 'bun'), `#!/usr/bin/env bash
+: > ${JSON.stringify(ready)}
+while [[ ! -e ${JSON.stringify(finish)} ]]; do
+  (( SECONDS < 5 )) || exit 1
+  sleep 0.02
+done
+`, { mode: 0o700 })
+  box.write('applying', 0)
+  const guard = box.start()
+  const stderr = new Response(guard.stderr).text()
+  try {
+    const deadline = Date.now() + 5000
+    while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(5)
+    expect(existsSync(ready)).toBe(true)
+    const update = new SelfUpdate({ repo: box.repo, run: runCommand, bun: 'unused', guardInstalled: async () => true })
+    expect(await update.check()).toMatchObject({ kind: 'refused', reason: 'busy' })
+  } finally {
+    writeFileSync(finish, '')
+    await guard.exited
+  }
+  expect(await guard.exited, await stderr).toBe(0)
+  expect(box.read()).toContain('phase=rolled_back')
+  expect(statSync(join(box.repo, '.git', 'krotov-update.lock')).mode & 0o777).toBe(0o600)
+}, 15_000)
+
+test('[A5] boot guard descendants do not inherit the checkout lock', () => {
+  const realGit = Bun.which('git')
+  if (!realGit) throw new Error('Fixture needs git')
+  for (const stub of ['bun', 'git']) {
+    const box = checkout()
+    const pids = join(box.root, 'pids')
+    // A stub that leaves a background sleep behind (stdio detached), the way a daemonizing child would.
+    const leave = `sleep 5 </dev/null >/dev/null 2>&1 &\necho $! >> ${JSON.stringify(pids)}\n`
+    if (stub === 'bun') writeFileSync(join(box.bin, 'bun'), `#!/usr/bin/env bash\n${leave}exit 0\n`, { mode: 0o700 })
+    else writeFileSync(join(box.bin, 'git'), `#!/usr/bin/env bash\n${leave}exec ${JSON.stringify(realGit)} "$@"\n`, { mode: 0o700 })
+    box.write('applying', 0)
+    try {
+      const result = box.run()
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(box.read()).toContain('phase=rolled_back')
+      expect(readFileSync(pids, 'utf8').trim()).not.toBe('')
+      const lock = join(box.repo, '.git', 'krotov-update.lock')
+      expect(spawnSync('flock', ['-n', lock, 'true'], { timeout: 5000 }).status, stub).toBe(0)
+    } finally {
+      for (const pid of existsSync(pids) ? readFileSync(pids, 'utf8').split('\n').filter(Boolean) : []) {
+        try { process.kill(Number(pid)) } catch { /* already gone */ }
+      }
+    }
+  }
+})
+
+test('[A7] boot guard still recovers an interrupted apply when flock is missing', () => {
+  const box = checkout()
+  for (const command of ['bash', 'git', 'mv']) {
+    const path = Bun.which(command)
+    if (!path) throw new Error('Fixture needs ' + command)
+    symlinkSync(path, join(box.bin, command))
+  }
+  expect(Bun.which('flock', { PATH: box.bin })).toBeNull()
+  box.write('applying', 0)
+  const result = box.run(box.bin, join(box.bin, 'bash'))
+  expect(result.exitCode).toBe(0)
+  expect(result.stderr.toString()).toContain('flock missing, recovering without the update lock')
+  expect(git(box.repo, 'rev-parse', 'HEAD')).toBe(box.from)
+  expect(box.read()).toContain('phase=rolled_back')
+})
 
 test('[S9] boot guard: a trial boot that died without recording its exit gets a second try, the second such boot rolls back', () => {
   const box = checkout()
