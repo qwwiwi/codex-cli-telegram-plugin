@@ -12,7 +12,7 @@
 [![Platform: Linux, macOS](https://img.shields.io/badge/platform-Linux%2C%20macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#requirements)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#license-and-credits)
 
-**Releases:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · current v0.4.0 · [release notes](docs/releases/v0.4.0.md) · [v0.1.0 notes](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
+**Releases:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · current v0.6.0 · [release notes](docs/releases/v0.6.0.md) · [v0.1.0 notes](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
 
 ## Your own Codex agent in a private Telegram chat.
 

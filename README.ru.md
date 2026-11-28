@@ -10,7 +10,7 @@
 [![Platform: Linux, macOS](https://img.shields.io/badge/platform-Linux%2C%20macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#что-нужно)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#лицензия-и-авторы)
 
-**Релизы:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · текущая версия v0.4.0 · [заметки к релизу](docs/releases/v0.4.0.md) · [заметки к v0.1.0](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
+**Релизы:** [GitHub releases](https://github.com/qwwiwi/codex-cli-telegram-plugin/releases) · текущая версия v0.6.0 · [заметки к релизу](docs/releases/v0.6.0.md) · [заметки к v0.1.0](RELEASE_NOTES_v0.1.0.md) · [CHANGELOG.md](CHANGELOG.md)
 
 ## Свой агент Codex в личке Telegram.
 
