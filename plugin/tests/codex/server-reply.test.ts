@@ -18,9 +18,10 @@ import { renderPreview } from '../../src/codex/render-preview.js'
 import type { PartStatus } from '../../src/codex/reply-delivery.js'
 import { bridgeOrigin, mainOrigin, storedOrigin, type TurnOrigin } from '../../src/codex/turn-origin.js'
 import * as chunk from '../../src/format/chunk.js'
-import { splitMessageLegacy } from '../../src/format/chunk-legacy.js'
 import { isTelegramHtmlParseError, markdownToTelegramHtml } from '../../src/format/html.js'
-import { splitLongBlock, splitLongBlockLegacy } from '../../src/format/paragraphs.js'
+import { splitLongBlock } from '../../src/format/paragraphs.js'
+import * as visible from '../../src/format/visible.js'
+import * as replyPlan from '../../src/codex/reply-plan.js'
 import { createLogger } from '../../src/log.js'
 import { validateTelegramHtml } from '../../src/safety/html-validator.js'
 import { detectOpenQuestion } from '../../src/safety/open-question.js'
@@ -48,7 +49,7 @@ afterEach(() => {
   }
 })
 
-function readyReply(source: string, receipts: Record<string, PartStatus>, parts?: string[]) {
+function readyReply(source: string, receipts: Record<string, PartStatus>) {
   const dir = mkdtempSync(join(tmpdir(), 'krot-server-reply-test-'))
   dirs.push(dir)
   const inbox = new CodexInbox(dir, owner)
@@ -57,7 +58,6 @@ function readyReply(source: string, receipts: Record<string, PartStatus>, parts?
   inbox.take()
   inbox.complete(id, { text: source, files: [] })
   for (const [key, state] of Object.entries(receipts)) inbox.setReplyPart(id, key, state)
-  if (parts) inbox.setReplyPlan(id, parts)
   return { dir, inbox }
 }
 
@@ -78,7 +78,8 @@ const bindReplies = new Function('dependencies', new Bun.Transpiler({ loader: 't
     redactedRenderOffset, resumeMessagePlan, protectPlainFallbackCuts, TELEGRAM_MAX_MESSAGE, PreformattedDocumentError,
     // keepShownSecretsWhole: its name in older sources, bound for red-then-green runs against them.
     maskShownSecrets, keepShownSecretsWhole, maskAcrossCuts, maskedPlainFallback, telegramTextLength, shownSent, MaskedOverflowError,
-    join, tmpdir, mkdtemp, writeFile, unlink, rmdir, ownerChat, outbox, parse429, detectOpenQuestion, renderEyes
+    join, tmpdir, mkdtemp, writeFile, unlink, rmdir, ownerChat, outbox, parse429, detectOpenQuestion, renderEyes,
+    mask, render, cut, visibleToHtml, replyPieces, joinPieces, newPlan, nextPiece, planPieces, textBefore
   } = dependencies
   const sendsAsRich = () => false
   const config = { richMessages: { enabled: false } }
@@ -88,7 +89,6 @@ const bindReplies = new Function('dependencies', new Bun.Transpiler({ loader: 't
   const agentChat = { remember: () => {} }
   const withoutDeletedQuote = (send: (id?: number) => Promise<unknown>, id?: number) => send(id)
   ${section(receipts, 'export async function deliverReplyPart', '/** The richMessages').replace('export ', '')}
-  ${section(receipts, 'export function plannedTextParts').replace('export ', '')}
   ${section(server, '  async function sendTextDocument(', '  let onDeferredDelivery:')}
   ${section(server, '    async function sendFinalText(', '    const actionApi =')}
   const { sendReply } = {
@@ -132,136 +132,15 @@ function delivery(inbox: CodexInbox, secrets: readonly string[], telegram: Parti
   warn: (message: string) => void = () => {}, outbox?: Outbox, renderEyes = new RenderEyes({ secrets })): ReplyCallbacks {
   const replies: unknown = bindReplies({ inbox, secrets, telegram, log: { warn }, ownerChat: String(owner), ...chunk,
     classifySendError, redactOutboundText, redactSecrets, markdownToTelegramHtml, isTelegramHtmlParseError,
-    normalizeChatReply, validateTelegramHtml, splitLongBlock, splitLongBlockLegacy, splitMessageLegacy,
+    normalizeChatReply, validateTelegramHtml, splitLongBlock, ...visible, ...replyPlan,
     join, tmpdir, mkdtemp, writeFile, unlink, rmdir, outbox, parse429, detectOpenQuestion, renderEyes, shownSent,
     MaskedOverflowError: Reflect.get(preSendErrors, 'MaskedOverflowError') })
   if (!hasReplyCallbacks(replies)) throw new Error('Could not bind reply callbacks')
   return replies
 }
 
-test('legacy resume sends no fragments of secrets formatted as strikeout or inline code', async () => {
-  const strike = 'stub~~violet~~plum'
-  const code = 'mint`amber`cobalt'
-  const prefix = 'ф'.repeat(4000 - markdownToTelegramHtml(strike).length - 1) + strike + ' '
-  const source = prefix + `keep ${strike} and ` + 'з'.repeat(4100) + ` ${code} end`
-  const original = markdownToTelegramHtml(source)
-  const cut = splitMessageLegacy(original).ends[0]!
-  const sent: string[] = []
-  const { inbox } = readyReply(source, { rich: 'fallback', 'text:0': 'sent' })
-  await delivery(inbox, [strike, code], {
-    async sendMessage(_chat, text) { sent.push(text); return { message_id: 51 } },
-  }).sendFinalText(source, origin, false, id, id)
-  expect(sent).toHaveLength(2)
-  for (const part of sent) expect(/stub|violet|plum|mint|amber|cobalt/.test(part)).toBe(false)
-  const visible = chunk.htmlToPlainText(original.slice(cut))
-  expect(sent.join('')).toBe(visible.replace('stubvioletplum', '[REDACTED]').replace('mintambercobalt', '[REDACTED]'))
-})
-
-const tailMarker = 'unsent tail marker'
-const repeatedValue = 'ж'.repeat(35)
-// Redacting the single long value also removes the delimiter that opens the rendered bold span before the cut.
-const longValue = 'ж'.repeat(598) + '**'
-test.each([
-  ['15 matches of a 35-character value', repeatedValue,
-    'opening ' + (repeatedValue + ' ').repeat(14) + 'ф'.repeat(4200) + ` ${tailMarker} ${repeatedValue}`],
-  ['one 600-character value', longValue, 'opening **' + 'ф'.repeat(4200) + ` ${tailMarker} ${longValue}`],
-])('legacy resume keeps the unsent tail when redacting %s', async (_label, value, source) => {
-  const original = markdownToTelegramHtml(splitLongBlockLegacy(normalizeChatReply(source)))
-  const { chunks } = splitMessageLegacy(original)
-  expect(chunks).toHaveLength(2)
-  expect(chunks[0]).not.toContain(tailMarker)
-  expect(chunks[1]).toContain(tailMarker)
-
-  const { dir } = readyReply(source, { rich: 'fallback', 'text:0': 'sent' })
-  const inbox = new CodexInbox(dir, owner)
-  expect(inbox.replyPlan(id)).toBeUndefined()
-  const sent: string[] = []
-  await delivery(inbox, [value], {
-    async sendMessage(_chat, text) { sent.push(text); return { message_id: 51 } },
-  }).sendFinalText(source, origin, false, id, id)
-
-  expect(sent.join('')).toContain(tailMarker)
-  expect(sent.join('')).not.toContain('ж')
-})
-
-test.each([
-  ['malformed JSON', encodeURIComponent('{')],
-  ['malformed URI encoding', '%'],
-  ['invalid JSON shape', 'null'],
-])('plain fallback recomputes saved pieces and warns once for %s', async (_label, encoded) => {
-  const source = '<b>pending plain</b>'
-  const parts = ['already delivered', source]
-  const { dir, inbox } = readyReply(source, { rich: 'fallback', 'text:0': 'sent' },
-    [...parts, `<u data-plain-fallbacks="${encoded}"></u>`])
-  const warnings: string[] = []
-  const warn = (message: string) => { warnings.push(message) }
-  const sent: string[] = []
-  let offline = true
-  const sendMessage = async (_chat: string, text: string, opts: SendMessageOpts) => {
-    if (offline) throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' })
-    if (opts.parse_mode === 'HTML') throw new Error("can't parse entities")
-    sent.push(text)
-    return { message_id: 51 }
-  }
-
-  await expect(delivery(inbox, [], { sendMessage }, warn).sendFinalText(source, origin, false, id, id)).rejects.toThrow('offline')
-  offline = false
-  const reloaded = new CodexInbox(dir, owner)
-  await delivery(reloaded, [], { sendMessage }, warn).sendFinalText(source, origin, false, id, id)
-
-  expect(sent).toEqual(['pending plain'])
-  expect(reloaded.replyPart(id, 'text:1:plain:0')).toBe('sent')
-  expect(warnings).toHaveLength(1)
-})
-
-test('plain fallback resumes at its saved cut after configured redactions change', async () => {
-  const source = '<a href="file:///' + 'д'.repeat(4400) + '">short</a> suffix'
-  const firstPlan = chunk.splitPlainFallback(source)
-  expect(firstPlan).toHaveLength(2)
-  const { dir, inbox } = readyReply(source, { rich: 'fallback' }, [source])
-  const sent: string[] = []
-  let offline = true
-  const sendMessage = async (_chat: string, text: string, opts: SendMessageOpts) => {
-    expect(opts.parse_mode).toBeUndefined()
-    if (sent.length === 1 && offline) {
-      throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' })
-    }
-    sent.push(text)
-    return { message_id: 50 + sent.length }
-  }
-  await expect(delivery(inbox, [], { sendMessage }).sendFinalText(source, origin, false, id, id)).rejects.toThrow('offline')
-  expect(sent).toEqual(firstPlan.slice(0, 1))
-  offline = false
-  const reloaded = new CodexInbox(dir, owner)
-  await delivery(reloaded, ['short'], { sendMessage }).sendFinalText(source, origin, false, id, id)
-  expect(sent[1]?.length).toBe(firstPlan[1]?.length)
-  expect(sent).toEqual(firstPlan)
-})
-
-test('plain fallback masks the unsent fragment of a newly configured secret at a saved cut', async () => {
-  const before = 'д'.repeat(4096 - 'label (file:///'.length - 'anchor'.length)
-  const after = 'я'.repeat(400)
-  const source = `<a href="file:///${before}anchorpiece${after}">label</a> suffix`
-  const { dir, inbox } = readyReply(source, { rich: 'fallback' }, [source])
-  const sent: string[] = []
-  await expect(delivery(inbox, [], {
-    async sendMessage(_chat, text) {
-      if (sent.length > 0) throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' })
-      sent.push(text)
-      return { message_id: 51 }
-    },
-  }).sendFinalText(source, origin, false, id, id)).rejects.toThrow('offline')
-  expect(sent[0]?.endsWith('anchor')).toBe(true)
-  const reloaded = new CodexInbox(dir, owner)
-  await delivery(reloaded, ['anchorpiece'], {
-    async sendMessage(_chat, text) { sent.push(text); return { message_id: 52 } },
-  }).sendFinalText(source, origin, false, id, id)
-  expect(sent[1]?.startsWith('piece')).toBe(false)
-  expect(sent[1]).toBe(after + ') suffix')
-})
-
-test('a flooded plain fallback preserves guest origin and completes Brain only on its last piece', async () => {
-  const prefix = 'word '.repeat(780).trimEnd()
+test('a flooded multi-piece reply preserves guest origin and completes Brain only on its last piece', async () => {
+  const prefix = 'word '.repeat(1000).trimEnd()
   const url = 'https://example.com/' + 'x'.repeat(220)
   const source = prefix + ' [read](' + url + ')'
   const { dir, inbox } = readyReply(source, {})
@@ -275,18 +154,20 @@ test('a flooded plain fallback preserves guest origin and completes Brain only o
     onDelivered: item => { delivered.push(item.brainKey) },
   })
   const reply = delivery(inbox, [], {
-    async sendMessage(_chat, _text, options) {
-      if (options.parse_mode === 'HTML') throw new Error("can't parse entities")
-      throw { error_code: 429, parameters: { retry_after: 5 } }
-    },
+    async sendMessage() { throw { error_code: 429, parameters: { retry_after: 5 } } },
   }, undefined, open())
   expect(await reply.sendFinalText(source, guest, false, id, undefined, undefined, brainKey)).toBe(true)
   const reloaded = open()
   const items = reloaded.snapshot()
-  expect(items.map(item => item.origin)).toEqual([storedOrigin(guest), storedOrigin(guest)])
-  expect(items.map(item => item.opts)).toEqual([{ ownerReply: true, reply_to_message_id: id }, { ownerReply: true }])
+  // One item per reply (outbox v3): its masked shown text, cut into two pieces.
+  expect(items.map(item => item.origin)).toEqual([storedOrigin(guest)])
+  expect(items.map(item => item.opts.reply_to_message_id)).toEqual([id])
+  expect(items.map(item => item.plan.cuts.length)).toEqual([2])
+  expect(items.every(item => item.opts.parse_mode === undefined)).toBe(true)
+  // The link travels as an entity beside its label.
+  expect(items[0]?.plan.entities).toEqual([{ type: 'text_link', offset: prefix.length + 1, length: 4, url }])
   await reloaded.flushDue(5_000)
-  expect(sent.join('')).toBe(prefix + ' read (' + url + ')')
+  expect(sent.join('')).toBe(prefix + ' read')
   expect(delivered).toEqual([undefined, brainKey])
 })
 
@@ -449,21 +330,17 @@ test('[R42] a clean final reply leaves no note and no render warning', async () 
   } finally { cleanup() }
 })
 
-test('[R42] an interim reply is recorded in the format and text the outbound sanitizer delivered', async () => {
+test('[R42] an interim reply is recorded as the shown text and formatting the safe wrapper sent', async () => {
   const eyes = new RenderEyes({ secrets: [] })
   const source = '<b class="demo">Example</b>'
-  // The premise: the rendered HTML fails the pre-send validator, so the safe wrapper sends it without parse_mode.
-  expect(validateTelegramHtml(markdownToTelegramHtml(source)).downgraded).toBe(true)
   const { inbox } = readyReply(source, {})
   const chat = fakeTelegramChat()
   const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
   const safe = createSafeTelegramApi(chat.raw, createLogger('test', { stream: quiet }), [])
   const { messageId } = await delivery(inbox, [], safe, undefined, undefined, eyes).sendReply(source)
   expect(chat.texts()).toEqual(['Example'])
-  // Recorded as what the owner got: plain «Example», a refused HTML part, not the HTML the wrapper was handed.
-  expect(eyes.shown(messageId)).toEqual({ format: 'plain', text: 'Example', messageId })
-  expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [messageId], formats: ['plain'],
-    degradations: [{ kind: 'broken_tags', code: 'html_refused' }] })])
+  expect(eyes.shown(messageId)).toEqual({ format: 'HTML', text: '<b>Example</b>', messageId })
+  expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [messageId], formats: ['HTML'], degradations: [] })])
 })
 
 test('[R42] a reply deferred by a flood wait is recorded when the outbox delivers it, with its message ID', async () => {
@@ -484,52 +361,25 @@ test('[R42] a reply deferred by a flood wait is recorded when the outbox deliver
   await outbox.flushDue(5_000)
   expect(flushed).toHaveLength(1)
   expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [77], formats: ['HTML'], degradations: [] })])
-  const [sentText] = flushed
-  if (typeof sentText !== 'string') throw new Error('The outbox did not send the deferred reply')
-  expect(eyes.shown(77)).toEqual({ format: 'HTML', text: sentText, messageId: 77 })
+  expect(flushed).toEqual(['Итог: готово.'])
+  expect(eyes.shown(77)).toEqual({ format: 'HTML', text: 'Итог: <b>готово</b>.', messageId: 77 })
 })
 
-test('[R42] identical queued replies keep their own diff when the degraded item is dropped', async () => {
-  const eyes = new RenderEyes({})
-  const source = 'Same reply'
+test('a deferred reply of two pieces is recorded once, after its last piece, with both message IDs', async () => {
+  const eyes = new RenderEyes({ secrets: [] })
+  const source = 'слово '.repeat(800).trimEnd() + '\n\nИтог: **готово**.'
   const { dir, inbox } = readyReply(source, {})
-  const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
   let replies: ReplyCallbacks | undefined
-  const outbox = new Outbox({ stateDir: dir, log: createLogger('test', { stream: quiet }),
-    now: () => 0, maxItems: 1, sendFn: async () => ({ message_id: 78 }),
+  let next = 80
+  const outbox = new Outbox({ stateDir: dir, log: createLogger('test'), now: () => 0,
+    sendFn: async () => ({ message_id: next++ }),
     onDelivered: (item, messageId, sent) => replies?.onDeferredDelivery(item, messageId, sent) })
-  let refuseHtml = true
-  replies = delivery(inbox, [], { async sendMessage(_chat, _text, options) {
-    if (refuseHtml && options.parse_mode === 'HTML') throw new Error("can't parse entities")
-    throw { error_code: 429, parameters: { retry_after: 5 } }
-  } }, undefined, outbox, eyes)
+  replies = delivery(inbox, [], { async sendMessage() { throw { error_code: 429, parameters: { retry_after: 5 } } } },
+    undefined, outbox, eyes)
   expect(await replies.sendFinalText(source, origin, false, id)).toBe(true)
-  expect(outbox.snapshot()).toMatchObject([{ text: source }])
-  expect(outbox.snapshot()[0]?.opts.parse_mode).toBeUndefined()
-  const firstId = outbox.snapshot()[0]?.id
-  refuseHtml = false
-  expect(await replies.sendFinalText(source, origin, false, id)).toBe(true)
-  expect(outbox.snapshot()).toMatchObject([{ text: source, opts: { parse_mode: 'HTML' } }])
-  expect(outbox.snapshot()[0]?.id).not.toBe(firstId)
+  expect(outbox.snapshot().map(item => item.plan.cuts.length)).toEqual([2])
   await outbox.flushDue(5_000)
-  expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [78], formats: ['HTML'], degradations: [] })])
-  expect(eyes.shown(78)).toEqual({ format: 'HTML', text: source, messageId: 78 })
-  expect(eyes.takeNote()).toBe('')
-})
-
-test('[R42] a direct plain fallback sends and records the masked text when plain conversion exposes a token', async () => {
-  const value = 'mock-value-123'
-  const source = '<a href="file:///tmp/x">link</a> Bearer **' + value + '**'
-  const eyes = new RenderEyes({})
-  const { inbox } = readyReply(source, {})
-  const sent: string[] = []
-  await delivery(inbox, [], { async sendMessage(_chat, text, options) {
-    expect(options.parse_mode).toBeUndefined()
-    sent.push(text)
-    return { message_id: 61 }
-  } }, undefined, undefined, eyes).sendFinalText(source, origin, false, id)
-  expect(sent).toEqual(['link (file:///tmp/x) Bearer [REDACTED]'])
-  expect(eyes.shown(61)).toEqual({ format: 'plain', text: 'link (file:///tmp/x) Bearer [REDACTED]', messageId: 61 })
+  expect(eyes.recent()).toEqual([expect.objectContaining({ messageIds: [80, 81], formats: ['HTML', 'HTML'] })])
 })
 
 test('[R42] a deferred document is recorded with the body the outbox uploaded', async () => {
@@ -569,41 +419,16 @@ test('[R42] a deferred document is recorded with the body the outbox uploaded', 
   expect(eyes.shown(81)?.format).toBe('document')
 })
 
-test('[R42] a resumed plain piece that grows past the message limit is recorded as the uploaded document', async () => {
-  const before = 'д'.repeat(4096 - 'label (file:///'.length - 'anchor'.length)
-  const after = 'я'.repeat(400)
-  const source = `<a href="file:///${before}anchorpiece${after}">label</a> suffix`
-  const { dir, inbox } = readyReply(source, { rich: 'fallback' }, [source])
-  await expect(delivery(inbox, [], {
-    async sendMessage() { throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' }) },
-  }).sendFinalText(source, origin, false, id, id)).rejects.toThrow('offline')
-  const eyes = new RenderEyes({})
-  const uploads: string[] = []
-  const reloaded = new CodexInbox(dir, owner)
-  // The new secret crosses the saved cut: protecting it moves its tail into the first piece, past 4096 characters.
-  await delivery(reloaded, ['anchorpiece'], {
-    async sendMessage() { return { message_id: 92 } },
-    async sendDocument(_chat, file) {
-      uploads.push(readFileSync(file, 'utf8'))
-      return { message_id: 91 }
-    },
-  }, undefined, undefined, eyes).sendFinalText(source, origin, false, id, id)
-  expect(uploads).toHaveLength(1)
-  const [upload] = uploads
-  if (upload === undefined) throw new Error('Missing document upload')
-  expect(eyes.shown(91)?.format).toBe('document')
-  expect(eyes.shown(91)?.text === upload).toBe(true)
-  expect(eyes.recent()[0]?.formats).toEqual(['document', 'plain'])
-})
-
 test('[R42] a transport rejection reaches the caller before the eyes write their journal line and history', async () => {
   const { eyes, journaled, history, cleanup } = eyesFixture()
   try {
-    const source = 'Итог **важно**'
+    // The owner sees `&amp;` raw in the first piece (a degradation the eyes record); the second piece fails.
+    const source = 'Итог: Tom &amp; Jerry.\n\n' + 'слово '.repeat(800).trimEnd()
     const { inbox } = readyReply(source, {})
-    const reply = delivery(inbox, [], { async sendMessage(_chat, _text, options) {
-      // Telegram refuses the HTML, then the plain fallback hits a transport failure.
-      if (options.parse_mode === 'HTML') throw new Error("can't parse entities")
+    let calls = 0
+    const reply = delivery(inbox, [], { async sendMessage() {
+      calls += 1
+      if (calls === 1) return { message_id: 120 }
       throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' })
     } }, undefined, undefined, eyes)
     let atCaller: { error: string; journal: number; history: boolean } | undefined
@@ -613,9 +438,9 @@ test('[R42] a transport rejection reaches the caller before the eyes write their
     // No fsync of the journal or the history ran between the failure and its caller.
     expect(atCaller).toEqual({ error: 'Error: offline', journal: 0, history: false })
     // The diff itself is in memory at once (the next turn's note does not wait for the disk).
-    expect(eyes.recent()).toEqual([expect.objectContaining({ degradations: [{ kind: 'broken_tags', code: 'html_refused' }] })])
+    expect(eyes.recent()).toEqual([expect.objectContaining({ degradations: [expect.objectContaining({ kind: 'raw_markup' })] })])
     await diagnosticsWritten()
-    expect(journaled()).toEqual([expect.objectContaining({ level: 'warn', area: 'render', status: 'broken_tags' })])
+    expect(journaled()).toEqual([expect.objectContaining({ level: 'warn', area: 'render', status: 'raw_markup' })])
     expect(existsSync(history)).toBe(true)
   } finally { cleanup() }
 })
@@ -628,12 +453,15 @@ function safeRecordingTelegram(secrets: readonly string[], options: { flood?: ()
   const raw: TelegramApi = {
     async sendMessage(_chat, text, opts) {
       if (options.flood?.()) throw { error_code: 429, parameters: { retry_after: 5 } }
-      if (opts.parse_mode === 'HTML' && validateTelegramHtml(text).downgraded) throw new Error("can't parse entities")
+      // The wire carries the shown text and entities, never markup.
+      expect(opts.parse_mode).toBeUndefined()
       // Telegram's limit, counted on what it shows: a longer message is refused for good.
-      const shown = opts.parse_mode === 'HTML' ? chunk.htmlToPlainText(text) : text
-      if (shown.length > chunk.TELEGRAM_MAX_MESSAGE) throw { error_code: 400, description: 'Bad Request: message is too long' }
+      if (text.length > chunk.TELEGRAM_MAX_MESSAGE) throw { error_code: 400, description: 'Bad Request: message is too long' }
       next += 1
-      messages.push({ id: next, text, format: opts.parse_mode === 'HTML' ? 'HTML' : 'plain' })
+      const entities = opts.entities ?? []
+      messages.push(entities.length > 0
+        ? { id: next, text: visible.visibleToHtml({ text, entities }), format: 'HTML' }
+        : { id: next, text, format: 'plain' })
       return { message_id: next }
     },
     async sendDocument(_chat, file) {
@@ -649,27 +477,6 @@ function safeRecordingTelegram(secrets: readonly string[], options: { flood?: ()
   const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
   return { messages, safe: createSafeTelegramApi(raw, createLogger('test', { stream: quiet }), secrets) }
 }
-
-// A raw HTML file link forces the plain fallback, where the cut separates `Bearer` from its bold value.
-const bearerValue = 'Zq7Kp2Wm9X'
-const straddlingBearer = '<a href="file:///' + 'д'.repeat(4073) + '">x</a> Bearer **' + bearerValue + '**'
-
-test.each([
-  ['a direct send', undefined],
-  ['a planned send', id],
-])('[R42] %s of a plain fallback masks a token split from its prefix by the cut, sent and recorded', async (_label, planned) => {
-  const eyes = new RenderEyes({})
-  const { inbox } = readyReply(straddlingBearer, {})
-  const { messages, safe } = safeRecordingTelegram([])
-  await delivery(inbox, [], safe, undefined, undefined, eyes).sendFinalText(straddlingBearer, origin, false, id, planned)
-  expect(messages.length).toBeGreaterThan(1)
-  // A hard cut inside the value leaves no part whole in one message: check the messages joined, too.
-  expect(messages.map(message => message.text).join('').includes(bearerValue)).toBe(false)
-  for (const message of messages) {
-    expect(message.text.includes(bearerValue)).toBe(false)
-    expect(eyes.shown(message.id)).toEqual({ format: message.format, text: message.text, messageId: message.id })
-  }
-})
 
 test('[R42] a deferred plain text is recorded with the text the outbox actually sent', async () => {
   const eyes = new RenderEyes({})
@@ -696,6 +503,9 @@ test('[R42] a deferred plain text is recorded with the text the outbox actually 
   expect(message.text.includes(value)).toBe(false)
   expect(eyes.shown(message.id)).toEqual({ format: message.format, text: message.text, messageId: message.id })
 })
+
+// H-a: `Bearer` and its bold value land on either side of a cut.
+const bearerValue = 'Zq7Kp2Wm9X'
 
 // Synthetic secrets at every offset around each cut: a registered value and a pattern token behind its prefix.
 const registered = 'Kv9-registered-77'
@@ -746,7 +556,7 @@ const splitMaskme = 'MA**SK**ME'
 test.each([
   ['a direct send', undefined],
   ['a planned send', id],
-])('[R42] %s whose shown secret grows past the limit once masked goes as split plain text', async (_label, planned) => {
+])('[R42] %s whose shown secret grows past the limit once masked is cut after masking', async (_label, planned) => {
   // 4,090 + 6 shown characters: within the limit before masking, 4,100 once MASKME reads [REDACTED].
   const source = '!'.repeat(4090) + splitMaskme
   expect(chunk.htmlToPlainText(markdownToTelegramHtml(source))).toHaveLength(chunk.TELEGRAM_MAX_MESSAGE)
@@ -761,23 +571,7 @@ test.each([
   for (const message of messages) {
     expect(eyes.shown(message.id)).toEqual({ format: message.format, text: message.text, messageId: message.id })
   }
-  if (planned !== undefined) expect(inbox.replyPart(id, 'text:0')).toBe('fallback')
-})
-
-test('[R42] a saved HTML part that masking grows past the limit goes as split plain text, not a refused send', async () => {
-  // A plan saved before shown-text masking: the wrapper masks MASKME and the plain text outgrows the message limit.
-  const part = '!'.repeat(4090) + 'MA<b>SK</b>ME'
-  expect(chunk.telegramTextLength(part)).toBe(chunk.TELEGRAM_MAX_MESSAGE)
-  const eyes = new RenderEyes({})
-  const { inbox } = readyReply('ignored', { rich: 'fallback' }, [part])
-  const { messages, safe } = safeRecordingTelegram([maskme])
-  await delivery(inbox, [maskme], safe, undefined, undefined, eyes).sendFinalText('ignored', origin, false, id, id)
-  expect(inbox.replyPart(id, 'text:0')).toBe('fallback')
-  expect(messages.map(message => message.text).join('')).toBe('!'.repeat(4090) + '[REDACTED]')
-  for (const message of messages) {
-    expect(message.format).toBe('plain')
-    expect(eyes.shown(message.id)).toEqual({ format: message.format, text: message.text, messageId: message.id })
-  }
+  if (planned !== undefined) expect(inbox.replyPart(id, 'text:0')).toBe('sent')
 })
 
 test('[R42] a fresh reply plan never persists a secret the shown text joins', async () => {
@@ -785,9 +579,9 @@ test('[R42] a fresh reply plan never persists a secret the shown text joins', as
   const { dir, inbox } = readyReply(source, {})
   const { messages, safe } = safeRecordingTelegram([maskme])
   await delivery(inbox, [maskme], safe).sendFinalText(source, origin, false, id, id)
-  const plan = new CodexInbox(dir, owner).replyPlan(id) ?? []
-  expect(plan.length).toBeGreaterThan(0)
-  for (const part of plan) expect(chunk.htmlToPlainText(part).includes(maskme)).toBe(false)
+  const plan = new CodexInbox(dir, owner).replyPlan(id)
+  expect(plan?.text).toBe('Ключ [REDACTED] тут')
+  expect(readFileSync(join(dir, 'codex-inbox.json'), 'utf8').includes(maskme)).toBe(false)
   expect(messages.map(message => message.text)).toEqual(['Ключ [REDACTED] тут'])
 })
 
@@ -800,41 +594,115 @@ test('[R42] a flooded HTML reply never queues a secret the shown text joins', as
   const { safe } = safeRecordingTelegram([maskme], { flood: () => true })
   expect(await delivery(inbox, [maskme], safe, undefined, outbox).sendFinalText(source, origin, false, id)).toBe(true)
   expect(outbox.snapshot().length).toBeGreaterThan(0)
-  for (const item of outbox.snapshot()) expect(chunk.htmlToPlainText(item.text).includes(maskme)).toBe(false)
+  for (const item of outbox.snapshot()) expect(item.plan.text.includes(maskme)).toBe(false)
   expect(readFileSync(join(dir, 'outbox.json'), 'utf8').includes('MA<b>SK</b>ME')).toBe(false)
 })
 
-test('[R42] a resumed plain fallback masks a pattern token across the saved cut it already sent', async () => {
-  // The saved part fails the validator, so it goes as plain text; its plain cut lands inside the Bearer value.
-  const part = '<b class="demo">x</b>' + 'а'.repeat(4084) + ' Bearer <b>' + bearerValue + '</b>'
-  const pieces = chunk.splitPlainFallback(part)
-  expect(pieces).toHaveLength(2)
-  expect(pieces[0]!.endsWith('Bearer Zq7')).toBe(true)
-  const { inbox } = readyReply('ignored', { rich: 'fallback', 'text:0': 'fallback', 'text:0:plain:0': 'sent' }, [part])
-  const { messages, safe } = safeRecordingTelegram([])
-  await delivery(inbox, [], safe).sendFinalText('ignored', origin, false, id, id)
-  expect(inbox.replyPart(id, 'text:0:plain:1')).toBe('sent')
-  expect(messages).toHaveLength(1)
-  for (const fragment of ['Kp2', 'Wm9X']) expect(messages[0]!.text.includes(fragment)).toBe(false)
-})
-
-test('[R42] an agent edit of a Rich Message goes through the safe wrapper and updates its preview', async () => {
+test('[R42] an agent edit of a Rich Message goes through the safe wrapper as a text edit and updates its preview', async () => {
   const eyes = new RenderEyes({})
   eyes.record({ source: 'old', parts: [{ format: 'rich', text: 'old', messageId: 70 }] })
   const edits: string[] = []
   const unused = async (): Promise<never> => { throw new Error('not used') }
   const raw: TelegramApi = {
-    sendMessage: unused, sendRichMessage: unused, sendWidget: unused, editMessageText: unused,
+    sendMessage: unused, sendRichMessage: unused, sendWidget: unused,
+    async editMessageText(_chat, _id, text) { edits.push(text) },
     setMessageReaction: unused, sendChatAction: unused, sendDocument: unused, sendPhoto: unused,
-    downloadFile: unused, deleteMessage: unused, answerGuestQuery: unused,
-    async editRichMessage(_chat, _id, markdown) { edits.push(markdown); return {} },
+    downloadFile: unused, deleteMessage: unused, answerGuestQuery: unused, editRichMessage: unused,
   }
   const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
   const safe = createSafeTelegramApi(raw, createLogger('test', { stream: quiet }), [maskme])
   const { inbox } = readyReply('x', {})
-  await delivery(inbox, [maskme], safe, undefined, undefined, eyes).editRich(70, '| a |\n|---|\n| ' + maskme + ' |')
-  expect(edits).toEqual(['| a |\n|---|\n| [REDACTED] |'])
-  expect(eyes.shown(70)).toEqual({ format: 'rich', text: '| a |\n|---|\n| [REDACTED] |', messageId: 70 })
+  await delivery(inbox, [maskme], safe, undefined, undefined, eyes).editRich(70, '| a |\n|---|\n| ' + maskme + ' |\n')
+  // Rich messages have no text + entities form: the table goes as its aligned monospace text.
+  expect(edits).toEqual(['a\n[REDACTED]'])
+  expect(eyes.shown(70)).toEqual({ format: 'HTML', text: '<pre>a\n[REDACTED]</pre>', messageId: 70 })
+})
+
+test('[v3 plan] a value registered between two pieces: piece 0 is not resent, the next starts with the marker', async () => {
+  const head = 'а'.repeat(3998)
+  const source = head + 'MASKME tail of the reply'
+  const { dir, inbox } = readyReply(source, {})
+  const secrets: string[] = []
+  const sent: { text: string; entities: unknown }[] = []
+  let offline = false
+  const raw: Partial<TelegramApi> = {
+    async sendMessage(_chat, text, opts) {
+      if (offline) throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' })
+      sent.push({ text, entities: opts.entities })
+      // Piece 0 lands, then the bridge stops before piece 1.
+      offline = true
+      return { message_id: 400 + sent.length }
+    },
+  }
+  const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
+  const safeOver = (api: Partial<TelegramApi>): TelegramApi => createSafeTelegramApi({
+    ...fakeTelegramChat().raw, ...api }, createLogger('test', { stream: quiet }), secrets)
+  await expect(delivery(inbox, secrets, safeOver(raw)).sendFinalText(source, origin, false, id, id)).rejects.toThrow('offline')
+  expect(sent.map(message => message.text)).toEqual([head + 'MA'])
+  // The value is registered while the bridge is stopped; then it restarts.
+  secrets.push('MASKME')
+  offline = false
+  const resent: string[] = []
+  const reloaded = new CodexInbox(dir, owner)
+  await delivery(reloaded, secrets, safeOver({
+    async sendMessage(_chat, text) { resent.push(text); return { message_id: 500 } },
+  })).sendFinalText(source, origin, false, id, id)
+  expect(resent).toEqual(['[REDACTED] tail of the reply'])
+  expect(reloaded.replyPart(id, 'text:0')).toBe('sent')
+  expect(reloaded.replyPart(id, 'text:1')).toBe('sent')
+  const saved = readFileSync(join(dir, 'codex-inbox.json'), 'utf8')
+  expect(saved.includes('SKME')).toBe(false)
+  expect(saved.includes('[REDACTED] tail of the reply')).toBe(true)
+})
+
+// S2: the run that is sending the reply registers the value after piece 0 landed, with no restart in between.
+for (const withInbox of [true, false]) {
+  test(`[S2] a value registered between two pieces of one run is masked across the cut (${withInbox ? 'inbox' : 'no inbox'})`, async () => {
+    const head = 'а'.repeat(3998)
+    const source = head + 'MASKME tail of the reply'
+    const { inbox } = readyReply(source, {})
+    const secrets: string[] = []
+    const sent: string[] = []
+    const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
+    const safe = createSafeTelegramApi({ ...fakeTelegramChat().raw,
+      async sendMessage(_chat, text) {
+        sent.push(text)
+        if (!secrets.includes(maskme)) secrets.push(maskme)
+        return { message_id: 700 + sent.length }
+      },
+    }, createLogger('test', { stream: quiet }), secrets)
+    await delivery(inbox, secrets, safe).sendFinalText(source, origin, false, id, withInbox ? id : undefined)
+    expect(sent).toEqual([head + 'MA', '[REDACTED] tail of the reply'])
+    if (withInbox) {
+      expect(inbox.replyPart(id, 'text:1')).toBe('sent')
+      expect(JSON.stringify(inbox.replyPlan(id))).not.toContain('SKME')
+    }
+  })
+}
+
+test('[v3 plan] a 400 on the entities sends the same text once more without them, under one receipt', async () => {
+  const source = '**Итог** готово'
+  const { inbox } = readyReply(source, {})
+  const calls: { text: string; entities: unknown }[] = []
+  const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
+  const safe = createSafeTelegramApi({ ...fakeTelegramChat().raw,
+    async sendMessage(_chat, text, opts) {
+      calls.push({ text, entities: opts.entities })
+      if ((opts.entities ?? []).length > 0) {
+        throw Object.assign(new Error("Bad Request: can't parse entities: unsupported entity"),
+          { error_code: 400, description: "Bad Request: can't parse entities: unsupported entity" })
+      }
+      return { message_id: 610 }
+    },
+  }, createLogger('test', { stream: quiet }), [])
+  await delivery(inbox, [], safe).sendFinalText(source, origin, false, id, id)
+  expect(calls).toEqual([
+    { text: 'Итог готово', entities: [{ type: 'bold', offset: 0, length: 4 }] },
+    { text: 'Итог готово', entities: [] },
+  ])
+  expect(inbox.replyPart(id, 'text:0')).toBe('sent')
+  expect(inbox.replyPart(id, 'text:0:plain:0')).toBeUndefined()
+  expect(inbox.replyPart(id, 'text:1')).toBeUndefined()
 })
 
 test('the key spike sends its fixed texts through the safe wrapper', async () => {
@@ -869,4 +737,42 @@ test('[R42] a rich send reports the redacted Markdown it sent', async () => {
   const result = await safe.sendRichMessage(String(owner), 'Ключ ' + maskme, {})
   expect(bodies).toEqual(['Ключ [REDACTED]'])
   expect(result).toEqual({ message_id: 71, sent: { text: 'Ключ [REDACTED]', format: 'rich' } })
+})
+
+test('[C1] a flood after the first piece hands the whole plan and its sent count to the outbox, which masks across the cut', async () => {
+  // No line break: the message limit cuts the value itself, after `MA`.
+  const source = 'з'.repeat(3998) + maskme + ' конец'
+  const { dir, inbox } = readyReply(source, {})
+  const secrets: string[] = []
+  const quiet = new Writable({ write(_chunk, _encoding, done) { done() } })
+  const direct: string[] = []
+  const telegram: Partial<TelegramApi> = {
+    async sendMessage(_chat, text) {
+      if (direct.length === 1) throw { error_code: 429, parameters: { retry_after: 5 } }
+      direct.push(text)
+      return { message_id: 60 + direct.length }
+    },
+  }
+  const flushed: { text: string; opts: SendMessageOpts }[] = []
+  const delivered: (string | undefined)[] = []
+  // A raw transport behind the outbox: whatever it sends, the outbox masked itself.
+  const open = (): Outbox => new Outbox({ stateDir: dir, log: createLogger('test', { stream: quiet }), now: () => 0,
+    secrets, sendFn: async (_chat, text, opts) => { flushed.push({ text, opts }); return { message_id: 90 + flushed.length } },
+    onDelivered: item => { delivered.push(item.brainKey) } })
+  const brainKey = 'scope:91'
+  expect(await delivery(inbox, secrets, telegram, undefined, open()).sendFinalText(source, origin, false, id, undefined,
+    undefined, brainKey)).toBe(true)
+  expect(direct).toEqual(['з'.repeat(3998) + 'MA'])
+  // The value is registered while the rest waits; a restart reads the queue with it.
+  secrets.push(maskme)
+  const reloaded = open()
+  expect(reloaded.snapshot()).toMatchObject([{ sent: 1, brainKey }])
+  expect(readFileSync(join(dir, 'outbox.json'), 'utf8').includes('SKME')).toBe(false)
+  await reloaded.flushDue(5_000)
+  expect(flushed.map(message => message.text)).toEqual(['[REDACTED] конец'])
+  // The rest goes unquoted, with the text sent before it for the wire guard's seam check.
+  expect(flushed[0]?.opts.reply_to_message_id).toBeUndefined()
+  expect(flushed[0]?.opts.sentBefore).toBe('з'.repeat(3998))
+  expect(delivered).toEqual([brainKey])
+  expect(reloaded.size()).toBe(0)
 })

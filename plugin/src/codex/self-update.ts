@@ -15,7 +15,7 @@
 // Each trial boot writes how it ended (outcome=…) into the record; the guard decides from that (S9.5).
 import { execFile, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { closeSync, copyFileSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, fchmodSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { updateEnvironment } from './environment.js'
@@ -269,12 +269,26 @@ export function trialOutcomeFor(code: number, watchdog: boolean): TrialOutcome {
 
 /**
  * Copies plugin/scripts/boot-guard.sh of the running (healthy) checkout to <state>/boot-guard.sh, the
- * file the unit runs. Called only once an update reached its health mark, and by install.sh.
+ * file the unit runs. Keeps the same permissions as the copy installed by install.sh.
  */
 export function refreshGuardCopy(repo: string, stateDir: string): void {
+  const bytes = readFileSync(join(repo, 'plugin', 'scripts', GUARD_FILE))
   const target = join(stateDir, GUARD_FILE)
-  copyFileSync(join(repo, 'plugin', 'scripts', 'boot-guard.sh'), target + '.tmp')
-  renameSync(target + '.tmp', target)
+  const temp = `${target}.${randomUUID()}.tmp`
+  const fd = openSync(temp, 'wx', 0o600)
+  try {
+    try {
+      writeFileSync(fd, bytes)
+      fchmodSync(fd, 0o600)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(temp, target)
+  } catch (error) {
+    try { rmSync(temp, { force: true }) } catch { /* Preserve the refresh error. */ }
+    throw error
+  }
 }
 
 const busyText = 'Обновление уже идёт.'

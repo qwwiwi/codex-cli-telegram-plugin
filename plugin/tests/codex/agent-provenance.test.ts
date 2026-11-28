@@ -138,8 +138,9 @@ test('a ready record without owner provenance recovers its text but never its wo
       delivery: { 'text:0': 'sent', 'file:0': 'sending' } },
   }).active!
   // deliverReply sends one attachment per reply file and counts every delivery marker.
+  // A text receipt without a plan is a reply from before v3 plans: the upgrade leaves nothing pending to resend.
   expect(legacy.outcome).toEqual({ stage: 'ready', reply: { text: 'Готово', files: [], replyTo: 7 },
-    delivery: { 'text:0': 'sent' } })
+    delivery: { 'text:0': 'sent' }, textPlan: { v: 3, text: '', entities: [], cuts: [] } })
   // Same for a current file that names an agent as the origin.
   const agent = savedActive(room(), {
     messages: [agentMessage('Verify the summary.')],

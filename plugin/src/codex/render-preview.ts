@@ -3,12 +3,11 @@
 // send it, plus the facts as text (parts, formats, what the owner would see raw). It sends nothing to Telegram.
 // Keep the root relay's validated catalog (codex-root-relay.py) in sync with this tool.
 
-import { maskedPlainFallback, maskShownSecrets, PreformattedDocumentError, plainTextWithLinks, splitMessage,
-  TELEGRAM_MAX_MESSAGE, telegramTextLength } from '../format/chunk.js'
+import { PreformattedDocumentError } from '../format/chunk.js'
 import { markdownToTelegramHtml } from '../format/html.js'
 import { splitLongBlock } from '../format/paragraphs.js'
 import { renderTelegramPng, type PreviewBubble } from '../format/render-png.js'
-import { validateTelegramHtml } from '../safety/html-validator.js'
+import { cut, mask, render, visibleToHtml } from '../format/visible.js'
 import { redactSecrets } from '../safety/redact.js'
 import { normalizeChatReply } from './continuation.js'
 import { diffRender, type RenderSend, type ShownPart } from './render-eyes.js'
@@ -67,32 +66,19 @@ function refused(hint: string): PreviewToolResult {
   return { success: false, contentItems: [{ type: 'inputText', text: JSON.stringify({ tool: renderPreviewTool.name, ok: false, hint }) }] }
 }
 
-/** The parts the bridge would send for `text` on its HTML path (the final reply's renderer, chunker and validator). */
+/**
+ * The parts the bridge would send for `text`: the final reply's renderer, masked as the shown text, cut into
+ * messages. Each part is drawn from Telegram HTML of its shown text and entities.
+ */
 export function draftSend(text: string, secrets: readonly string[]): RenderSend {
   const source = redactSecrets(text, secrets)
-  const html = markdownToTelegramHtml(splitLongBlock(normalizeChatReply(source)))
-  const redact = (plain: string): string => redactSecrets(plain, secrets)
-  const plainParts = new Set<string>()
-  let planned: string[]
+  const visible = mask(render(markdownToTelegramHtml(splitLongBlock(normalizeChatReply(source))), 'HTML'), secrets)
   try {
-    // Markup inside a value (`MA**SK**ME`) survives source masking: plan the masked shown text, as the send does.
-    planned = maskShownSecrets(splitMessage(html), html, redact, part => { plainParts.add(part) })
+    return { source, parts: cut(visible).map(piece => ({ format: 'HTML', text: visibleToHtml(piece) })) }
   } catch (error) {
     if (!(error instanceof PreformattedDocumentError)) throw error
-    return { source, parts: [{ format: 'document', text: redactSecrets(plainTextWithLinks(error.html, Infinity), secrets) }] }
+    return { source, parts: [{ format: 'document', text: visible.text }] }
   }
-  const parts: ShownPart[] = []
-  let brokenHtml = 0
-  for (const part of planned) {
-    if (!plainParts.has(part) && !validateTelegramHtml(part).downgraded && telegramTextLength(part) <= TELEGRAM_MAX_MESSAGE) {
-      parts.push({ format: 'HTML', text: part })
-      continue
-    }
-    brokenHtml += 1
-    // Dropping the tags can join a token with its prefix (`Bearer <b>…</b>`): mask the plain text, as the send does.
-    for (const piece of maskedPlainFallback(part, redact)) parts.push({ format: 'plain', text: piece })
-  }
-  return { source, parts, brokenHtml }
 }
 
 function bubble(part: ShownPart): PreviewBubble {

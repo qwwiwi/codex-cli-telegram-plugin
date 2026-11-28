@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CodexInbox } from '../../src/codex/inbox.js'
+import type { PlanV3 } from '../../src/codex/reply-plan.js'
 import { ownerProvenance } from '../../src/codex/provenance.js'
 import { mainOrigin } from '../../src/codex/turn-origin.js'
 import {
@@ -130,6 +131,8 @@ test('the inbox recovers the restart request and cancels it without losing deliv
     inbox = new CodexInbox(root, owner.id)
     expect(inbox.active?.work).toEqual({ mayRestartBridge: true, verificationEligible: true, voiceTaskText: 'Restart the bridge' })
     inbox.complete(7, { text: 'Ready to restart', files: [] }, false, true, true)
+    const plan: PlanV3 = { v: 3, text: 'Ready to restart', entities: [], cuts: [16] }
+    inbox.setReplyPlan(7, plan)
     inbox.setReplyPart(7, 'text:0', 'sent')
 
     inbox = new CodexInbox(root, owner.id)
@@ -140,7 +143,7 @@ test('the inbox recovers the restart request and cancels it without losing deliv
     expect(inbox.active?.work?.mayRestartBridge).toBeUndefined()
     expect(inbox.active?.work?.verificationEligible).toBeUndefined()
     expect(inbox.active?.outcome).toEqual({
-      stage: 'ready', reply: { text: 'Ready to restart', files: [] }, delivery: { 'text:0': 'sent' },
+      stage: 'ready', reply: { text: 'Ready to restart', files: [] }, delivery: { 'text:0': 'sent' }, textPlan: plan,
     })
   } finally { rmSync(root, { force: true, recursive: true }) }
 })

@@ -5,7 +5,8 @@
 import { expect, test } from 'bun:test'
 
 import { AgentChatActions } from '../../src/codex/chat-actions.js'
-import { plannedTextParts, type ReplyReceipts } from '../../src/codex/reply-delivery.js'
+import { replyPieces, type PlanStore, type PlanV3 } from '../../src/codex/reply-plan.js'
+import { mask, render } from '../../src/format/visible.js'
 import { escapeHtml, markdownToTelegramHtml } from '../../src/format/html.js'
 import { createLogger } from '../../src/log.js'
 import { redactSecrets } from '../../src/safety/redact.js'
@@ -24,18 +25,20 @@ function expectNoLeak(texts: readonly string[]): void {
   expect(texts.join('\n')).toContain('[REDACTED]')
 }
 
-function receipts(): ReplyReceipts {
-  let plan: readonly string[] | undefined
-  return { replyPart: () => undefined, replyPlan: () => plan, setReplyPlan: (_id, parts) => { plan = parts } }
+function receipts(): PlanStore {
+  let plan: PlanV3 | undefined
+  return { replyPart: () => undefined, hasTextReceipt: () => false, replyPlan: () => plan,
+    setReplyPlan: (_id, saved) => { plan = saved } }
 }
 
 test('the prose reply path redacts the configured secret before HTML rendering and splitting', async () => {
   const chat = fakeTelegramChat()
   const api = createSafeTelegramApi(chat.raw, log, [secret])
   const reply = `**Ключ** ${secret}\n\nВторой абзац ${secret}.\n\n` + 'Длинный текст. '.repeat(400) + secret
-  const parts = plannedTextParts(receipts(), 7, reply, text => redactSecrets(text, [secret]))
+  const shown = () => mask(render(markdownToTelegramHtml(redactSecrets(reply, [secret])), 'HTML'), [secret])
+  const parts = replyPieces(receipts(), 7, shown, [secret])
   expect(parts.length).toBeGreaterThan(1)
-  for (const part of parts) await api.sendMessage(OWNER, part, { parse_mode: 'HTML' })
+  for (const part of parts) await api.sendMessage(OWNER, part.text, { entities: part.entities })
   expectNoLeak(chat.texts())
 })
 

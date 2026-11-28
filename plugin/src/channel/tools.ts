@@ -11,12 +11,15 @@
 import { Buffer } from 'buffer'
 import { basename, extname, join } from 'path'
 import { mkdirSync, writeFileSync } from 'fs'
+import { mkdtemp, rmdir, unlink, writeFile } from 'fs/promises'
+import { tmpdir } from 'os'
 import type { Bot } from 'grammy'
 import { InputFile } from 'grammy'
-import type { ReactionTypeEmoji } from 'grammy/types'
+import type { MessageEntity, ReactionTypeEmoji } from 'grammy/types'
 import { z } from 'zod'
 
 import type { AppConfig, StatePaths } from '../config.js'
+import { CAPTION_LIMIT, mask, maskString, MESSAGE_HARD_LIMIT, render, type Entity, type SourceFormat, type VisibleText } from '../format/visible.js'
 import type { Logger } from '../log.js'
 import type { MultichatPolicy } from '../chats/policy-loader.js'
 import type { StatusManager, StatusState } from '../status/status-manager.js'
@@ -46,17 +49,14 @@ import { analyzeAskDetailed, askGuardAdvisoryHint, askGuardBlockMessage } from '
 import { detectOpenQuestion } from '../safety/open-question.js'
 import { assertAllowedChat } from '../telegram/gate.js'
 import { analyzeFormat, formatHint } from '../format/format-check.js'
-import {
-  isTelegramHtmlParseError,
-  markdownToTelegramHtml,
-} from '../format/html.js'
-import { plainTextWithLinks, splitMessage, splitPlainMessage } from '../format/chunk.js'
+import { markdownToTelegramHtml } from '../format/html.js'
+import { newPlan, nextPiece, type NextPiece, type PlanV3 } from '../codex/reply-plan.js'
+import { PreformattedDocumentError } from '../format/chunk.js'
 import { buildRichMessagePayload, contentFitsRichLimits } from '../format/rich.js'
 import type { RichLatch } from '../safety/rich-latch.js'
-import { WidgetPreSendError } from '../safety/pre-send-error.js'
+import { MaskedOverflowError, WidgetPreSendError } from '../safety/pre-send-error.js'
 import { checkWidgetPayload } from './widget.js'
 import { PHOTO_EXTENSIONS, assertSendableFile, isPhotoExtension } from '../security/paths.js'
-import { validateTelegramHtml } from '../safety/html-validator.js'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
 import type { Outbox } from '../safety/outbox.js'
 import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
@@ -123,6 +123,13 @@ export interface RemoveKeyboardLike {
 export interface SendMessageOpts {
   reply_to_message_id?: number
   parse_mode?: 'MarkdownV2' | 'HTML'
+  // The formatting of `text` as entities (UTF-16 offsets). Set by the safe wrapper, which sends the text
+  // Telegram shows plus entities and never a parse_mode; callers pass parse_mode and let the wrapper render it.
+  entities?: Entity[]
+  // The shown text already sent ahead of this piece in the same reply. The safe wrapper and the wire guard mask
+  // the two as one text on every attempt, so a value that spans the cut (registered after the reply was cut, or
+  // during a rate-limit wait) is masked whole in this piece. Never reaches the wire.
+  sentBefore?: string
   reply_markup?: InlineKeyboardLike
   // A reply keyboard or its removal, sent as reply_markup when no inline keyboard is set. Its fields are
   // bot-authored (button labels, a web_app URL), so the safe wrapper passes it unchanged.
@@ -170,6 +177,8 @@ export interface SendMessageOpts {
 
 export interface EditOpts {
   parse_mode?: 'MarkdownV2' | 'HTML'
+  // See SendMessageOpts.entities.
+  entities?: Entity[]
   // PRX-1 TASK-2 (2026-05-27): inline keyboard mutation on edit. Needed by
   // the AskUserQuestion relay to re-render the multi-select question card
   // when a toggle button is pressed (text changes — `[ ]` → `[x]` — AND
@@ -187,6 +196,8 @@ export interface EditOpts {
 export interface SendDocumentOpts {
   reply_to_message_id?: number
   caption?: string
+  // The caption's formatting as entities; set by the safe wrapper (captions leave the bridge without parse_mode).
+  caption_entities?: Entity[]
   // Forum-topic thread id — see SendMessageOpts.message_thread_id.
   message_thread_id?: number
   // Staging uploads (guest attachments) land in the owner's DM only to mint a
@@ -266,6 +277,8 @@ export interface GuestFileAnswer {
 // Options for the one-shot guest answer (Guest Mode, Bot API 10.0).
 export interface AnswerGuestQueryOpts {
   parse_mode?: 'MarkdownV2' | 'HTML'
+  // The formatting of the answer text (the article text or the file caption) as entities; set by the safe wrapper.
+  entities?: Entity[]
   // When set, the answer ships the file instead of a text article, with the
   // answer text as its caption (Telegram caps a caption at 1024 chars).
   file?: GuestFileAnswer
@@ -276,20 +289,101 @@ export interface AnswerGuestQueryOpts {
 // usual 4096 message cap instead).
 export const GUEST_CAPTION_LIMIT = 1024
 
-// Telegram counts a caption's VISIBLE text: markup travels out-of-band as
-// entities, so `<b>` and `&amp;` are not what the 1024 cap measures. Counting
-// the rendered HTML instead would refuse perfectly legal captions whose tags
-// happen to be long (Grimstroke review, 2026-11-10).
-export function visibleTextLength(text: string, parseMode: string | undefined): number {
-  if (parseMode !== 'HTML') return text.length
-  return text
-    .replace(/<[^>]*>/g, '')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    // &amp; last: decoding it first would turn &amp;lt; into a bare tag.
-    .replace(/&amp;/g, '&').length
+/** The reply tool's `format` argument. */
+export type ReplyFormat = z.infer<typeof ReplyArgsSchema>['format']
+
+/** The body and parse_mode a guest answer is sent with, or why it cannot be sent. */
+export type GuestAnswerPlan = { body: string; parseMode?: 'HTML' | 'MarkdownV2' } | { refusal: string }
+
+/**
+ * The guest answer for `text`, measured before anything is claimed or staged. A guest answer is one message (one
+ * caption with a file): Telegram counts the text it shows, masked (markup travels as entities, so tags are free).
+ * An answer that does not fit is refused, never truncated. 'rich' degrades to the HTML rendering: answerGuestQuery
+ * has no rich_message payload.
+ */
+export function planGuestAnswer(text: string, format: ReplyFormat, hasFile: boolean,
+  secrets: ReadonlyArray<string> | undefined): GuestAnswerPlan {
+  const html = format === 'html' || format === 'rich'
+  const body = html ? markdownToTelegramHtml(text) : text
+  const parseMode = html ? 'HTML' : format === 'markdownv2' ? 'MarkdownV2' : undefined
+  const shown = mask(render(body, parseMode), secrets).text
+  if (shown.trim() === '') return { refusal: 'guest reply rendered to an empty message — nothing to send' }
+  if (hasFile && shown.length > GUEST_CAPTION_LIMIT) {
+    return { refusal: `a guest answer with a file puts the text in the file's CAPTION, which Telegram caps at ` +
+      `${GUEST_CAPTION_LIMIT} chars (this answer needs ${shown.length} once masked) — shorten the text` }
+  }
+  if (shown.length > MESSAGE_HARD_LIMIT) {
+    return { refusal: `a guest answer is ONE message, which Telegram caps at ${MESSAGE_HARD_LIMIT} chars (this ` +
+      `answer needs ${shown.length} once masked) — shorten the text; nothing was sent` }
+  }
+  return parseMode === undefined ? { body } : { body, parseMode }
+}
+
+/** Where a reply tool text goes besides its chat: the quoted message, the forum topic, the secrets to cut by. */
+export interface TextReplyOptions {
+  replyTo?: number | undefined
+  threadId?: number | undefined
+  secrets?: ReadonlyArray<string> | undefined
+}
+
+/**
+ * Send a reply tool text: rendered once, masked as one text, cut into messages, and sent piece by piece. Each
+ * piece is re-planned with the current secrets right before it goes and carries the text sent before it, so a
+ * value never splits across two messages, also when it is registered mid-reply. Message ids land in `sentIds` as
+ * pieces go (the caller's flood handling reads how far the reply got). Text that cannot be cut into messages goes
+ * as one masked document (reply.txt); text that shows nothing throws PreformattedDocumentError.
+ */
+export async function sendTextReply(api: TelegramApi, chatId: string, text: string, format: ReplyFormat,
+  opts: TextReplyOptions, sentIds: number[]): Promise<void> {
+  const html = format === 'html' || format === 'rich'
+  const shown = html ? render(markdownToTelegramHtml(text), 'HTML')
+    : render(text, format === 'markdownv2' ? 'MarkdownV2' : undefined)
+  const masked = mask(shown, opts.secrets)
+  let plan: PlanV3
+  try {
+    plan = newPlan(masked)
+  } catch (error) {
+    if (!(error instanceof PreformattedDocumentError) || !/\S/.test(masked.text)) throw error
+    sentIds.push(await sendReplyDocument(api, chatId, masked.text, opts))
+    return
+  }
+  for (let done = 0; ; done++) {
+    let next: NextPiece | undefined
+    try {
+      next = nextPiece(plan, done, opts.secrets)
+    } catch (error) {
+      // Only before the first piece: once a piece went, nextPiece keeps the saved cuts instead.
+      if (!(error instanceof PreformattedDocumentError) || done > 0) throw error
+      sentIds.push(await sendReplyDocument(api, chatId, plan.text, opts))
+      return
+    }
+    if (next === undefined) return
+    plan = next.plan
+    const pieceOpts: SendMessageOpts = { entities: next.piece.entities, sentBefore: next.before }
+    // reply_to quotes only the first piece, so a long answer does not quote-spam the original message.
+    if (done === 0 && opts.replyTo !== undefined) pieceOpts.reply_to_message_id = opts.replyTo
+    if (opts.threadId !== undefined) pieceOpts.message_thread_id = opts.threadId
+    const sent = await api.sendMessage(chatId, next.piece.text, pieceOpts)
+    sentIds.push(sent.message_id)
+  }
+}
+
+// A reply text no message cut fits, as one reply.txt document: masked again with the current secrets, written to a
+// private temporary file that is removed after the upload. Returns the document's message id.
+async function sendReplyDocument(api: TelegramApi, chatId: string, shown: string,
+  opts: TextReplyOptions): Promise<number> {
+  const dir = await mkdtemp(join(tmpdir(), 'krot-reply-'))
+  const file = join(dir, 'reply.txt')
+  try {
+    await writeFile(file, maskString(shown, opts.secrets), { flag: 'wx', mode: 0o600 })
+    const docOpts: SendDocumentOpts = { filename: 'reply.txt' }
+    if (opts.replyTo !== undefined) docOpts.reply_to_message_id = opts.replyTo
+    if (opts.threadId !== undefined) docOpts.message_thread_id = opts.threadId
+    return (await api.sendDocument(chatId, file, docOpts)).message_id
+  } finally {
+    await unlink(file).catch(() => undefined)
+    await rmdir(dir).catch(() => undefined)
+  }
 }
 
 // Extensions that may be echoed into a public guest answer. An ALLOWLIST, not
@@ -523,22 +617,69 @@ type RawSendRichMessageFn = (
   body: Record<string, unknown>,
 ) => Promise<RawSendRichResponse>
 
+// The bridge's entities are a subset of the Bot API's: typed here so a field the wire does not accept fails to compile.
+function wireEntities(entities: readonly Entity[]): MessageEntity[] {
+  return entities.map(entity => ({ ...entity }))
+}
+
+/**
+ * The last mask before HTTP: the live secret list applied to a payload's shown text right before bot.api. With
+ * `before` (the shown text sent ahead of a reply piece) the two are masked as one text (maskPiece).
+ */
+export type WireGuard = (visible: VisibleText, before?: string) => VisibleText
+
+// The text a payload shows, masked by the wire guard. A payload from the safe wrapper carries entities and no
+// parse_mode; one that still has a parse_mode is rendered here first, so the wire never sees markup. Masking
+// that grows the text past `limit` is refused before the request (the retry of a rate-limited send included).
+function guardText(guard: WireGuard, text: string, entities: Entity[] | undefined,
+  parseMode: SourceFormat, limit: number, before?: string): VisibleText {
+  const source = entities !== undefined ? { text, entities } : render(text, parseMode)
+  const guarded = guard(source, before)
+  if (guarded.text.length > limit && source.text.length <= limit) {
+    throw new MaskedOverflowError('the masked text is longer than Telegram allows; nothing was sent')
+  }
+  return guarded
+}
+
+// A plain string Telegram shows (a button label, a url, a file name), masked by the wire guard.
+function guardString(guard: WireGuard, text: string): string {
+  return guard({ text, entities: [] }).text
+}
+
+// The fields of a keyboard Telegram shows or opens: labels, urls (a web_app or login_url nests one) and the
+// input placeholder. callback_data and flags are not shown and pass unchanged.
+const SHOWN_MARKUP_FIELDS: ReadonlySet<string> = new Set(['text', 'url', 'input_field_placeholder'])
+
+// A keyboard with every shown field masked by the wire guard, on every attempt (a value registered while the
+// send waited in the rate limiter is masked in the buttons too).
+function guardMarkup(guard: WireGuard, value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(item => guardMarkup(guard, item))
+  if (typeof value !== 'object' || value === null) return value
+  return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, typeof field === 'string'
+    ? (SHOWN_MARKUP_FIELDS.has(key) ? guardString(guard, field) : field) : guardMarkup(guard, field)]))
+}
+
+// The upload's name as Telegram stores and shows it: the explicit one, else the path's basename (what grammY
+// would take), masked by the wire guard.
+function guardFile(guard: WireGuard, filePath: string, filename: string | undefined): InputFile {
+  return new InputFile(filePath, guardString(guard, filename ?? basename(filePath)))
+}
+
 // Thin wrapper around grammY bot.api. Keeps the rest of the system free of
 // grammy-specific quirks (reply_parameters vs reply_to_message_id, etc).
-export function createTelegramApi(bot: Bot, token: string): TelegramApi {
+export function createTelegramApi(bot: Bot, token: string, guard: WireGuard): TelegramApi {
   return {
     async sendMessage(chatId, text, opts) {
       const other: Record<string, unknown> = {}
       if (opts.reply_to_message_id !== undefined) {
         other.reply_parameters = { message_id: opts.reply_to_message_id }
       }
-      if (opts.parse_mode !== undefined) {
-        other.parse_mode = opts.parse_mode
-      }
+      const shown = guardText(guard, text, opts.entities, opts.parse_mode, MESSAGE_HARD_LIMIT, opts.sentBefore)
+      other.entities = wireEntities(shown.entities)
       if (opts.reply_markup !== undefined) {
-        other.reply_markup = opts.reply_markup
+        other.reply_markup = guardMarkup(guard, opts.reply_markup)
       } else if (opts.reply_keyboard !== undefined) {
-        other.reply_markup = opts.reply_keyboard
+        other.reply_markup = guardMarkup(guard, opts.reply_keyboard)
       }
       if (opts.message_thread_id !== undefined) {
         other.message_thread_id = opts.message_thread_id
@@ -550,7 +691,7 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       // grammY types its signal with the abort-controller polyfill; the runtime one is the same object
       // (cast as in telegram/poller.ts).
       const signal = opts.signal as unknown as Parameters<typeof bot.api.sendMessage>[3]
-      const sent = await bot.api.sendMessage(chatId, text, other, signal)
+      const sent = await bot.api.sendMessage(chatId, shown.text, other, signal)
       return { message_id: sent.message_id }
     },
     async sendRichMessage(chatId, rawMarkdown, opts) {
@@ -580,7 +721,8 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       // Last layer before HTTP: re-check the size rules on what actually goes out.
       const refused = checkWidgetPayload(params)
       if (refused !== undefined) throw new WidgetPreSendError(refused)
-      const body: Record<string, unknown> = { chat_id: chatId, html: params.html, caption: params.caption }
+      const caption = guardText(guard, params.caption, [], undefined, CAPTION_LIMIT).text
+      const body: Record<string, unknown> = { chat_id: chatId, html: params.html, caption }
       if (params.reply_to_message_id !== undefined) body.reply_parameters = { message_id: params.reply_to_message_id }
       const rawApi = bot.api.raw as unknown as Record<string, unknown>
       const send = rawApi.sendWidget
@@ -592,9 +734,10 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
     },
     async editMessageText(chatId, messageId, text, opts) {
       const other: Record<string, unknown> = {}
-      if (opts.parse_mode !== undefined) other.parse_mode = opts.parse_mode
-      if (opts.reply_markup !== undefined) other.reply_markup = opts.reply_markup
-      await bot.api.editMessageText(chatId, messageId, text, other)
+      const shown = guardText(guard, text, opts.entities, opts.parse_mode, MESSAGE_HARD_LIMIT)
+      other.entities = wireEntities(shown.entities)
+      if (opts.reply_markup !== undefined) other.reply_markup = guardMarkup(guard, opts.reply_markup)
+      await bot.api.editMessageText(chatId, messageId, shown.text, other)
     },
     async editRichMessage(chatId, messageId, rawMarkdown) {
       await bot.api.raw.editMessageText({ chat_id: chatId, message_id: messageId, rich_message: { markdown: rawMarkdown } })
@@ -613,16 +756,16 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       if (opts.reply_to_message_id !== undefined) {
         other.reply_parameters = { message_id: opts.reply_to_message_id }
       }
-      if (opts.caption !== undefined) other.caption = opts.caption
+      if (opts.caption !== undefined) {
+        const caption = guardText(guard, opts.caption, opts.caption_entities ?? [], undefined, CAPTION_LIMIT)
+        other.caption = caption.text
+        other.caption_entities = wireEntities(caption.entities)
+      }
       if (opts.message_thread_id !== undefined) other.message_thread_id = opts.message_thread_id
       if (opts.disable_notification !== undefined) {
         other.disable_notification = opts.disable_notification
       }
-      const sent = await bot.api.sendDocument(
-        chatId,
-        new InputFile(filePath, opts.filename),
-        other,
-      )
+      const sent = await bot.api.sendDocument(chatId, guardFile(guard, filePath, opts.filename), other)
       return {
         message_id: sent.message_id,
         ...(sent.document?.file_id !== undefined ? { file_id: sent.document.file_id } : {}),
@@ -633,12 +776,16 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       if (opts.reply_to_message_id !== undefined) {
         other.reply_parameters = { message_id: opts.reply_to_message_id }
       }
-      if (opts.caption !== undefined) other.caption = opts.caption
+      if (opts.caption !== undefined) {
+        const caption = guardText(guard, opts.caption, opts.caption_entities ?? [], undefined, CAPTION_LIMIT)
+        other.caption = caption.text
+        other.caption_entities = wireEntities(caption.entities)
+      }
       if (opts.message_thread_id !== undefined) other.message_thread_id = opts.message_thread_id
       if (opts.disable_notification !== undefined) {
         other.disable_notification = opts.disable_notification
       }
-      const sent = await bot.api.sendPhoto(chatId, new InputFile(filePath, opts.filename), other)
+      const sent = await bot.api.sendPhoto(chatId, guardFile(guard, filePath, opts.filename), other)
       // Telegram returns every rendered size, ascending — the LAST entry is
       // the largest, which is the one worth re-sending.
       const largest = sent.photo?.[sent.photo.length - 1]?.file_id
@@ -669,12 +816,14 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       // answerGuestQuery takes an InlineQueryResult; a text answer is an
       // article with InputTextMessageContent. `id` is scoped to the query
       // (one result per answer), so a constant is fine.
-      const parseMode = opts.parse_mode !== undefined ? { parse_mode: opts.parse_mode } : {}
       if (opts.file !== undefined) {
         // With an attachment the answer becomes a CACHED media result: the
         // file already lives on Telegram's servers (file_id from the staging
         // upload) and `text` rides along as its caption.
-        const caption = text.length > 0 ? { caption: text, ...parseMode } : {}
+        const shown = guardText(guard, text, opts.entities, opts.parse_mode, CAPTION_LIMIT)
+        const caption = shown.text.length > 0
+          ? { caption: shown.text, caption_entities: wireEntities(shown.entities) } : {}
+        const title = guardString(guard, opts.file.title)
         await bot.api.answerGuestQuery(
           guestQueryId,
           opts.file.kind === 'photo'
@@ -682,20 +831,21 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
             : {
                 type: 'document',
                 id: 'answer',
-                title: opts.file.title,
+                title,
                 document_file_id: opts.file.fileId,
                 ...caption,
               },
         )
         return
       }
+      const shown = guardText(guard, text, opts.entities, opts.parse_mode, MESSAGE_HARD_LIMIT)
       await bot.api.answerGuestQuery(guestQueryId, {
         type: 'article',
         id: 'answer',
         title: 'Ответ',
         input_message_content: {
-          message_text: text,
-          ...parseMode,
+          message_text: shown.text,
+          entities: wireEntities(shown.entities),
         },
       })
     },
@@ -711,7 +861,7 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'reply',
     description:
-      'Reply on Telegram. Pass chat_id from the inbound message. In a forum supergroup ALWAYS reply in the same topic the message came from: pass thread_id from the inbound <channel> block\'s message_thread_id (the tool also defaults to the last inbound topic of that chat, so you never accidentally answer in General). Optionally pass reply_to (message_id) to quote, and files (absolute paths) to attach images or documents. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id here too — the answer is delivered into the foreign chat via answerGuestQuery. Guest answers are ONE-SHOT (exactly one reply, no reply_to, single message ≤4096 chars — be concise). A guest answer may carry AT MOST ONE file in `files`: the text then ships as the caption of that file, so keep it ≤1024 chars, and the file arrives under a neutral public name — `attachment.<ext>` for a known file type, `attachment.bin` otherwise. The upload is staged through the owner DM to mint a file_id and that staging copy is deleted once the answer is delivered; it is kept when the answer failed or its outcome is unknown. The tool result states which happened — including the case where the delete itself could not be confirmed, i.e. the copy may still be in the owner DM — and it reports that alongside any truncation notice, never instead of it.',
+      'Reply on Telegram. Pass chat_id from the inbound message. In a forum supergroup ALWAYS reply in the same topic the message came from: pass thread_id from the inbound <channel> block\'s message_thread_id (the tool also defaults to the last inbound topic of that chat, so you never accidentally answer in General). Optionally pass reply_to (message_id) to quote, and files (absolute paths) to attach images or documents. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id here too — the answer is delivered into the foreign chat via answerGuestQuery. Guest answers are ONE-SHOT (exactly one reply, no reply_to, single message ≤4096 chars — be concise; a longer answer is refused, never truncated). A guest answer may carry AT MOST ONE file in `files`: the text then ships as the caption of that file, so keep it ≤1024 chars, and the file arrives under a neutral public name — `attachment.<ext>` for a known file type, `attachment.bin` otherwise. The upload is staged through the owner DM to mint a file_id and that staging copy is deleted once the answer is delivered; it is kept when the answer failed or its outcome is unknown. The tool result states which happened — including the case where the delete itself could not be confirmed, i.e. the copy may still be in the owner DM.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -916,6 +1066,10 @@ export interface ToolDeps {
   // Pin surface (2026-11-10). Optional: legacy wiring and test fixtures omit
   // it, and the `pin` tool then reports unavailability instead of throwing.
   pinApi?: PinApi
+  // The live secret list the safe wrapper masks with. The guest path measures
+  // a file caption masked with it before staging the upload; omitted → only
+  // the built-in patterns count.
+  secrets?: ReadonlyArray<string>
 }
 
 // DM detection: a Telegram DM chat.id equals the user's id and is positive.
@@ -983,29 +1137,16 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             return toolError(name, 'guest replies do not support thread_id — answerGuestQuery has no topic routing')
           }
 
-          // Render BEFORE claiming: a renderer throw after claim() would
-          // strand the one-shot entry inflight until TTL. Hard-cap at ONE
-          // Telegram message: there is no second answerGuestQuery, so
-          // chunking cannot apply — ship chunk[0] and flag the truncation in
-          // the tool result so the agent knows. 'rich' degrades to the HTML
-          // rendering here: answerGuestQuery has no rich_message payload, and
-          // raw markdown in a public foreign chat reads worse than our
-          // rendered HTML subset.
-          const guestFormat = args.format === 'rich' ? 'html' : args.format
-          const body = guestFormat === 'html' ? markdownToTelegramHtml(args.text) : args.text
-
-          const chunks = guestFormat === 'html' ? splitMessage(body) : splitPlainMessage(body)
-          const single = chunks[0]
-          if (single === undefined) {
-            return toolError(name, 'guest reply rendered to an empty message — nothing to send')
-          }
-          const truncated = chunks.length > 1
-          // Plain-text fallback body: the PRE-render text — a parse failure
-          // means our markup was bad, and raw <b> tag soup in a public
-          // foreign chat reads worse than unrendered markdown.
-          const plainBody = splitPlainMessage(args.text)[0] ?? single
-          const guestParseMode: AnswerGuestQueryOpts['parse_mode'] | undefined =
-            guestFormat === 'html' ? 'HTML' : guestFormat === 'markdownv2' ? 'MarkdownV2' : undefined
+          // Render and measure BEFORE claiming: a renderer throw after claim()
+          // would strand the one-shot entry inflight until TTL. There is no
+          // second answerGuestQuery, so an answer that does not fit one
+          // message (one caption with a file), counted on its masked shown
+          // text with the same secret list the safe wrapper masks with, is
+          // refused here — never truncated, and never after a staging upload.
+          const guestPlan = planGuestAnswer(args.text, args.format, guestFiles.length > 0, deps.secrets)
+          if ('refusal' in guestPlan) return toolError(name, guestPlan.refusal)
+          const single = guestPlan.body
+          const guestParseMode = guestPlan.parseMode
 
           // ── Attachment (2026-11-10) ──────────────────────────────────
           // answerGuestQuery takes an InlineQueryResult, so a file can ride
@@ -1021,38 +1162,6 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           let guestCanonical: string | undefined
           let stagingChatId: string | undefined
           if (guestFilePath !== undefined) {
-            // The cap applies to what Telegram actually receives:
-            //   · valid HTML  → it counts the VISIBLE text (markup travels as
-            //     entities, so long tags are free);
-            //   · invalid HTML → the safety wrapper escapes the whole body and
-            //     ships it WITHOUT parse_mode, and escaping INFLATES it (a
-            //     reviewed case went 859 raw chars → 2992 escaped), so the cap
-            //     must be measured on that string instead;
-            //   · a parse-error retry → the raw markdown fallback.
-            // Known blind spot: redaction also rewrites the text, but it needs
-            // the channel's secret list, which this layer does not have. A
-            // redacted caption that trips the cap fails the send — it does not
-            // leak (Grimstroke round-2 review, 2026-11-10). DECIDED in round 3:
-            // not escalated to a hard "never stage an oversize caption"
-            // guarantee. That would mean duplicating the secret list into this
-            // layer (or moving caption policy into the safety wrapper) to buy
-            // availability in a case that requires a secret-shaped string in a
-            // near-1024-char public answer. Cost beats the benefit; the failure
-            // mode is a refused send plus a staged copy, both visible.
-            const htmlCheck = guestParseMode === 'HTML' ? validateTelegramHtml(single) : undefined
-            const shippedLen =
-              htmlCheck?.downgraded === true
-                ? htmlCheck.text.length
-                : visibleTextLength(single, guestParseMode)
-            const captionLen = Math.max(shippedLen, plainBody.length)
-            if (captionLen > GUEST_CAPTION_LIMIT) {
-              return toolError(
-                name,
-                `a guest answer with a file puts the text in the file's CAPTION, which Telegram caps at ` +
-                  `${GUEST_CAPTION_LIMIT} chars (this answer needs ${captionLen}, counting the ` +
-                  `plain-text fallback) — shorten the text`,
-              )
-            }
             try {
               guestCanonical = assertSendableFile({ filePath: guestFilePath, config })
             } catch (err) {
@@ -1180,35 +1289,14 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             ...(guestFile !== undefined ? { file: guestFile } : {}),
           }
 
+          // A refusal of the entities is retried by the safe wrapper as the
+          // same shown text without them, the attachment kept; no other body
+          // (the Markdown source, a re-render) is ever sent instead.
           try {
             await telegramApi.answerGuestQuery(args.guest_query_id, single, guestOpts)
           } catch (err) {
-            // Entity-parse failures are format-agnostic: Telegram raises the
-            // same «can't parse entities» family for HTML and MarkdownV2
-            // bodies — and a chunked MarkdownV2 body can be INVALID by
-            // construction (splitMessage balances only HTML tags), so without
-            // this retry a long markdownv2 guest reply would burn the query's
-            // TTL on identical failures. A failed call does not consume the
-            // query on Telegram's side.
-            if (guestOpts.parse_mode !== undefined && isTelegramHtmlParseError(err)) {
-              log.warn('guest answer entity parse failed, retrying as plain text', {
-                format: args.format,
-                error: err instanceof Error ? err.message : String(err),
-              })
-              try {
-                // Drop the markup, KEEP the attachment — the file is the
-                // point of the answer; losing it to a bad tag is not an option.
-                await telegramApi.answerGuestQuery(args.guest_query_id, plainBody, {
-                  ...(guestFile !== undefined ? { file: guestFile } : {}),
-                })
-              } catch (err2) {
-                deps.guestQueries.release(args.guest_query_id)
-                return toolError(name, ambiguousGuestFailure(err2, guestFile !== undefined))
-              }
-            } else {
-              deps.guestQueries.release(args.guest_query_id)
-              return toolError(name, ambiguousGuestFailure(err, guestFile !== undefined))
-            }
+            deps.guestQueries.release(args.guest_query_id)
+            return toolError(name, ambiguousGuestFailure(err, guestFile !== undefined))
           }
 
           // Send succeeded — freeze the entry as answered so a repeat reply
@@ -1255,15 +1343,9 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             }
           }
 
-          // Truncation and the attachment/cleanup status are INDEPENDENT facts
-          // about the same send, so they are composed, never nested: a
-          // truncated answer that also left a copy in the owner DM must report
-          // BOTH. Nesting them once hid the cleanup outcome behind the
-          // truncation notice (Grimstroke round 2, 2026-11-11).
+          // The attachment and cleanup status of the send. An answer longer
+          // than one message is refused before the send, never truncated.
           const notes: string[] = []
-          if (truncated) {
-            notes.push('TRUNCATED to one message — guest replies are one-shot; keep them short')
-          }
           if (guestFile !== undefined && guestCanonical !== undefined) {
             notes.push(
               `${basename(guestCanonical)} attached as ${guestFile.title}; ` +
@@ -1464,65 +1546,15 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // else res.fallback === true → fall through to the HTML path below.
         }
 
-        if (richSent) {
-          // Rich shipped the whole body — nothing else to send for text.
-          // (Attachments are impossible here: richEligible required
-          // files.length === 0.)
-        } else if (args.format === 'html' || args.format === 'rich') {
-          // HTML path (also the transparent fallback for 'rich'): when rich
-          // was skipped (disabled / non-DM / oversize / opted-out / has
-          // files) or fell back, render markdown → validated Telegram HTML.
-          // Convert markdown → Telegram HTML, then chunk at 4000 chars so we
-          // never exceed Telegram's 4096 sendMessage cap. reply_to applies
-          // only to the first chunk so a long answer doesn't quote-spam the
-          // user's original message N times.
-          const rendered = markdownToTelegramHtml(args.text)
-          const chunks = splitMessage(rendered)
-          for (let i = 0; i < chunks.length; i++) {
-            const chunkOpts: SendMessageOpts = { parse_mode: 'HTML' }
-            if (i === 0 && replyToId !== undefined) chunkOpts.reply_to_message_id = replyToId
-            if (threadId !== undefined) chunkOpts.message_thread_id = threadId
-            const chunk = chunks[i] as string
-            try {
-              const out = await telegramApi.sendMessage(args.chat_id, chunk, chunkOpts)
-              sentIds.push(out.message_id)
-            } catch (err) {
-              if (isTelegramHtmlParseError(err)) {
-                // Telegram rejected our HTML. Retry the SAME chunk as plain
-                // text so the user still sees the answer body — better a
-                // missing <b> than a missing reply. Mirror gateway.py:500-510.
-                log.warn('telegram HTML parse failed, retrying as plain text', {
-                  chunk_index: i,
-                  error: err instanceof Error ? err.message : String(err),
-                })
-                const plainOpts: SendMessageOpts = {}
-                if (i === 0 && replyToId !== undefined) plainOpts.reply_to_message_id = replyToId
-                if (threadId !== undefined) plainOpts.message_thread_id = threadId
-                // The text Telegram would have shown: never longer than the chunk's Telegram length.
-                const out = await telegramApi.sendMessage(args.chat_id, plainTextWithLinks(chunk), plainOpts)
-                sentIds.push(out.message_id)
-              } else {
-                throw err
-              }
-            }
-          }
-        } else {
-          // text / markdownv2 — also chunk at 4000 chars so a 9000-char reply
-          // does not trip Telegram's 4096 sendMessage cap. reply_to threads
-          // only the first chunk so a long answer doesn't quote-spam.
-          // chunk.ts' tag-balancing is HTML-specific; for text/markdownv2 we
-          // still rely on the same paragraph/line/hard-cut preference order
-          // (the tag-balance path is a no-op when no <pre>/<code> tags).
-          const chunks = splitPlainMessage(args.text)
-          for (let i = 0; i < chunks.length; i++) {
-            const chunkOpts: SendMessageOpts = {}
-            if (i === 0 && replyToId !== undefined) chunkOpts.reply_to_message_id = replyToId
-            if (threadId !== undefined) chunkOpts.message_thread_id = threadId
-            if (args.format === 'markdownv2') chunkOpts.parse_mode = 'MarkdownV2'
-            const chunk = chunks[i] as string
-            const sent = await telegramApi.sendMessage(args.chat_id, chunk, chunkOpts)
-            sentIds.push(sent.message_id)
-          }
+        if (!richSent) {
+          // Rich shipped the whole body when it went (attachments are
+          // impossible there: richEligible required files.length === 0).
+          // Otherwise the text goes as masked shown text cut into messages:
+          // html/rich render Markdown → Telegram HTML, markdownv2 its own
+          // markup, text as is. A refusal of the entities is retried by the
+          // safe wrapper as the same text without them.
+          await sendTextReply(telegramApi, args.chat_id, args.text, args.format,
+            { replyTo: replyToId, threadId, secrets: deps.secrets }, sentIds)
         }
 
         // Attachments. We send the canonical (realpath-resolved) path so a

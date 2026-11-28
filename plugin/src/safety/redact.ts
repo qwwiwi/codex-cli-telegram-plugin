@@ -178,27 +178,20 @@ const URL_TRAILING_PUNCT_RE = /[.:!?]+$/
 // lowercase letter, or without an underscore, is still masked.
 const UPPER_SNAKE_RE = /^[A-Z]+(?:_[A-Z]+)+$/
 
-// Replace GENERIC_LONG_TOKEN_RE matches everywhere EXCEPT inside http(s)
+// Mask GENERIC_LONG_TOKEN_RE matches everywhere EXCEPT inside http(s)
 // URLs. Ranges are recomputed per call from the current text (earlier
 // rules may have shifted offsets). Idempotent: skipped matches are left
 // byte-identical, masked ones no longer match the pattern.
-function maskLongTokensOutsideUrls(text: string): string {
+function longTokenPass(text: string): PassResult {
   const urlRanges: Array<[number, number]> = []
   for (const m of text.matchAll(URL_RE)) {
-    if (m.index !== undefined) {
-      const trimmed = m[0].replace(URL_TRAILING_PUNCT_RE, '')
-      urlRanges.push([m.index, m.index + trimmed.length])
-    }
+    const trimmed = m[0].replace(URL_TRAILING_PUNCT_RE, '')
+    urlRanges.push([m.index, m.index + trimmed.length])
   }
-  return text.replace(
-    GENERIC_LONG_TOKEN_RE,
-    (match: string, head: string, tail: string, offset: number) => {
-      const inUrl = urlRanges.some(
-        ([start, end]) => offset >= start && offset < end,
-      )
-      return inUrl || UPPER_SNAKE_RE.test(match) ? match : `${head}***${tail}`
-    },
-  )
+  return applyPass(text, GENERIC_LONG_TOKEN_RE, (m) => {
+    const inUrl = urlRanges.some(([start, end]) => m.index >= start && m.index < end)
+    return inUrl || UPPER_SNAKE_RE.test(m[0]) ? m[0] : `${m[1] ?? ''}***${m[2] ?? ''}`
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -282,34 +275,92 @@ export function redactSecrets(
   text: string,
   extras?: ReadonlyArray<string>,
 ): string {
+  return redactWithEdits(text, extras).text
+}
+
+/** One replacement made by a redaction pass, in the offsets of that pass's input (UTF-16 units). */
+export interface RedactEdit {
+  at: number
+  removed: number
+  inserted: string
+  /** Characters of the match right after the edit that the replacement kept: a cut there still splits the value. */
+  kept: number
+}
+
+interface PassResult {
+  text: string
+  edits: RedactEdit[]
+}
+
+// Run one global pattern over `text`. Each match whose replacement differs becomes one edit, narrowed to the
+// characters that actually change (a kept prefix such as `Bearer ` or a kept group is not part of the edit).
+function applyPass(text: string, pattern: RegExp, replace: (match: RegExpExecArray) => string): PassResult {
+  const edits: RedactEdit[] = []
+  let out = ''
+  let last = 0
+  for (const match of text.matchAll(pattern)) {
+    const found = match[0]
+    const replacement = replace(match)
+    if (replacement === found) continue
+    const shortest = Math.min(found.length, replacement.length)
+    let prefix = 0
+    while (prefix < shortest && found[prefix] === replacement[prefix]) prefix += 1
+    let suffix = 0
+    while (suffix < shortest - prefix &&
+      found[found.length - 1 - suffix] === replacement[replacement.length - 1 - suffix]) suffix += 1
+    edits.push({
+      at: match.index + prefix,
+      removed: found.length - prefix - suffix,
+      inserted: replacement.slice(prefix, replacement.length - suffix),
+      kept: suffix,
+    })
+    out += text.slice(last, match.index) + replacement
+    last = match.index + found.length
+  }
+  return edits.length === 0 ? { text, edits } : { text: out + text.slice(last), edits }
+}
+
+// `$1`-style template expansion, as String.prototype.replace does it for the templates RULES use.
+function expandTemplate(template: string, match: RegExpExecArray): string {
+  return template.replace(/\$(\d)/g, (_all, digit: string) => match[Number(digit)] ?? '')
+}
+
+function rulePass(text: string, rule: RedactionRule): PassResult {
+  const { replacement } = rule
+  return applyPass(text, rule.pattern, typeof replacement === 'string'
+    ? match => expandTemplate(replacement, match)
+    : match => replacement(match[0], ...match.slice(1).map(group => group ?? '')))
+}
+
+/**
+ * The redaction of `text` as a sequence of passes, each with the edits it made in the offsets of its own input.
+ * `text` equals redactSecrets(text, extras); applying the passes' edits in order rebuilds it from the input.
+ */
+export function redactWithEdits(
+  text: string,
+  extras?: ReadonlyArray<string>,
+): { text: string; passes: RedactEdit[][] } {
+  const passes: RedactEdit[][] = []
   let out = text
+  const run = (pass: (input: string) => PassResult): void => {
+    const result = pass(out)
+    if (result.edits.length > 0) passes.push(result.edits)
+    out = result.text
+  }
   // Extras BEFORE patterns: caller-supplied exact substrings (e.g. webhook
   // tokens with no public shape) get masked first so the downstream generic
   // long-token rule doesn't partially eat them and leave a recoverable
   // prefix/suffix. Short (<4 chars) entries are ignored as catastrophic-
   // false-positive guards.
-  if (extras && extras.length > 0) {
-    for (const secret of extras) {
-      if (!secret || secret.length < 4) continue
-      const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      out = out.replace(new RegExp(escaped, 'g'), '[REDACTED]')
-    }
+  for (const secret of extras ?? []) {
+    if (!secret || secret.length < 4) continue
+    const pattern = new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')
+    run(input => applyPass(input, pattern, () => '[REDACTED]'))
   }
-  for (const rule of RULES) {
-    // String replacement: replace() accepts string OR callback. We narrow
-    // explicitly so TS picks the right overload.
-    if (typeof rule.replacement === 'string') {
-      out = out.replace(rule.pattern, rule.replacement)
-    } else {
-      // Cast to satisfy String.prototype.replace's variadic callback shape.
-      // The replacer is typed (match, ...groups) which matches replace()'s
-      // contract for capturing groups.
-      out = out.replace(rule.pattern, rule.replacement as (sub: string, ...args: unknown[]) => string)
-    }
-  }
+  for (const rule of RULES) run(input => rulePass(input, rule))
   // Generic long-token rule runs LAST and outside RULES: it needs the
   // final post-specific-rules text to compute URL ranges (offsets shift
   // as earlier rules rewrite the string).
-  out = maskLongTokensOutsideUrls(out)
-  return out
+  run(longTokenPass)
+  return { text: out, passes }
 }

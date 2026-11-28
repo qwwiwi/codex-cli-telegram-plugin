@@ -3,9 +3,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  collectDoctorReport, dependencyDrift, DoctorCommand, doctorFixTurn, formatDoctorReport, runDoctorScript, type DoctorReport,
+  chatReportChars, collectDoctorReport, dependencyDrift, DoctorCommand, doctorFixTurn, formatDoctorReport, runDoctorScript, type DoctorReport,
 } from '../../src/codex/doctor-command.js'
-import { RenderEyes, type ShownPart } from '../../src/codex/render-eyes.js'
+import { ErrorJournal } from '../../src/codex/error-log.js'
+import { RenderEyes, type RenderDiff, type ShownPart } from '../../src/codex/render-eyes.js'
+import { GUARD_FILE, guardCopyProblem } from '../../src/codex/self-update.js'
 import { markdownToTelegramHtml } from '../../src/format/html.js'
 import { BRAIN_EVENTS, checkHooksPack, installHooks, PACK_EVENTS } from '../../../codex-hooks/src/install.js'
 
@@ -330,7 +332,7 @@ test('[R21] /doctor fix hands the report to Codex as an owner turn with safe-fix
 test('[R21] /doctor reports a failed check run instead of throwing', async () => {
   const sent: string[] = []
   const command = new DoctorCommand({
-    collect: async () => { throw new Error('/home/owner/.secrets/token') }, send: async text => { sent.push(text) },
+    collect: async () => { throw new Error('/srv/example/.secrets/token') }, send: async text => { sent.push(text) },
     repo: '/srv/bridge', selfRestart: false, secrets: [],
   })
   await command.handle('fix', async () => { throw new Error('must not start a turn') })
@@ -580,6 +582,66 @@ test('[R29] /doctor says why automatic update is refused while the installed boo
     updates: () => ({ auto: { enabled: true, intervalMs: 6 * 3_600_000 }, bad: [], guard }) })
   expect(report.problems.map(problem => problem.text)).toContain(guard)
   expect(formatDoctorReport(report)).toContain(guard)
+})
+
+test('/doctor fits the full damaged generation path, guard warning and render summary in a busy report', async () => {
+  const { repo, root } = fixture()
+  const state = join(root, 'state')
+  const statePath = '/srv/' + 'bridge-install/state-store/'.repeat(3) + 'state'
+  expect(statePath.length).toBe(91)
+  mkdirSync(state)
+  writeFileSync(join(state, GUARD_FILE), '# krotov-boot-guard-version: 2\n')
+  const guard = guardCopyProblem(state)
+  if (!guard) throw new Error('expected an outdated guard warning')
+
+  const now = () => Date.parse('2026-11-27T11:20:00Z')
+  const history = join(state, 'render-diffs.json')
+  const historyPath = join(statePath, 'render-diffs.json')
+  const journal = new ErrorJournal({ dir: state, now })
+  writeFileSync(history, '{')
+  new RenderEyes({ file: history, now, log: {
+    warn: (message, context) => journal.record('warn', 'bridge', message, context),
+    debug() {}, info() {}, error() {},
+  } })
+  for (let index = 0; index < 4; index++) {
+    const error = index === 0 ? { name: 'Error', code: 'ENOSPC', description: 'ENOSPC: no space left on device' } : {
+      name: 'Error', code: 'EACCES', description: `EACCES: permission denied, rename '${historyPath}.${index}.tmp' -> '${historyPath}'`,
+    }
+    journal.record('warn', 'render', 'Could not save the render history', { error })
+  }
+  const renders: RenderDiff[] = Array.from({ length: 5 }, (_, index) => ({
+    ts: new Date(now() + (5 - index) * 60_000).toISOString(), messageIds: [1000 + index, 1100 + index],
+    formats: ['HTML', 'plain'], collapsedBlankLines: 0,
+    degradations: [{ kind: 'raw_markup', code: 'entity:amp' }, { kind: 'split_mid_block', code: 'split:code' }],
+  }))
+  const report = await collectDoctorReport({ repo, env: {}, doctor: healthy, codexVersion, stateDir: state,
+    errors: () => ({ ...journal.recent(), path: statePath }), renders: () => renders,
+    updates: () => ({ auto: { enabled: false, intervalMs: 6 * 3_600_000 }, bad: [], guard }),
+  })
+  const path = join(statePath, 'codex-public', 'generations', 'gen-20261127-112000-damaged')
+  const failedImport = join(statePath, 'codex-public', 'generations', 'gen-20261127-111000-import')
+  const stopped = {
+    text: 'Очистка папок Codex остановлена, ни одна папка не удалена: отметка поколения повреждена или не найдена — ' + path,
+    fix: 'Проверьте файл complete.json в этой папке; пока он повреждён, старые папки не удаляются.',
+    urgent: true,
+  }
+  report.problems.push({
+    text: 'История гостевых чатов не прочиталась при переносе из ' + failedImport + '. Папка сохранена, перенос повторится при следующем запуске.',
+    fix: 'Проверьте права на файлы в этой папке (владелец — пользователь моста, чтение разрешено) и перезапустите мост.',
+  }, stopped)
+
+  const sent: string[] = []
+  const command = new DoctorCommand({ collect: async () => report, send: async text => { sent.push(text) },
+    repo, selfRestart: false, secrets: [],
+  })
+  await command.handle('', async () => {})
+  const text = sent.at(-1) ?? ''
+  expect(text.length).toBeLessThanOrEqual(chatReportChars)
+  expect(text).toContain(guard)
+  expect(text).toContain('Показ ответов в Telegram (последние 5, новые сверху):')
+  expect(text).toContain(path)
+  expect(text.indexOf(stopped.text)).toBeLessThan(text.indexOf('Журнал ошибок моста'))
+  expect(text.indexOf(guard)).toBeLessThan(text.indexOf('Журнал ошибок моста'))
 })
 
 test('[R38] /doctor tests runs the self-test and prints pass or fail per check without secrets', async () => {

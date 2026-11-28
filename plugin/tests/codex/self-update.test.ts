@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { GUARD_VERSION, guardCopyProblem, guardVersion, INSTALL_ARGS, recordTrialOutcome, runCommand, SelfUpdate, trialOutcomeFor, type Runner } from '../../src/codex/self-update.js'
+import { ensureGuardCopy, GUARD_FILE, GUARD_VERSION, guardCopyProblem, guardVersion, INSTALL_ARGS, recordTrialOutcome, runCommand, SelfUpdate, trialOutcomeFor, type Runner } from '../../src/codex/self-update.js'
 
 const temporary: string[] = []
 afterEach(() => { for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true }) })
@@ -651,6 +651,30 @@ test('[R29] an installed guard copy older than the bridge needs is refreshed fro
   expect(await updater(repo, runner().run, { stateDir: state }).check()).toMatchObject({ kind: 'plan' })
   expect(readFileSync(join(state, 'boot-guard.sh'), 'utf8')).toBe(current)
   expect(guardCopyProblem(state)).toBeUndefined()
+})
+
+test('[R29] refreshing an executable checkout guard installs it with mode 0600', () => {
+  const root = mkdtempSync(join(tmpdir(), 'krot-guard-mode-'))
+  temporary.push(root)
+  const scripts = join(root, 'plugin', 'scripts')
+  const state = join(root, 'state')
+  mkdirSync(scripts, { recursive: true })
+  mkdirSync(state)
+  const source = join(scripts, GUARD_FILE)
+  const target = join(state, GUARD_FILE)
+  const current = `# krotov-boot-guard-version: ${GUARD_VERSION}\n`
+  writeFileSync(source, current)
+  chmodSync(source, 0o775)
+  writeFileSync(target, '# krotov-boot-guard-version: 2\n', { mode: 0o600 })
+
+  const previous = process.umask(0)
+  try {
+    expect(ensureGuardCopy(root, state)).toBeUndefined()
+  } finally {
+    process.umask(previous)
+  }
+  expect(readFileSync(target, 'utf8')).toBe(current)
+  expect(statSync(target).mode & 0o777).toBe(0o600)
 })
 
 test('[R29] without a compatible guard copy the update is refused with the reason, and nothing is applied', async () => {

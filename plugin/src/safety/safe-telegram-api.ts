@@ -1,22 +1,25 @@
-// Safety wrapper around TelegramApi.
+// Safety wrapper around TelegramApi: the outbound masking choke point.
 //
-// Every outbound TEXT method (sendMessage, editMessageText) runs through:
-//   1. redactSecrets(text, extraSecrets) — strips tokens, IPs, secret paths,
-//      and any caller-supplied substrings before the body leaves the process.
-//   2. validateTelegramHtml(text) — only when parse_mode === 'HTML'. If the
-//      body is invalid Telegram HTML, we downgrade by removing parse_mode
-//      and shipping the body as plain text. Telegram will accept it.
+// Every text the bridge sends is rendered to the text Telegram will show
+// (format/visible.ts render: HTML, MarkdownV2 or plain), masked there
+// (mask: every registered value and pattern rule, the formatting carried
+// beside the text) and passed down as text + entities with parse_mode
+// removed. The string we mask is, character for character, the string the
+// reader sees, so markup can no longer hide, split or re-join a value.
 //
-// Methods that don't accept user text (sendDocument, sendPhoto, downloadFile,
-// setMessageReaction, deleteMessage, sendChatAction) are forwarded verbatim.
-// Captions on document/photo sends DO contain user text — Phase A1 keeps the
-// scope tight to text-only methods; PR-A2 can extend to captions if needed
-// (most callers route formatted text through sendMessage with attachment
-// resolution done as a separate call).
+// Routes: sendMessage, editMessageText, editRichMessage (a text edit),
+// answerGuestQuery (article text or file caption, file title), photo and
+// document captions, the widget caption. Rich sends are off: without a
+// latch sendRichMessage reports `{ fallback }` and callers take the text
+// path. The raw adapter masks once more right before HTTP (its wire guard),
+// so a value registered while a send waits in the rate limiter is masked
+// too.
 //
 // The wrapper returns a fresh TelegramApi-shaped object whose every method
 // is a thin function. Callers swap the raw instance for this one and need
 // no code changes downstream.
+
+import { basename } from 'node:path'
 
 import type { Logger } from '../log.js'
 import type {
@@ -33,12 +36,13 @@ import type {
   SendRichMessageResult,
   SendWidgetParams,
   SentMessage,
+  SentText,
   TelegramApi,
 } from '../channel/tools.js'
-import { htmlToPlainText, TELEGRAM_MAX_MESSAGE, telegramTextLength } from '../format/chunk.js'
-import { escapeHtml, escapeHtmlAttr } from '../format/html.js'
+import { escapeHtml, escapeHtmlAttr, isTelegramHtmlParseError, markdownToTelegramHtml } from '../format/html.js'
+import { CAPTION_LIMIT, maskPiece, maskString, MESSAGE_HARD_LIMIT, render, visibleToHtml, type Entity,
+  type SourceFormat, type VisibleText } from '../format/visible.js'
 import { redactSecrets } from './redact.js'
-import { validateTelegramHtml } from './html-validator.js'
 import { richErrorClass } from '../format/rich.js'
 import type { RichLatch } from './rich-latch.js'
 import { MaskedOverflowError, WidgetPreSendError } from './pre-send-error.js'
@@ -85,10 +89,10 @@ function redactReplyMarkup(
       const c = cell as Record<string, unknown>
       const next: Record<string, unknown> = { ...c }
       if (typeof c.text === 'string') {
-        next.text = redactSecrets(c.text, extraSecrets)
+        next.text = maskString(c.text, extraSecrets)
       }
       if (typeof c.url === 'string') {
-        next.url = redactSecrets(c.url, extraSecrets)
+        next.url = maskString(c.url, extraSecrets)
       }
       // Cast back to the structural cell type — the unknown extra keys
       // ride along because TS doesn't widen object literal property sets
@@ -100,25 +104,6 @@ function redactReplyMarkup(
   return { inline_keyboard: safeRows }
 }
 
-/**
- * Wrap the raw TelegramApi so every text-sending call is funneled through
- * redaction + HTML validation. Logger receives a `warn` on HTML downgrade
- * — only the reason is logged, never the body (which may still contain
- * pre-redaction secrets if the agent was sloppy about logging upstream).
- *
- * @param raw           The underlying TelegramApi (typically createTelegramApi()).
- * @param log           Channel logger.
- * @param extraSecrets  Optional list of exact-substring secrets to mask
- *                      (e.g. webhook token, Groq key). Passed through to
- *                      redactSecrets on every send.
- * @param richLatch     Optional M1 rich-message capability latch. When the
- *                      rich send fails with a `capability` error we flip
- *                      `sendDisabled` so subsequent rich attempts short-
- *                      circuit to fallback without hitting Telegram. When
- *                      omitted, sendRichMessage always reports `{ fallback }`
- *                      (the layered chain then uses the HTML path) so a
- *                      mis-wired build degrades safely instead of crashing.
- */
 /** Each secret as written and in the escaped forms it takes in rendered Telegram HTML. */
 function htmlSecretForms(secrets: ReadonlyArray<string>): string[] {
   return [...new Set(secrets.flatMap(secret => [secret, escapeHtml(secret), escapeHtmlAttr(secret),
@@ -135,72 +120,109 @@ export function redactOutboundText(text: string, parseMode: 'MarkdownV2' | 'HTML
   return redactSecrets(text, parseMode === 'HTML' ? htmlSecretForms(secrets) : secrets)
 }
 
-// The length Telegram checks against its message limit: what it shows for HTML, the raw text otherwise.
-function shownLength(text: string, parseMode: 'MarkdownV2' | 'HTML' | undefined): number {
-  return parseMode === 'HTML' ? telegramTextLength(text) : text.length
+/**
+ * The masked text Telegram will show for `text` sent with `parseMode`, its formatting as entities. Masking can
+ * grow a message (`[REDACTED]` is longer than a short value) past the limit Telegram counts on what it shows:
+ * that is refused before the request, so the caller splits the text instead of losing it to a 400.
+ */
+function shownMasked(text: string, parseMode: SourceFormat, secrets: ReadonlyArray<string> | undefined,
+  limit: number = MESSAGE_HARD_LIMIT, entities?: Entity[], before?: string): VisibleText {
+  // A caller that planned the shown text itself (a reply piece) passes its entities and no parse_mode, and the
+  // shown text already sent ahead of the piece: the two are masked as one text (see maskPiece).
+  const shown = entities !== undefined && parseMode === undefined ? { text, entities } : render(text, parseMode)
+  const visible = maskPiece(shown, secrets, before)
+  if (visible.text.length > limit && shown.text.length <= limit) {
+    throw new MaskedOverflowError('the masked message is longer than Telegram allows; nothing was sent')
+  }
+  return visible
 }
 
+// What a send reports it sent, for render records: Telegram HTML of the masked shown text when it has formatting
+// or came from markup, the text itself when it was plain all along. Never sent anywhere.
+function sentRecord(visible: VisibleText, formatted: boolean): SentText {
+  return formatted || visible.entities.length > 0
+    ? { text: visibleToHtml(visible), format: 'HTML' } : { text: visible.text, format: 'plain' }
+}
+
+// The refusal of explicit entities: the 400 «can't parse entities» family, an ENTITY_* error code, or a description
+// about an entity's bounds, offset or length.
+const ENTITY_REFUSAL_RE = /\bENTITY_[A-Z_]+\b|\bentit(?:y|ies)\b[^.]*\b(?:bounds|offset|length|invalid)\b/i
+
+function errorTexts(error: object): string[] {
+  const texts: string[] = []
+  if ('description' in error && typeof error.description === 'string') texts.push(error.description)
+  if ('message' in error && typeof error.message === 'string') texts.push(error.message)
+  return texts
+}
+
+/**
+ * Telegram's definite refusal of a request's entities (a 400 that names them): the same text goes once more
+ * without them. A pure function of the error; nothing else counts.
+ */
+export function isEntityRejection(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('error_code' in error) || error.error_code !== 400) return false
+  return isTelegramHtmlParseError(error) || errorTexts(error).some(text => ENTITY_REFUSAL_RE.test(text))
+}
+
+/**
+ * Send `visible` through `attempt` with its entities; when Telegram refuses them, once more as the same text
+ * without them. Every text route shares it, so a refusal never turns into a different text (markup, a source).
+ */
+async function withEntityRetry<T>(visible: VisibleText, log: Logger, route: string,
+  attempt: (entities: Entity[]) => Promise<T>): Promise<{ value: T; shown: VisibleText }> {
+  try {
+    return { value: await attempt(visible.entities), shown: visible }
+  } catch (error) {
+    if (visible.entities.length === 0 || !isEntityRejection(error)) throw error
+    log.warn(`telegram refused the entities, ${route} the same text without formatting`)
+    return { value: await attempt([]), shown: { text: visible.text, entities: [] } }
+  }
+}
+
+/**
+ * Wrap the raw TelegramApi so every text-sending call goes out as masked shown text plus entities.
+ *
+ * @param raw           The underlying TelegramApi (typically createTelegramApi()).
+ * @param log           Channel logger.
+ * @param extraSecrets  Optional list of exact-substring secrets to mask
+ *                      (e.g. webhook token, Groq key). A live list: values
+ *                      appended later are masked on the next send.
+ * @param richLatch     Optional M1 rich-message capability latch. The bridge
+ *                      passes none: rich messages are markup Telegram renders,
+ *                      with no text + entities form, so sendRichMessage then
+ *                      always reports `{ fallback }` and the caller sends text.
+ */
 export function createSafeTelegramApi(
   raw: TelegramApi,
   log: Logger,
   extraSecrets?: ReadonlyArray<string>,
   richLatch?: RichLatch,
 ): TelegramApi {
-  const sanitize = (
-    text: string,
-    parseMode: 'MarkdownV2' | 'HTML' | undefined,
-  ): { text: string; parseMode: 'MarkdownV2' | 'HTML' | undefined } => {
-    // Redact first — secrets must be stripped regardless of parse mode. HTML text
-    // carries a secret in its escaped form (`&` as `&amp;`), so those forms are
-    // masked too; callers still redact the source before rendering.
-    // The escaped forms are derived per send: a secret registered after this wrapper was built is masked too.
-    const redacted = redactSecrets(text, parseMode === 'HTML' && extraSecrets !== undefined
-      ? htmlSecretForms(extraSecrets) : extraSecrets)
-    if (parseMode !== 'HTML') {
-      return { text: redacted, parseMode }
-    }
-    const validated = validateTelegramHtml(redacted)
-    // Markup can separate a token from the prefix that marks it (`Bearer <b>…</b>`): the text Telegram shows
-    // joins them. When that visible text still holds a secret, send it masked as plain text.
-    const visible = validated.downgraded ? '' : htmlToPlainText(validated.text)
-    if (!validated.downgraded && redactSecrets(visible, extraSecrets) !== visible) {
-      log.warn('telegram html downgrade', { reason: 'secret in visible text' })
-      return { text: redactSecrets(visible, extraSecrets), parseMode: undefined }
-    }
-    if (validated.downgraded) {
-      // Telegram-bound payload is unknown to the operator, so log only the
-      // classification (reason). The original text is intentionally NOT in
-      // ctx — even after redaction it may carry sensitive context the
-      // caller didn't whitelist.
-      log.warn('telegram html downgrade', { reason: validated.reason ?? 'unknown' })
-      // Decoding entities could reassemble a secret written as numeric entities.
-      return { text: redactSecrets(validated.text, extraSecrets), parseMode: undefined }
-    }
-    return { text: validated.text, parseMode }
+  // A caption has no parse_mode on this interface: it is plain text, masked and sent with caption entities.
+  // The upload's name is shown too (the document's title in the chat): the explicit one, or the one grammY takes
+  // from the path, is masked like text.
+  const safeCaption = (filePath: string, opts: SendDocumentOpts): SendDocumentOpts => {
+    const filename = maskString(opts.filename ?? basename(filePath), extraSecrets)
+    if (typeof opts.caption !== 'string') return { ...opts, filename }
+    const caption = shownMasked(opts.caption, undefined, extraSecrets, CAPTION_LIMIT)
+    return { ...opts, filename, caption: caption.text, caption_entities: caption.entities }
   }
 
   return {
-    // The redaction choke point for every outgoing text: the result carries the payload actually sent.
+    // The redaction choke point for every outgoing text: the source is rendered to the text Telegram shows,
+    // masked there, and sent as text + entities without a parse_mode. The result carries what was sent.
     async sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<SentMessage> {
-      const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
-      // Masking can grow a message (`[REDACTED]` is longer than a short value) past the limit Telegram counts on
-      // what it shows. Refuse before the request so the caller splits the text instead of losing it to a 400.
-      if (shownLength(safeText, parseMode) > TELEGRAM_MAX_MESSAGE &&
-          shownLength(text, opts.parse_mode) <= TELEGRAM_MAX_MESSAGE) {
-        throw new MaskedOverflowError('the masked message is longer than Telegram allows; nothing was sent')
-      }
-      // Rebuild opts without mutating caller's object.
-      const safeOpts: SendMessageOpts = { ...opts }
-      if (parseMode === undefined) {
-        delete safeOpts.parse_mode
-      } else {
-        safeOpts.parse_mode = parseMode
-      }
+      const visible = shownMasked(text, opts.parse_mode, extraSecrets, MESSAGE_HARD_LIMIT, opts.entities,
+        opts.sentBefore)
+      const { parse_mode: parseMode, ...rest } = opts
+      const safeOpts: SendMessageOpts = { ...rest, entities: visible.entities }
       if (safeOpts.reply_markup) {
         safeOpts.reply_markup = redactReplyMarkup(safeOpts.reply_markup, extraSecrets)
       }
-      const result = await raw.sendMessage(chatId, safeText, safeOpts)
-      return { ...result, sent: { text: safeText, format: parseMode ?? 'plain' } }
+      const { value, shown } = await withEntityRetry(visible, log, 'sending',
+        entities => raw.sendMessage(chatId, visible.text, { ...safeOpts, entities }))
+      // A retry without the entities sent plain text, whatever markup the source had.
+      return { ...value, sent: sentRecord(shown, shown === visible && parseMode !== undefined) }
     },
 
     // Widget html is CODE, not prose: redaction must never silently rewrite it
@@ -214,7 +236,8 @@ export function createSafeTelegramApi(
         while (offset < params.html.length && params.html[offset] === redacted[offset]) offset += 1
         throw new WidgetPreSendError(`widget html looks like it contains a secret at offset ${offset}; nothing was sent`)
       }
-      return raw.sendWidget(chatId, { ...params, caption: redactSecrets(params.caption, extraSecrets) })
+      const caption = shownMasked(params.caption, undefined, extraSecrets, CAPTION_LIMIT).text
+      return raw.sendWidget(chatId, { ...params, caption })
     },
 
     async sendRichMessage(
@@ -270,22 +293,21 @@ export function createSafeTelegramApi(
       }
     },
 
-    // A Rich Message edit is redacted like a rich send and reports the Markdown it sent.
+    // A Rich Message edit becomes a text + entities edit: its Markdown is rendered the way a reply is
+    // (Markdown → Telegram HTML → shown text), masked, and sent as text. If Telegram refuses to turn a rich
+    // message into text, its error reaches the caller. A refusal of the entities edits to the same text without
+    // them, as every text route does.
     async editRichMessage(chatId: string, messageId: number, rawMarkdown: string): Promise<EditResult> {
-      if (raw.editRichMessage === undefined) throw new Error('editRichMessage is not available on this transport')
-      const redacted = redactSecrets(rawMarkdown, extraSecrets)
-      await raw.editRichMessage(chatId, messageId, redacted)
-      return { sent: { text: redacted, format: 'rich' } }
+      const visible = shownMasked(markdownToTelegramHtml(rawMarkdown), 'HTML', extraSecrets)
+      const { shown } = await withEntityRetry(visible, log, 'editing to',
+        entities => raw.editMessageText(chatId, messageId, visible.text, { entities }))
+      return { sent: sentRecord(shown, shown === visible) }
     },
 
     async editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void> {
-      const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
-      const safeOpts: EditOpts = { ...opts }
-      if (parseMode === undefined) {
-        delete safeOpts.parse_mode
-      } else {
-        safeOpts.parse_mode = parseMode
-      }
+      const visible = shownMasked(text, opts.parse_mode, extraSecrets, MESSAGE_HARD_LIMIT, opts.entities)
+      const { parse_mode: _parseMode, ...rest } = opts
+      const safeOpts: EditOpts = { ...rest, entities: visible.entities }
       // PRX-1 TASK-2 (2026-05-27): edit-time reply_markup mutation needs
       // the same secret-redaction treatment as the send path. Without
       // this an inline keyboard re-render (multi-select toggle, etc.)
@@ -301,12 +323,11 @@ export function createSafeTelegramApi(
       if (opts?.reply_markup !== undefined) {
         safeOpts.reply_markup = redactReplyMarkup(opts.reply_markup, extraSecrets)
       }
-      return raw.editMessageText(chatId, messageId, safeText, safeOpts)
+      await withEntityRetry(visible, log, 'editing to',
+        entities => raw.editMessageText(chatId, messageId, visible.text, { ...safeOpts, entities }))
     },
 
-    // ─── Pass-through methods ────────────────────────────────────────
-    // These accept no user-controlled HTML text. Captions could carry user
-    // text but Phase A1 keeps the scope tight; see header comment.
+    // ─── Pass-through methods (no user text) and captions ───────────
 
     async setMessageReaction(chatId: string, messageId: number, emoji: string): Promise<void> {
       return raw.setMessageReaction(chatId, messageId, emoji)
@@ -317,22 +338,11 @@ export function createSafeTelegramApi(
     },
 
     async sendDocument(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<SendFileResult> {
-      // Caption is plain text on Telegram unless parse_mode is set on the
-      // raw call (we don't expose that here). Redact it defensively in case
-      // the caller threaded user text into the caption.
-      const safeOpts: SendDocumentOpts = { ...opts }
-      if (typeof safeOpts.caption === 'string') {
-        safeOpts.caption = redactSecrets(safeOpts.caption, extraSecrets)
-      }
-      return raw.sendDocument(chatId, filePath, safeOpts)
+      return raw.sendDocument(chatId, filePath, safeCaption(filePath, opts))
     },
 
     async sendPhoto(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<SendFileResult> {
-      const safeOpts: SendDocumentOpts = { ...opts }
-      if (typeof safeOpts.caption === 'string') {
-        safeOpts.caption = redactSecrets(safeOpts.caption, extraSecrets)
-      }
-      return raw.sendPhoto(chatId, filePath, safeOpts)
+      return raw.sendPhoto(chatId, filePath, safeCaption(filePath, opts))
     },
 
     async downloadFile(fileId: string, destDir: string): Promise<DownloadResult> {
@@ -348,25 +358,25 @@ export function createSafeTelegramApi(
       text: string,
       opts: AnswerGuestQueryOpts,
     ): Promise<void> {
-      // Guest answers land in a PUBLIC foreign chat — redaction here is the
-      // last line of defence, exactly like sendMessage. HTML downgrade
-      // follows the same rule: invalid Telegram HTML ships as plain text.
-      const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
-      const safeOpts: AnswerGuestQueryOpts = { ...opts }
+      // Guest answers land in a PUBLIC foreign chat — masking here is the
+      // last line of defence, exactly like sendMessage. With a file the text
+      // is the file's caption, so the caption limit applies.
+      const visible = shownMasked(text, opts.parse_mode, extraSecrets,
+        opts.file === undefined ? MESSAGE_HARD_LIMIT : CAPTION_LIMIT)
+      const { parse_mode: _parseMode, ...rest } = opts
+      const safeOpts: AnswerGuestQueryOpts = { ...rest, entities: visible.entities }
       // An attachment's title is its FILE NAME and lands in the same public
-      // chat as the caption — redact it on the same last line of defence.
+      // chat as the caption — mask it on the same last line of defence.
       if (safeOpts.file !== undefined) {
         safeOpts.file = {
           ...safeOpts.file,
-          title: redactSecrets(safeOpts.file.title, extraSecrets),
+          title: maskString(safeOpts.file.title, extraSecrets),
         }
       }
-      if (parseMode === undefined) {
-        delete safeOpts.parse_mode
-      } else {
-        safeOpts.parse_mode = parseMode
-      }
-      return raw.answerGuestQuery(guestQueryId, safeText, safeOpts)
+      // A refusal of the entities answers with the same text without them, never with another body: a failed
+      // call does not consume the query.
+      await withEntityRetry(visible, log, 'answering with',
+        entities => raw.answerGuestQuery(guestQueryId, visible.text, { ...safeOpts, entities }))
     },
   }
 }

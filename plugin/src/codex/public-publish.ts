@@ -71,9 +71,10 @@ export function publishExclusive(directory: string, name: string, bytes: string,
   } catch (error) {
     const code = errorCode(error)
     if (code !== undefined && NO_HARD_LINKS.has(code)) {
-      throw new PublishUnsupportedError('Многопользовательский режим (KROT_MULTIUSER=1) не запускается: файловая система папки ' +
-        directory + ' не поддерживает жёсткие ссылки, а без них мост не может надёжно сохранить отметку. ' +
-        'Перенесите папку состояния моста на обычный диск (например, ext4 или APFS) или выключите KROT_MULTIUSER.')
+      throw new PublishUnsupportedError('Многопользовательский режим (KROT_MULTIUSER=1) не запускается: ' +
+        'файловая система не поддерживает жёсткие ссылки, а без них мост не может надёжно сохранить отметку. ' +
+        'Перенесите папку состояния моста на обычный диск (например, ext4 или APFS) или выключите KROT_MULTIUSER. ' +
+        'Папка, где возникла ошибка: ' + directory)
     }
     throw error
   }

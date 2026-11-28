@@ -6,7 +6,7 @@ import { createTelegramApi, type TelegramApi } from '../channel/tools.js'
 import type { Logger } from '../log.js'
 import { createRateLimitedTelegramApi } from '../safety/rate-limited-telegram-api.js'
 import { createReliableTelegramApi, type OutboundDeadLetter } from '../safety/reliable-telegram-api.js'
-import { createRichLatch } from '../safety/rich-latch.js'
+import { maskPiece, type VisibleText } from '../format/visible.js'
 import { redactSecrets } from '../safety/redact.js'
 import { createSafeTelegramApi } from '../safety/safe-telegram-api.js'
 
@@ -25,11 +25,15 @@ export function createTelegramStack(options: {
   deadLetter: (record: OutboundDeadLetter) => void
 }): TelegramStack {
   const { bot, token, log, secrets, deadLetter } = options
+  // The wire guard masks every text payload once more right before HTTP: the rate limiter may sleep and
+  // retry a captured payload, and `secrets` is a live list that grows at run time. No rich latch: rich
+  // messages have no text + entities form, so the safe wrapper answers `{ fallback }` and callers send text.
+  // A reply piece carries the shown text sent before it: the seam is checked again on every attempt.
+  const guard = (visible: VisibleText, before?: string): VisibleText => maskPiece(visible, secrets, before)
   const safeTelegram = createSafeTelegramApi(
-    createRateLimitedTelegramApi(createTelegramApi(bot, token), log),
+    createRateLimitedTelegramApi(createTelegramApi(bot, token, guard), log),
     log,
     secrets,
-    createRichLatch(),
   )
   const reliableTelegram = createReliableTelegramApi(safeTelegram, log, { deadLetter })
   return { safeTelegram, reliableTelegram }
