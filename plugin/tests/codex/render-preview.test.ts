@@ -54,14 +54,13 @@ test('[R42] a draft document body masks a token exposed by plain conversion', ()
   expect(png(preview).equals(png(masked))).toBe(true)
 })
 
-test('[R42] a draft plain fallback masks a token exposed by plain conversion', () => {
-  // A raw HTML file link forces plain text; Markdown file links are rendered as code paths.
-  const link = '<a href="file:///tmp/x">link</a>'
+test('[R42] a draft masks a token that markup separates from its prefix in the shown text', () => {
+  // Masking runs on the text Telegram shows, where the bold tags no longer separate `Bearer` and the value.
   const value = 'mock-value-123'
   const options = { shown: () => undefined, secrets: [] }
-  const preview = renderPreview({ text: link + ' Bearer **' + value + '**' }, options)
-  const masked = renderPreview({ text: link + ' Bearer [REDACTED]' }, options)
-  expect(JSON.parse(preview.contentItems[0].text)).toMatchObject({ formats: ['plain'] })
+  const preview = renderPreview({ text: '[link](file:///tmp/x) Bearer **' + value + '**' }, options)
+  const masked = renderPreview({ text: '[link](file:///tmp/x) Bearer **[REDACTED]**' }, options)
+  expect(JSON.parse(preview.contentItems[0].text)).toMatchObject({ formats: ['HTML'] })
   expect(png(preview).equals(png(masked))).toBe(true)
 })
 
@@ -90,8 +89,8 @@ test('[R42] render_preview returns a Telegram-like PNG of a draft and of a sent 
 })
 
 test('[R42] a draft never draws a secret that markup splits in the source', () => {
-  // The picture is drawn from these parts: the masked plain fallback, as the send delivers it.
-  expect(draftSend('Ключ MA**SK**ME тут', ['MASKME']).parts).toEqual([{ format: 'plain', text: 'Ключ [REDACTED] тут' }])
+  // The picture is drawn from these parts: the masked shown text, as the send delivers it.
+  expect(draftSend('Ключ MA**SK**ME тут', ['MASKME']).parts).toEqual([{ format: 'HTML', text: 'Ключ [REDACTED] тут' }])
   const preview = renderPreview({ text: 'Ключ MA**SK**ME тут' }, { shown: () => undefined, secrets: ['MASKME'] })
-  expect(JSON.parse(preview.contentItems[0].text)).toMatchObject({ formats: ['plain'] })
+  expect(JSON.parse(preview.contentItems[0].text)).toMatchObject({ formats: ['HTML'] })
 })

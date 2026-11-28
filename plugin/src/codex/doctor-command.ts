@@ -21,7 +21,7 @@ import { DEFAULT_BRIDGE_UNIT_NAME } from './unit-contract.js'
 // bridge with its GitHub repository and the recent entries of the bridge's error journal.
 
 export interface DoctorCheck { status: 'ok' | 'info' | 'warning' | 'error'; message: string }
-export interface DoctorProblem { text: string; fix?: string }
+export interface DoctorProblem { text: string; fix?: string; urgent?: boolean }
 export interface DoctorReport {
   problems: DoctorProblem[]; commit?: string; upstream?: string; codexVersion?: string
   upstreamInfo?: string
@@ -474,7 +474,7 @@ export async function collectDoctorReport(options: DoctorOptions): Promise<Docto
   if (options.updates) {
     const updates = await Promise.resolve().then(() => options.updates?.()).catch(() => undefined)
     if (updates) report.updates = updateStatusLines(updates)
-    if (updates?.guard) report.problems.push({ text: updates.guard, fix: 'на сервере выполни ./install.sh --start.' })
+    if (updates?.guard) report.problems.push({ text: updates.guard, fix: 'на сервере выполни ./install.sh --start.', urgent: true })
   }
   const errors = options.errors?.()
   // Only errors and a warning that keeps repeating are problems; other warnings are an info line with the counts.
@@ -563,7 +563,8 @@ export function formatDoctorReport(report: DoctorReport, maxChars = Number.POSIT
   if (!report.problems.length) return ['🩺 Доктор: всё в порядке.', ...facts].join('\n')
   const head = [`🩺 Доктор нашёл проблемы: ${report.problems.length}.`, '']
   const tail = facts.length ? ['', ...facts] : []
-  const items = report.problems.map((problem, index) =>
+  const problems = [...report.problems].sort((a, b) => Number(b.urgent ?? false) - Number(a.urgent ?? false))
+  const items = problems.map((problem, index) =>
     `${index + 1}. ${problem.text}` + (problem.fix ? `\n   Как исправить: ${problem.fix}` : ''))
   const fixed = [...head, ...tail].join('\n').length + 1
   return [...head, ...(Number.isFinite(maxChars) ? fitProblems(items, maxChars - fixed) : items), ...tail].join('\n')
@@ -575,6 +576,7 @@ function redactReport(report: DoctorReport, secrets: readonly string[]): DoctorR
     ...(report.upstreamInfo ? { upstreamInfo: redactSecrets(report.upstreamInfo, secrets) } : {}),
     ...(report.ownerInstructions ? { ownerInstructions: report.ownerInstructions.map(line => redactSecrets(line, secrets)) } : {}),
     problems: report.problems.map(problem => ({
+      ...problem,
       text: redactSecrets(problem.text, secrets),
       ...(problem.fix === undefined ? {} : { fix: redactSecrets(problem.fix, secrets) }),
     })),

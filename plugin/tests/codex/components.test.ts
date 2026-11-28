@@ -43,7 +43,7 @@ function bridge(api: Partial<{
       return { message_id: ++next }
     }),
     deleteMessage: api.deleteMessage ?? (async (chat, id) => { calls.push(['delete', chat, id]) }),
-  }, OWNER, { beforeSend: async () => { order.push('hud') } })
+  }, OWNER, { beforeSend: async () => { order.push('hud') }, widgets: true })
   const pins: number[] = []
   const actions = new AgentChatActions({
     sendMessage: unexpected, editMessageText: unexpected, setMessageReaction: unexpected,
@@ -272,7 +272,7 @@ test('[R12] a turn stopped while Telegram refuses the widget gets no text copy',
     },
     async sendMessage() { calls.push('text'); return { message_id: 6 } },
     async deleteMessage() { calls.push('delete') },
-  }, OWNER)
+  }, OWNER, { widgets: true })
   const outcome = await components.run('send_component', { component: 'kpi', data: pack('kpi', 'example.json') }, () => true, () => current)
   expect(outcome.ok).toBe(false)
   expect(outcome.message_ids).toEqual([])
@@ -565,7 +565,7 @@ test('[R85] a widget Telegram refuses is logged at warn with its error code and 
     },
     async sendMessage() { return { message_id: 6 } },
     async deleteMessage() {},
-  }, OWNER, { log: { warn: (message, context) => { warnings.push([message, context]) } } })
+  }, OWNER, { log: { warn: (message, context) => { warnings.push([message, context]) } }, widgets: true })
   const outcome = await components.run('send_component', { component: 'kpi', data: pack('kpi', 'example.json') }, () => true)
   expect(outcome.delivery).toBe('text')
   expect(warnings).toHaveLength(1)

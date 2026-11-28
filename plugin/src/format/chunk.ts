@@ -16,8 +16,6 @@
 // reopened (with its attributes, so a link keeps its href) on the next, so
 // each chunk on its own is valid HTML Telegram accepts with parse_mode=HTML.
 
-import { escapeHtml, escapeHtmlAttr } from './html.js'
-
 export const TELEGRAM_MAX_MESSAGE = 4096
 const DEFAULT_MAX = 4000
 
@@ -33,7 +31,7 @@ const NAMED_ENTITIES: ReadonlyMap<string, string> = new Map([['lt', '<'], ['gt',
 const TAG_RE = /<(\/?)([a-zA-Z][\w-]*)((?:[^<>"']|"[^"]*"|'[^']*')*)>/y
 const ENTITY_RE = /&(?:#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6})|([a-zA-Z]+));/y
 
-interface Token {
+export interface Token {
   /** The source text of the token. */
   raw: string
   /** What Telegram shows for it; its length is what Telegram counts. */
@@ -51,7 +49,7 @@ function decodeEntity(match: RegExpExecArray): string | undefined {
 }
 
 // `markup` false: plain text, where every code point is literal (no tags, no entities).
-function tokenize(html: string, markup = true): Token[] {
+export function tokenize(html: string, markup = true): Token[] {
   const tokens: Token[] = []
   let i = 0
   while (i < html.length) {
@@ -133,47 +131,6 @@ function plainLinkSegments(html: string): { text: string; link?: boolean }[] {
   }
   segments.push({ text: shown })
   return segments
-}
-
-/** Expand every destination before fitting the fallback to Telegram's message limit. */
-export function splitPlainFallback(html: string, max: number = TELEGRAM_MAX_MESSAGE): string[] {
-  const segments = plainLinkSegments(html)
-  const tokens = segments.flatMap(({ text, link }) => {
-    if (!link || text.length - 3 > max) return tokenize(text, false)
-    if (text.length <= max) return [{ raw: text, plain: text }]
-    // The URL itself still fits. Keep it together even if the parentheses spill over.
-    const url = text.slice(2, -1)
-    return [{ raw: ' (', plain: ' (' }, { raw: url, plain: url }, { raw: ')', plain: ')' }]
-  })
-  return splitTokens(segments.map(segment => segment.text).join(''), tokens, max)
-}
-
-/**
- * The plain fallback of `html` cut into messages, masked as one text: a cut can split a token or separate it from the
- * prefix that marks it (`Bearer` | value), which no per-message redaction sees. When the whole plain text holds
- * anything `redact` masks, the masked whole is what is split.
- */
-export function maskedPlainFallback(html: string, redact: (text: string) => string,
-  max: number = TELEGRAM_MAX_MESSAGE): string[] {
-  const whole = plainTextWithLinks(html, Infinity)
-  const masked = redact(whole)
-  return masked === whole ? splitPlainFallback(html, max) : splitPlainMessage(masked, max)
-}
-
-/**
- * The parts of `html` from splitMessage, unless the text Telegram shows for the whole still holds something `redact`
- * masks (markup inside a value, `MA<b>SK</b>ME`, or between a token and its prefix): then the reply becomes one part,
- * its masked plain fallback escaped as HTML, so no saved plan, queued message or draft keeps the joined value.
- * `onMasked` gets that part: the sender delivers it through maskedPlainFallback (plain text, split unchanged), as the
- * reply Telegram would have shown without its formatting.
- */
-export function maskShownSecrets(parts: string[], html: string, redact: (text: string) => string,
-  onMasked?: (part: string) => void): string[] {
-  const shown = htmlToPlainText(html)
-  if (redact(shown) === shown) return parts
-  const masked = escapeHtml(redact(plainTextWithLinks(html, Infinity)))
-  onMasked?.(masked)
-  return [masked]
 }
 
 /** The length Telegram checks against its message limit: the text after entity parsing, in UTF-16 units. */
@@ -298,166 +255,6 @@ export function splitMessage(text: string, max: number = DEFAULT_MAX): string[] 
  */
 export function splitPlainMessage(text: string, max: number = DEFAULT_MAX): string[] {
   return splitTokens(text, tokenize(text, false), max)
-}
-
-interface HtmlRedaction {
-  redact: (html: string) => string
-  secrets: readonly string[]
-}
-
-function balancedSeam(left: string, right: string): { close: number; reopen: number } {
-  const closing = /(?:<\/[a-z][\w-]*>)+$/i.exec(left)
-  if (!closing) return { close: 0, reopen: 0 }
-  const open: OpenTag[] = []
-  for (const token of tokenize(left.slice(0, closing.index))) track(open, token)
-  const prefix = open.map(tag => tag.raw).join('')
-  if (prefix && right.startsWith(prefix) &&
-    open.slice().reverse().map(tag => `</${tag.name}>`).join('') === closing[0].toLowerCase()) {
-    return { close: closing[0].length, reopen: prefix.length }
-  }
-  return { close: 0, reopen: 0 }
-}
-
-/** Rebuild only the unattempted tail of a saved plan when current redaction changes its source. */
-export function resumeMessagePlan(parts: readonly string[], attempted: number, redaction: HtmlRedaction): string[] | undefined {
-  if (attempted >= parts.length) return undefined
-  const body: string[] = []
-  let from = 0
-  let offset = 0
-  for (const [index, part] of parts.entries()) {
-    const { close, reopen } = balancedSeam(part, parts[index + 1] ?? '')
-    const text = part.slice(from, part.length - close)
-    body.push(text)
-    if (index < attempted) offset += text.length
-    from = reopen
-  }
-  const html = body.join('')
-  if (redaction.redact(html) === html) return undefined
-  return splitMessageFrom(html, offset, DEFAULT_MAX, redaction)
-}
-
-/** Locate an old receipt cut in a separately rendered, redacted copy of the reply. */
-export function redactedRenderOffset(original: string, redacted: string, cut: number): number {
-  let prefix = 0
-  while (prefix < cut && original[prefix] === redacted[prefix]) prefix += 1
-  if (prefix === cut) return cut
-  let oldEnd = original.length
-  let newEnd = redacted.length
-  while (oldEnd > prefix && newEnd > prefix && original[oldEnd - 1] === redacted[newEnd - 1]) {
-    oldEnd -= 1
-    newEnd -= 1
-  }
-  if (cut >= oldEnd) return newEnd + cut - oldEnd
-
-  // Use Myers' edit frontier to map cuts between redactions. Keep only the furthest path on
-  // each diagonal and the revised offset where that path crossed the old cut.
-  type Path = { end: number; mapped: number | undefined }
-  let frontier = new Map<number, Path>([[1, { end: prefix, mapped: undefined }]])
-  for (let edits = 0; edits <= 512; edits++) {
-    const next = new Map<number, Path>()
-    for (let diagonal = -edits; diagonal <= edits; diagonal += 2) {
-      const insertion = frontier.get(diagonal + 1)
-      const deletion = frontier.get(diagonal - 1)
-      const fromInsertion = insertion && insertion.end - diagonal <= newEnd ? insertion.end : -1
-      const fromDeletion = deletion && deletion.end < oldEnd ? deletion.end + 1 : -1
-      let before = Math.max(fromInsertion, fromDeletion)
-      if (before < 0) continue
-      let after = before - diagonal
-      let mapped = (fromDeletion > fromInsertion ? deletion : insertion)?.mapped
-      do {
-        if (before === cut && mapped === undefined) mapped = after
-        if (before === oldEnd || after === newEnd || original[before] !== redacted[after]) break
-        before += 1
-        after += 1
-      } while (true)
-      if (before === oldEnd && after === newEnd) return mapped ?? newEnd
-      next.set(diagonal, { end: before, mapped })
-    }
-    frontier = next
-  }
-  // Resume from the proven common prefix when the edit budget runs out. This may repeat text.
-  return prefix
-}
-
-// Move a seam past any configured value it would otherwise split.
-function afterCrossingValues(text: string, offset: number, values: Iterable<string>): number {
-  let previous: number
-  do {
-    previous = offset
-    for (const value of values) {
-      const from = Math.max(0, offset - value.length + 1)
-      const start = text.slice(from, offset + value.length - 1).indexOf(value)
-      if (start >= 0 && from + start < offset) offset = from + start + value.length
-    }
-  } while (previous < offset && offset < text.length)
-  return offset
-}
-
-/** Keep saved plain receipt slots, moving only fragments of newly configured secrets across a seam. */
-export function protectPlainFallbackCuts(parts: readonly string[], secrets: readonly string[]): readonly string[] {
-  const values = secrets.filter(secret => secret.length >= 4)
-  if (parts.length < 2 || values.length === 0) return parts
-  const body = parts.join('')
-  let start = 0
-  let originalEnd = 0
-  return parts.map(part => {
-    originalEnd += part.length
-    const end = Math.max(start, afterCrossingValues(body, originalEnd, values))
-    const piece = body.slice(start, end)
-    start = end
-    return piece
-  })
-}
-
-/**
- * Saved plain pieces masked as one text, one piece per saved slot: a pattern match across a saved cut (`Bearer` |
- * value) is masked too, and each cut moves to its place in the masked text, so `:plain:N` receipts keep their pieces.
- */
-export function maskAcrossCuts(pieces: readonly string[], redact: (text: string) => string): string[] {
-  const whole = pieces.join('')
-  const masked = redact(whole)
-  if (masked === whole) return [...pieces]
-  let start = 0
-  let originalEnd = 0
-  return pieces.map((piece, index) => {
-    originalEnd += piece.length
-    const end = index === pieces.length - 1 ? masked.length
-      : Math.min(masked.length, Math.max(start, redactedRenderOffset(whole, masked, originalEnd)))
-    const slice = masked.slice(start, end)
-    start = end
-    return slice
-  })
-}
-
-/**
- * Split the Telegram HTML `html` from source offset `offset` on, as splitMessage does, with every supported tag open
- * at that offset reopened on the first chunk. An offset inside a tag or an entity starts at that token, so a cut
- * taken from another chunker repeats a character rather than losing one.
- */
-export function splitMessageFrom(html: string, offset: number, max: number = DEFAULT_MAX,
-  redaction?: HtmlRedaction): string[] {
-  const tokens = tokenize(html)
-  // Keep the original offset. If it cuts a newly configured secret in half, exclude the
-  // unsent fragment before applying current redaction to the entire remaining HTML.
-  if (redaction && offset > 0) {
-    const forms = new Set(redaction.secrets.filter(secret => secret.length >= 4).flatMap(secret =>
-      [secret, escapeHtml(secret), escapeHtmlAttr(secret), secret.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')]))
-    offset = afterCrossingValues(html, offset, forms)
-  }
-  const open: OpenTag[] = []
-  let start = 0
-  let position = 0
-  while (start < tokens.length && position + tokens[start]!.raw.length <= offset) {
-    track(open, tokens[start]!)
-    position += tokens[start]!.raw.length
-    start += 1
-  }
-  if (redaction) {
-    if (position >= html.length) return []
-    const tail = open.map(tag => tag.raw).join('') + html.slice(position)
-    return splitMessage(redaction.redact(tail), max)
-  }
-  return splitTokens(html, tokens, max, start, open)
 }
 
 function splitTokens(text: string, tokens: readonly Token[], max: number, from = 0, inherited: OpenTag[] = [],

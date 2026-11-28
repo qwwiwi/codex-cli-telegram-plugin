@@ -10,3 +10,9 @@ export class WidgetPreSendError extends Error {
 export class MaskedOverflowError extends Error {
   override readonly name = 'MaskedOverflowError'
 }
+
+// Masking did not settle: a registered value overlaps the mask marker, so every pass changes the text again.
+// Nothing was sent; the send fails closed.
+export class MaskFixedPointError extends Error {
+  override readonly name = 'MaskFixedPointError'
+}

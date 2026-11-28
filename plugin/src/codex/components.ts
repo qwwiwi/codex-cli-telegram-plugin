@@ -239,6 +239,9 @@ type ComponentOptions = {
   secrets?: readonly string[]
   // Shared with the Codex tool catalog and /doctor for this process.
   widgetCapability?: { disabled: boolean }
+  // Try an HTML widget first. Off by default and in the bridge: widget HTML is a program, and what it shows
+  // cannot be read from its source, so the bridge cannot mask it. Components then arrive as their text version.
+  widgets?: boolean
 }
 
 export type ComponentOutcome = {
@@ -389,7 +392,9 @@ export class AgentComponents {
     await this.options.beforeSend?.()
     if (!current()) return { kind: 'failed', reason: 'Ход остановлен, компонент не отправлен.' }
     let replyTo = target
-    let reason = this.widgetCapability.disabled ? 'Виджеты отключены до перезапуска моста.' : checkWidgetChat(this.ownerChat) ??
+    let reason = (this.options.widgets === true ? undefined : 'виджеты отключены, компонент показан текстом') ??
+      (this.widgetCapability.disabled ? 'Виджеты отключены до перезапуска моста.' : undefined) ??
+      checkWidgetChat(this.ownerChat) ??
       (carriesSecret(data, redact) ? 'данные содержат секрет, он скрыт в текстовой версии' : undefined)
     if (reason === undefined) {
       const rendered = renderComponentWidget(component, data)

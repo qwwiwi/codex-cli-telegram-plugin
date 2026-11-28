@@ -3,6 +3,30 @@
 Fork of Krotov-plugin by Pavel Krotov (Apache-2.0, see [NOTICE](NOTICE)); fork point
 upstream `bb1d1ce`. Per-commit details for the first changes: [CHANGES.md](CHANGES.md).
 
+## v0.6.1 – 2026-11-28
+
+[Release notes in English and Russian](docs/releases/v0.6.1.md).
+
+- Masking checks exactly the text the reader sees, including values split by
+  formatting or written with character codes. Links with a protected value in
+  the label or destination become non-clickable. This also applies to edits,
+  guest answers, and photo and document captions.
+- A reply that spans several messages is saved and queued together. After a
+  restart or rate-limit wait, delivery continues from the last sent message
+  and masks values registered in the meantime. The bridge also migrates and
+  masks existing queued replies on first start. If Telegram rejects formatting,
+  the bridge retries once with the same text as plain text.
+- Tables arrive as formatted text with aligned monospace columns. Rich Message
+  edits become text edits. The `richMessages` setting has no effect.
+- `send_component` delivers charts, diagrams, and cards as text.
+- `/doctor` shows damaged generation paths and the boot guard warning before
+  verbose journal entries.
+- If hard links are unavailable, the startup console shows the cause and remedy
+  before the state path, so both fit even when the path is long.
+- Refreshing the installed boot guard keeps its file permissions at `0600`.
+- Known limitation. A value registered after a reply was prepared may stay
+  unmasked in the local queue file until the file is next saved.
+
 ## v0.6.0 – 2026-11-28
 
 [Release notes in English and Russian](docs/releases/v0.6.0.md).

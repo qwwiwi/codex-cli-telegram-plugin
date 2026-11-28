@@ -493,15 +493,23 @@ export class RenderEyes {
   /**
    * The outbox delivered a part identified by its UUID; `sent` is what it actually delivered when that differs from
    * the queued part (a document uploaded with the redactions current at the flush). Record the parked send after all
-   * its queued parts arrive.
+   * its queued parts arrive. A queued reply goes as one or more messages: `more` marks a message that is not its
+   * last, recorded as a part of its own before the queued one, which the last message then fills.
    * A part of no parked send (one queued by an earlier bridge run) is ignored. Never throws.
    */
-  delivered(outboxId: string, messageId: number, sent?: { format: ShownFormat; text: string }): RenderDiff | undefined {
+  delivered(outboxId: string, messageId: number, sent?: { format: ShownFormat; text: string },
+    more = false): RenderDiff | undefined {
     try {
       const at = this.waiting.findIndex(({ queued }) => queued.has(outboxId))
       const waiting = this.waiting[at]
       const index = waiting?.queued.get(outboxId)
       if (!waiting || index === undefined) return undefined
+      if (more) {
+        const part = waiting.parts[index]
+        if (part) waiting.parts.splice(index, 0, { ...part, ...sent, messageId })
+        for (const [id, position] of waiting.queued) if (position >= index) waiting.queued.set(id, position + 1)
+        return undefined
+      }
       waiting.queued.delete(outboxId)
       const part = waiting.parts[index]
       if (part) waiting.parts[index] = { ...part, ...sent, messageId }

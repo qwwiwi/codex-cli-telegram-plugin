@@ -186,30 +186,3 @@ export function splitLongBlock(text: string): string {
     return (apart ? '\n\n' : '\n') + body
   }).join('') + text.slice(content.length)
 }
-
-// The <pre> tracking of the version before paragraph grouping, kept as it was for splitLongBlockLegacy.
-function legacyPreProtectedLines(lines: readonly string[]): boolean[] {
-  let open = false
-  return lines.map(line => {
-    const wasOpen = open
-    const opens = line.match(/<pre\b[^>]*>/giu)?.length ?? 0
-    const closes = line.match(/<\/pre\s*>/giu)?.length ?? 0
-    open = opens > closes || (open && closes === 0)
-    return wasOpen || open
-  })
-}
-
-/**
- * The safety net of the version before paragraph grouping: only prose lines longer than PARAGRAPH_MAX are split at
- * sentence ends. Kept so a reply whose first text parts were sent by that version resumes with the same chunks.
- */
-export function splitLongBlockLegacy(text: string): string {
-  if (text.length <= SPLIT_ABOVE) return text
-  const lines = text.split('\n')
-  const pre = legacyPreProtectedLines(lines)
-  const fence = fenceProtectedLines(lines).map((inFence, index) => inFence || pre[index] === true)
-  if (lines.some((line, index) => !fence[index] && line.trim() === '')) return text
-  return lines.map((line, index) =>
-    fence[index] || BLOCK_START_RE.test(line) || line.length <= PARAGRAPH_MAX ? line : splitLine(line),
-  ).join('\n')
-}

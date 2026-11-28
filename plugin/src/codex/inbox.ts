@@ -2,9 +2,13 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Message } from 'grammy/types'
 import { atomicWriteInRoot } from '../autonomy/store.js'
+import { PreformattedDocumentError } from '../format/chunk.js'
+import { MaskFixedPointError } from '../safety/pre-send-error.js'
+import { redactSecrets } from '../safety/redact.js'
 import type { ContinuationContext } from './continuation.js'
 import type { LeaseTicket } from './lease.js'
 import type { PartStatus } from './reply-delivery.js'
+import { isPlanV3, planFromLegacyParts, resumePlan, type PlanV3 } from './reply-plan.js'
 import { agentFramePrefix, agentProvenance, isProvenance, ownerProvenance, type Provenance } from './provenance.js'
 import { object } from './rpc.js'
 import {
@@ -20,8 +24,8 @@ type Work = { continuation?: ContinuationContext; lease?: LeaseTicket; mayRestar
 type Outcome = { stage: 'claimed' } | { stage: 'running'; turnId?: string; thread?: string } |
   { stage: 'ready'; reply: InboxReply; continueGoal?: true; restartBridge?: true; restartVerification?: true;
     delivery?: Record<string, PartStatus>;
-    // The Telegram HTML chunks the `text:N` receipts refer to, saved before the first text part is sent.
-    textPlan?: string[] }
+    // The masked shown text the `text:N` receipts count pieces of, saved before the first text piece is sent.
+    textPlan?: PlanV3 }
 // `origin`: the turn origin classified when the turn started; a record without one is a guest's.
 type Active = { messages: Message[]; outcome: Outcome; work?: Work; origin?: StoredTurnOrigin }
 // A side turn Codex accepted (turn/start answered); kept until the side turn finishes.
@@ -34,8 +38,13 @@ type Pending = { ready: Message[][]; albums: Record<string, Message[]>; accepted
 
 export class CodexInbox {
   private state: Pending = { ready: [], albums: {}, accepted: [] }
+  private upgradeNotice = false
 
-  constructor(private root: string, private ownerId: number) {
+  /**
+   * @param secrets The live secret list: a saved reply (its source and its plan) is masked with it on load, before
+   *                the first write, so the file never holds a value registered since it was saved.
+   */
+  constructor(private root: string, private ownerId: number, secrets?: ReadonlyArray<string>) {
     try {
       const saved = JSON.parse(readFileSync(join(this.root, filename), 'utf8')) as Omit<Pending, 'followUp'> & {
         followUp?: Message | Message[]
@@ -65,14 +74,12 @@ export class CodexInbox {
       if (legacy && first && state.active?.outcome.stage !== 'claimed') {
         state.origins[String(first.message_id)] = agentProvenance('unknown')
       }
-      // A damaged or empty chunk plan is dropped rather than trusted (an empty one would finish the reply without
-      // its text); its receipts then resume like receipts saved without a plan.
+      // The saved reply plan is upgraded to v3 once, before any send (migrateReplyPlan).
       const outcome = state.active?.outcome
-      if (outcome?.stage === 'ready' && outcome.textPlan !== undefined &&
-          !(Array.isArray(outcome.textPlan) && outcome.textPlan.length > 0 &&
-            outcome.textPlan.every(part => typeof part === 'string'))) {
-        delete outcome.textPlan
-      }
+      const upgraded = outcome?.stage === 'ready' ? migrateReplyPlan(outcome) : 'unchanged'
+      if (upgraded !== 'unchanged') this.upgradeNotice = upgraded === 'notice'
+      // Masked and its cuts mapped (resume steps 2-4) before anything below writes the record.
+      const remasked = outcome?.stage === 'ready' ? maskSavedReply(outcome, secrets) : false
       // A record saved before origins were persisted: with owner provenance and no side thread it was
       // an owner turn on the main thread; anything else is a guest's.
       if (state.active && first && state.active.origin === undefined) {
@@ -86,9 +93,20 @@ export class CodexInbox {
         state.active = withoutOwnerMetadata(state.active)
       }
       this.state = state
+      if (upgraded !== 'unchanged' || remasked) this.save(state)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
+  }
+
+  /**
+   * True once after an upgrade left part of the pending reply unsent (its receipts could not be matched to the
+   * new plan): the bridge tells the owner that the reply may be incomplete.
+   */
+  takeUpgradeNotice(): boolean {
+    const notice = this.upgradeNotice
+    this.upgradeNotice = false
+    return notice
   }
 
   get size(): number {
@@ -270,18 +288,33 @@ export class CodexInbox {
     this.updateActive(id, { ...active.outcome, delivery })
   }
 
-  replyPlan(id: number): readonly string[] | undefined {
+  /** Whether any text piece of the pending reply has a receipt (`text:N`, a legacy `text:N:plain:M` too). */
+  hasTextReceipt(id: number): boolean {
+    const active = this.state.active
+    return active?.messages[0]?.message_id === id && active.outcome.stage === 'ready' &&
+      Object.keys(active.outcome.delivery ?? {}).some(key => TEXT_RECEIPT_RE.test(key))
+  }
+
+  replyPlan(id: number): PlanV3 | undefined {
     const active = this.state.active
     return active?.messages[0]?.message_id === id && active.outcome.stage === 'ready'
       ? active.outcome.textPlan : undefined
   }
 
-  setReplyPlan(id: number, parts: readonly string[]): void {
+  /** Mask the stored reply text with the current secrets, so the record at rest holds no newly registered value. */
+  redactReply(id: number, redact: (text: string) => string): void {
+    const active = this.state.active
+    if (active?.messages[0]?.message_id !== id || active.outcome.stage !== 'ready') return
+    const text = redact(active.outcome.reply.text)
+    if (text !== active.outcome.reply.text) this.updateActive(id, { ...active.outcome, reply: { ...active.outcome.reply, text } })
+  }
+
+  setReplyPlan(id: number, plan: PlanV3): void {
     const active = this.state.active
     if (active?.messages[0]?.message_id !== id || active.outcome.stage !== 'ready') {
       throw new Error('Pending reply changed during delivery')
     }
-    this.updateActive(id, { ...active.outcome, textPlan: [...parts] })
+    this.updateActive(id, { ...active.outcome, textPlan: plan })
   }
 
   finish(id: number): void {
@@ -344,6 +377,122 @@ function withoutOwnerMetadata(active: Active): Active {
   const outcome: Outcome = { stage: 'ready', reply: { ...reply, files: [] },
     ...(textParts.length ? { delivery: Object.fromEntries(textParts) } : {}), ...(textPlan ? { textPlan } : {}) }
   return { ...rest, outcome }
+}
+
+const TEXT_RECEIPT_RE = /^text:\d+(?::plain:\d+)?$/
+// The plain-fallback metadata entry a v0.6 plan kept as its last part.
+const LEGACY_METADATA_PREFIX = '<u data-plain-fallbacks="'
+
+type ReadyOutcome = Extract<Outcome, { stage: 'ready' }>
+
+// A v3 plan with nothing left to send: what an upgrade leaves when no saved part may be sent again.
+const NOTHING_PENDING: PlanV3 = { v: 3, text: '', entities: [], cuts: [] }
+
+/**
+ * Upgrade a pending reply's saved plan to v3, decided by its receipts. Every upgraded record ends with a v3 plan
+ * (or none, with no receipts), so a second run changes nothing.
+ *   A. no text receipt: the old plan is dropped and the reply is planned fresh;
+ *   B. every part has a receipt: nothing is pending (an empty v3 plan);
+ *   C. some parts have receipts, no plain-fallback receipt, every saved part shows text: the parts become one v3
+ *      plan with the same cuts, so the receipts keep their pieces;
+ *   D. anything else (a plain-fallback receipt, a blanked slot, receipts without a plan, plain-fallback metadata,
+ *      an unreadable plan): the pending parts are marked uncertain (never sent automatically), the plan is empty,
+ *      and the owner is told the reply may be incomplete.
+ * `rich` and `text:document` receipts are untouched.
+ */
+export function migrateReplyPlan(outcome: ReadyOutcome): 'unchanged' | 'upgraded' | 'notice' {
+  const saved: unknown = outcome.textPlan
+  const delivery = outcome.delivery ?? {}
+  const textKeys = Object.keys(delivery).filter(key => TEXT_RECEIPT_RE.test(key))
+  if (isPlanV3(saved) || (saved === undefined && textKeys.length === 0)) return 'unchanged'
+  delete outcome.textPlan
+  if (textKeys.length === 0) return 'upgraded'
+  const parts = Array.isArray(saved) && saved.every(part => typeof part === 'string') ? saved : undefined
+  const metadataPart = parts?.at(-1)
+  const metadata = metadataPart?.startsWith(LEGACY_METADATA_PREFIX) === true ? metadataPart : undefined
+  const htmlParts = parts?.filter(part => !part.startsWith(LEGACY_METADATA_PREFIX))
+  // Delivered: a part's HTML went, or it fell back to plain text and every plain piece the old plan named has a
+  // receipt. A `fallback` receipt whose plain pieces are unknown or not all receipted is not delivered.
+  const plainPieces = legacyPlainPieces(metadata)
+  const delivered = (index: number): boolean => {
+    const receipt = delivery['text:' + index]
+    if (receipt === undefined) return false
+    if (receipt !== 'fallback') return true
+    const count = plainPieces?.get(index)
+    if (count === undefined) return false
+    for (let piece = 0; piece < count; piece++) if (delivery[`text:${index}:plain:${piece}`] === undefined) return false
+    return true
+  }
+  if (htmlParts !== undefined && htmlParts.length > 0 && htmlParts.every((_part, index) => delivered(index))) {
+    outcome.textPlan = NOTHING_PENDING
+    return 'upgraded'
+  }
+  const fallback = textKeys.some(key => key.includes(':plain:') || delivery[key] === 'fallback')
+  const plan = parts !== undefined && !fallback && metadata === undefined && parts.every(part =>
+    !part.startsWith(LEGACY_METADATA_PREFIX)) ? planFromLegacyParts(parts) : undefined
+  if (plan !== undefined) {
+    outcome.textPlan = plan
+    return 'upgraded'
+  }
+  const marked = { ...delivery }
+  for (let index = 0; index < (htmlParts?.length ?? 0); index++) {
+    if (marked['text:' + index] === undefined) marked['text:' + index] = 'uncertain'
+  }
+  outcome.delivery = marked
+  outcome.textPlan = NOTHING_PENDING
+  // Something was not delivered (a pending part, a plain fallback cut short) or cannot be matched: tell the owner.
+  return 'notice'
+}
+
+// The plain-fallback sub-plan a v0.6 plan kept as its last part: how many plain pieces each fallen-back part had.
+// Undefined when it is missing or unreadable.
+function legacyPlainPieces(metadata: string | undefined): Map<number, number> | undefined {
+  const end = '"></u>'
+  if (metadata === undefined || !metadata.endsWith(end)) return undefined
+  try {
+    const parsed: unknown = JSON.parse(decodeURIComponent(metadata.slice(LEGACY_METADATA_PREFIX.length, -end.length)))
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const counts = new Map<number, number>()
+    for (const [key, pieces] of Object.entries(parsed)) {
+      if (!/^(0|[1-9]\d*)$/.test(key) || !Array.isArray(pieces)) return undefined
+      counts.set(Number(key), pieces.length)
+    }
+    return counts
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Mask a saved reply with the current secrets: its source text, and its v3 plan through resume steps 2-4 (the sent
+ * cuts mapped through the edits, the pending text cut again). True when anything changed. A plan masking cannot
+ * settle on (a registered value the marker cannot hide) is left as saved: its delivery refuses it. A pending text
+ * masking leaves uncuttable is saved masked as one piece.
+ */
+export function maskSavedReply(outcome: ReadyOutcome, secrets: ReadonlyArray<string> | undefined): boolean {
+  let changed = false
+  const text = redactSecrets(outcome.reply.text, secrets)
+  if (text !== outcome.reply.text) {
+    outcome.reply = { ...outcome.reply, text }
+    changed = true
+  }
+  const plan = outcome.textPlan
+  if (plan === undefined || plan.cuts.length === 0) return changed
+  let done = 0
+  while (done < plan.cuts.length && outcome.delivery?.['text:' + done] !== undefined) done += 1
+  let resumed: PlanV3
+  try {
+    resumed = resumePlan(plan, done, secrets)
+  } catch (error) {
+    if (error instanceof MaskFixedPointError) return changed
+    if (!(error instanceof PreformattedDocumentError)) throw error
+    // The masked pending text can no longer be cut into messages: it is kept masked as one document piece (the
+    // outbox's rule for an uncuttable item), never as saved. Its delivery sends it as a document.
+    resumed = resumePlan(plan, done, secrets, Number.POSITIVE_INFINITY)
+  }
+  if (JSON.stringify(resumed) === JSON.stringify(plan)) return changed
+  outcome.textPlan = resumed
+  return true
 }
 
 function threadOf(outcome: Outcome): string | undefined {

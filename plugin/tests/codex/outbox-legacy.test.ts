@@ -85,18 +85,19 @@ test('a secret cut inside a code block, where the old chunker closed and reopene
   ])
   const sent: string[] = []
   await open(dir, sent).flushDue(10_000)
-  expect(sent).toEqual(['<pre><code>[REDACTED]\nend</code></pre>'])
+  // One reply, one message: the shown text (the code block travels as an entity beside it).
+  expect(sent).toEqual(['[REDACTED]\nend'])
 })
 
-test('the upgrade rewrites a legacy queue once and leaves a run without a hit as it was', () => {
+test('the upgrade rewrites a legacy queue once and joins a run into one reply item', () => {
   const plain = [
     { id: 'c', chatId: '1', text: 'первая часть ', opts: { ...opts, reply_to_message_id: 3 }, notBefore: 5, attempts: 0 },
     { id: 'd', chatId: '1', text: 'вторая часть', opts, notBefore: 5, attempts: 0 },
   ]
   const dir = legacyOutbox(plain)
   const first = open(dir, []).snapshot()
-  expect(first.map(item => item.text)).toEqual(plain.map(item => item.text))
-  expect(first.map(item => item.id)).toEqual(['c', 'd'])
+  expect(first.map(item => item.plan.text)).toEqual(['первая часть вторая часть'])
+  expect(first.map(item => item.id)).toEqual(['c'])
   // Saved as migrated: a second start reads the same queue and rewrites nothing.
   const after = readFileSync(join(dir, 'outbox.json'), 'utf8')
   expect(open(dir, []).snapshot()).toEqual(first)
@@ -143,16 +144,16 @@ test('O1-7 a deferred question saved without an origin is delivered and stays ou
   expect(leases).toEqual([])
 })
 
-test('rewritten legacy tails start with a fresh retry budget after restart', async () => {
+test('a rewritten legacy reply keeps its largest retry count, once, after restart', async () => {
   const dir = legacyOutbox([
     { id: 'head', chatId: '1', text: 'а'.repeat(3950) + escaped.slice(0, 10),
       opts: { ...opts, reply_to_message_id: 9 }, notBefore: 10, attempts: 4 },
     { id: 'tail', chatId: '1', text: escaped.slice(10) + 'б'.repeat(150), opts, notBefore: 10, attempts: 1 },
   ])
   const migrated = open(dir, []).snapshot()
-  expect(migrated.map(item => item.attempts)).toEqual([4, 0])
+  expect(migrated.map(item => item.attempts)).toEqual([4])
   expect(migrated[0]?.id).toBe('head')
-  expect(migrated[1]?.opts.reply_to_message_id).toBeUndefined()
+  expect(migrated[0]?.opts.reply_to_message_id).toBe(9)
   const sent: string[] = []
   const restarted = open(dir, sent)
   expect(restarted.snapshot()).toEqual(migrated)
